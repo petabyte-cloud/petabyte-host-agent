@@ -186,6 +186,9 @@ class _FakeProc:
     def __init__(self, alive=True,
                  err="Warning: remote port forwarding failed for listen port 20000"):
         self._alive, self._err = alive, err
+        # ssh's stderr, which the agent drains: OpenSSH's bind confirmation, or why it died
+        self.stderr = iter(["debug1: remote forward success for: listen 127.0.0.1:20001\n"]
+                           if alive else [err + "\n"])
     def poll(self): return None if self._alive else 1
     def communicate(self, timeout=None): return ("", self._err)
     def terminate(self): self._alive = False

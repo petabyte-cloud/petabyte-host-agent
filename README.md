@@ -4,8 +4,8 @@ This repository is a **read-only mirror** of the software GPU owners install to 
 machines on [Petabyte](https://petabyte.market). Every file here is the content of the exact
 signed bundle that host machines download from `https://petabyte.market/agent.tar.gz`.
 
-- **Release:** `bf823d693df0a79932918e62973dc2c671979441`
-- **Bundle SHA-256:** `f7a74d2d9af50c2f3865b14e35b6e1e72090a95c4791a91aed171ad29cde14dc`
+- **Release:** `135f8ac14fd7c7abd92392e7172a1475a2523f49`
+- **Bundle SHA-256:** `c4927ae3fd32b06392aad5216b298a9e22f6d1e24024934027f3f646597dc3f2`
 
 Hosts never install or update from this repository. The installer pins our release public key
 (`release_ed25519.pub`, also in this repo), and the updater (`update.sh`) refuses any bundle whose

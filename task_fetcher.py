@@ -1170,24 +1170,86 @@ def _await_ready(tid, name, host_port, path):
     report_log(tid, f"app did not pass its health check ({path}) in time; it was not billed")
 
 
+def _start_ollama_pull(tid, name, model):
+    threading.Thread(target=_ollama_pull, args=(tid, name, model),
+                     name=f"pb-ollama-{tid}", daemon=True).start()
+
+
+def _ollama_pull(tid, name, model, timeout_s=3600):
+    """Pull the buyer's model into their running Ollama container. The template passed it as
+    OLLAMA_MODEL, which the official image never reads, so buyers got an empty server.
+
+    No 'loading' state: Ollama answers its API while pulling, and 'loading' means not billed, so it
+    would let a buyer use the GPU for free by asking for a model that never finishes. 'ready' is
+    posted once the model is in (timeline + Manage page); billing is unchanged."""
+    import re
+    import subprocess
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}", str(model)):
+        report_log(tid, "ollama: invalid model name; not pulled")
+        return
+    report_log(tid, f"ollama: pulling model {model}")
+    err = ""
+    for _ in range(12):                                  # the server inside needs a moment to start
+        with _pb_vm_lock:
+            if tid not in _pb_vm_watch:
+                return                                   # rental already over
+        try:
+            r = subprocess.run(["docker", "exec", name, "ollama", "pull", model],
+                               capture_output=True, text=True, timeout=timeout_s, check=False)
+        except subprocess.TimeoutExpired:
+            report_log(tid, f"ollama: pulling {model} did not finish in {timeout_s // 60} min")
+            return
+        except Exception as e:                           # noqa: BLE001
+            err = type(e).__name__
+            break
+        if r.returncode == 0:
+            report_log(tid, f"ollama: model {model} pulled; ready")
+            _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
+                                       "status": "ready"})
+            return
+        err = _mask_secrets(((r.stderr or r.stdout or "").strip().splitlines() or [""])[-1])[:200]
+        if "could not connect" not in err.lower():
+            break                                        # a real error (unknown model, disk full)
+        time.sleep(5)
+    report_log(tid, f"ollama: could not pull {model}: {err}; the server runs without it")
+
+
 _SECRETISH = None
 _pb_log_sent = set()                                 # task ids whose failure log tail was sent
 
 
-def _container_log_tail(name, lines=25):
-    """Last lines of a container's output, for the buyer's failure message. Token-looking strings
-    are masked (a Jupyter URL token, a Hugging Face token)."""
+def _mask_secrets(text):
+    """Mask token-looking strings (a Jupyter URL token, a Hugging Face token) before text that came
+    out of a container or Docker is shown to the buyer."""
     import re
-    import subprocess
     global _SECRETISH
     if _SECRETISH is None:
         _SECRETISH = re.compile(r"(hf_[A-Za-z0-9]{8,}|(?:token|key|secret|password)=[^\s&]+)", re.IGNORECASE)
+    return _SECRETISH.sub("[redacted]", text or "")
+
+
+def _container_log_tail(name, lines=25):
+    """Last lines of a container's output, for the buyer's failure message (secrets masked)."""
+    import subprocess
     try:
         r = subprocess.run(["docker", "logs", "--tail", str(lines), name],
                            capture_output=True, text=True, timeout=10, check=False)
     except Exception:                                    # noqa: BLE001
         return ""
-    return _SECRETISH.sub("[redacted]", ((r.stdout or "") + (r.stderr or "")).strip())[-1800:]
+    return _mask_secrets(((r.stdout or "") + (r.stderr or "")).strip())[-1800:]
+
+
+def _launch_failure_reason(e):
+    """One short, masked reason for a failed template launch: Docker's own stderr tail for a refused
+    `docker run` (pull denied, bad image, port taken, runtime error), the exception type otherwise.
+    It used to be a bare "container launch failed", so nobody could tell why a node refused."""
+    import subprocess
+    if isinstance(e, subprocess.CalledProcessError):
+        lines = [ln.strip() for ln in str(e.stderr or "").splitlines() if ln.strip()]
+        text = " | ".join(lines[-3:]) or f"docker exited {e.returncode}"
+    else:
+        text = f"{type(e).__name__}: {e}"
+    return _mask_secrets(text)[-300:]
 
 
 # Server-driven orphan reap. The container watchdog only knows containers THIS process launched
@@ -1290,6 +1352,16 @@ _tunnels = {}                                                 # task_id -> (remo
 # Self-enrolled key + known_hosts live in the unit's StateDirectory ($HOME is read-only there).
 _TUN_STATE_KEY = "/var/lib/petabyte-agent/tunnel_key"
 _TUN_KNOWN_HOSTS = "/var/lib/petabyte-agent/known_hosts"
+# Supervised interactive rentals: task_id -> {name, host_port, vm_id, rp, reg, down_since, next_try,
+# delay}. Their gateway ports are saved so a restarted agent re-binds the SAME port: the gateway
+# routes by port alone, so a restored rental landing on another rental's old port would briefly
+# send one buyer's traffic to another buyer's app.
+_tun_rentals = {}
+_TUN_PORTS_FILE = "/var/lib/petabyte-agent/tunnel_ports.json"
+_TUN_CONFIRM_S = 20          # wait for ssh's "remote forward success"; > ConnectTimeout=10
+_TUN_RETRY_MIN_S, _TUN_RETRY_MAX_S = 15, 120                  # re-open backoff
+_TUN_GIVE_UP_S = 600         # then fail the rental: the buyer is not billed for an unreachable VM
+_tun_sup_started = threading.Event()
 # Set once self-enrollment has settled (enabled, refused, or not applicable). run_agent waits on it
 # before claiming work: a JIT droplet is booked seconds after it registers, and enrollment takes ~70s
 # (API + the gateway's 60s key sync), so claiming at once refused its first serving job.
@@ -1338,42 +1410,75 @@ def _tun_port_range():
 def _popen(cmd, capture_stderr=False):
     import subprocess
     # stderr is kept for the tunnel, which otherwise discards the ONE line that says why it failed
-    # and leaves the operator reading "no free port" for what was really a rejected key. ssh runs
-    # at LogLevel=ERROR there, so a healthy long-lived tunnel never fills the pipe.
+    # and leaves the operator reading "no free port" for what was really a rejected key. The caller
+    # must drain it for the tunnel's whole life (_drain_ssh_stderr): an unread PIPE fills at ~64 KB
+    # and ssh then blocks mid-write, freezing the tunnel.
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, text=capture_stderr or None,
                             stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL)
 
 
-def _open_reverse_tunnel(host_port, tid):
+def _drain_ssh_stderr(p, up, last):
+    """Read a tunnel's ssh stderr until ssh exits. Sets `up` on OpenSSH's own confirmation that the
+    gateway bound the port (a LogLevel=DEBUG1 line); keeps the last non-debug line, which is the one
+    that says why ssh died."""
+    try:
+        for line in p.stderr:
+            line = line.strip()
+            if "remote forward success" in line:
+                up.set()
+            elif line and not line.startswith("debug"):
+                last[0] = line
+    except Exception:                                         # noqa: BLE001 - pipe closed with ssh
+        pass
+
+
+def _open_reverse_tunnel(host_port, tid, prefer=None):
     """Dial OUT to the gateway, binding a gateway-loopback remoteport -> our 127.0.0.1:host_port.
     Returns the remoteport (int) or None. The ssh process is tracked so teardown can kill it.
+    `prefer` (the rental's previous port) is tried first; ports other supervised rentals hold are
+    skipped, so a re-open never takes a port another buyer's route still points at.
 
     Only a BUSY PORT is worth retrying on the next port. Every other failure -- no key, key not
     authorized, gateway unreachable -- fails identically on all 51 ports, and the loop used to
     sleep 3s after each one anyway: two and a half minutes of waiting, a message blaming port
     exhaustion, and then teardown of a container that was serving perfectly well. Observed on a
-    live node whose snapshot simply had no /etc/petabyte/tunnel_key."""
+    live node whose snapshot simply had no /etc/petabyte/tunnel_key.
+
+    "Up" means ssh reported the forward bound, not "still alive after 3s": with no ConnectTimeout an
+    unreachable gateway kept ssh alive for minutes, so a dead port was registered and metered."""
     if not os.path.exists(_TUN_KEY):
         report_log(tid, f"reverse tunnel key {_TUN_KEY} is missing: this node cannot publish a "
                         "serving rental until the operator installs it")
         return None
+    held = {s.get("rp") for t, s in list(_tun_rentals.items()) if t != tid}
+    ports = [x for x in _tun_port_range() if x not in held]
+    if prefer in ports:
+        ports.remove(prefer)
+        ports.insert(0, prefer)
     last = ""
-    for rp in _tun_port_range():
-        cmd = ["ssh", "-i", _TUN_KEY, "-N", "-T", "-o", "LogLevel=ERROR",
+    for rp in ports:
+        cmd = ["ssh", "-i", _TUN_KEY, "-N", "-T", "-o", "LogLevel=DEBUG1",
                "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={_TUN_KNOWN_HOSTS}",
-               "-o", "ExitOnForwardFailure=yes",
+               "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=10",
                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "BatchMode=yes",
                "-R", f"127.0.0.1:{rp}:127.0.0.1:{host_port}", _TUN_GW]
         p = _popen(cmd, capture_stderr=True)
-        time.sleep(3)
-        if p.poll() is None:                                  # still alive => the -R bind took
+        up, err = threading.Event(), [""]
+        drain = threading.Thread(target=_drain_ssh_stderr, args=(p, up, err), daemon=True,
+                                 name=f"pb-tun-{tid}")
+        drain.start()
+        # ponytail: an ssh that never prints the confirmation but stays up past ConnectTimeout is
+        # accepted after _TUN_CONFIRM_S, so a build with different debug wording still serves.
+        for _ in range(_TUN_CONFIRM_S * 2):
+            if up.is_set() or p.poll() is not None:
+                break
+            up.wait(0.5)
+        if p.poll() is None:                                  # bound (or survived the wait)
             _tunnels[tid] = (rp, p)
             report_log(tid, f"reverse tunnel up: gateway 127.0.0.1:{rp} -> vm (node opens no inbound port)")
             return rp
-        try:
-            last = ((p.communicate(timeout=5)[1] or "").strip().splitlines() or [""])[-1]
-        except Exception:                                     # noqa: BLE001 - never mask the retry
-            last = ""
+        drain.join(timeout=5)
+        last = err[0]
         if not _TUN_PORT_BUSY(last):
             report_log(tid, f"reverse tunnel refused by the gateway, not retrying the other "
                             f"ports: {last[:200]}")
@@ -1452,12 +1557,114 @@ def _ensure_tunnel_async():
 
 
 def _kill_reverse_tunnel(tid):
+    """Tear down a rental's ssh -R and stop supervising it. The orphan reap passes the task id as
+    the str from a docker label while _tunnels is keyed by int, so the reaped rental's tunnel used
+    to stay up: normalize here, where every teardown path goes through."""
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        pass
+    if _tun_rentals.pop(tid, None) is not None:
+        _save_tunnel_ports()
     t = _tunnels.pop(tid, None)
     if t:
         try:
             t[1].terminate()
         except Exception:                                     # noqa: BLE001
             pass
+
+
+def _save_tunnel_ports():
+    """Persist task_id -> gateway port so a restarted agent re-binds the same ports. Best-effort."""
+    import json
+    try:
+        tmp = _TUN_PORTS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({str(t): s["rp"] for t, s in list(_tun_rentals.items()) if s.get("rp")}, f)
+        os.replace(tmp, _TUN_PORTS_FILE)
+    except Exception:                                         # noqa: BLE001 - only a preference
+        pass
+
+
+def _saved_tunnel_ports():
+    """{task_id: gateway port} from the last agent run. Read ONCE, before restoring rewrites it."""
+    import json
+    try:
+        with open(_TUN_PORTS_FILE) as f:
+            return {int(k): int(v) for k, v in json.load(f).items()}
+    except Exception:                                         # noqa: BLE001 - none saved
+        return {}
+
+
+def _supervise_tunnel(tid, name, host_port, vm_id, rp=None, registered=False):
+    """Keep an interactive rental's reverse tunnel alive (see _check_tunnels). Idempotent."""
+    if tid in _tun_rentals:
+        return
+    _tun_rentals[tid] = {"name": name, "host_port": int(host_port), "vm_id": vm_id, "rp": rp,
+                         "reg": rp if registered else None, "down_since": None,
+                         "next_try": 0.0, "delay": _TUN_RETRY_MIN_S}
+    _save_tunnel_ports()
+    if not _tun_sup_started.is_set():
+        _tun_sup_started.set()
+        threading.Thread(target=_tunnel_supervisor, name="pb-tunnel-supervisor", daemon=True).start()
+
+
+def _tunnel_supervisor():
+    while True:
+        try:
+            _check_tunnels()
+        except Exception as e:                                # noqa: BLE001
+            logging.error(f"tunnel supervisor error: {e}")
+        time.sleep(5)
+
+
+def _check_tunnels(now=None):
+    """One pass over supervised rentals. The ssh -R used to be fire-and-forget: when it exited
+    (gateway reboot, a >45s network drop, an agent restart) the rental stayed 'running' and billed
+    but unreachable. Re-open it (same port first) and re-register it, with backoff; if it cannot be
+    restored within _TUN_GIVE_UP_S, hand the rental to the watchdog to report failed, so the buyer
+    is billed only for the time it was reachable."""
+    now = time.time() if now is None else now
+    for tid, s in list(_tun_rentals.items()):
+        with _pb_vm_lock:
+            w = _pb_vm_watch.get(tid)
+            live = bool(w) and not w.get("reported") and not w.get("fail")
+        if not live:                                          # rental over: teardown owns it
+            _kill_reverse_tunnel(tid)
+            continue
+        t = _tunnels.get(tid)
+        alive = bool(t) and t[1].poll() is None
+        if alive and s["reg"] == t[0]:
+            s.update(down_since=None, delay=_TUN_RETRY_MIN_S)
+            continue
+        if s["down_since"] is None:
+            s["down_since"] = now
+            report_log(tid, "reverse tunnel is down or unregistered; restoring it")
+        if now - s["down_since"] >= _TUN_GIVE_UP_S:
+            report_log(tid, f"reverse tunnel could not be restored in {_TUN_GIVE_UP_S // 60} min; "
+                            "failing the rental so it is not billed while unreachable")
+            with _pb_vm_lock:
+                if tid in _pb_vm_watch:
+                    _pb_vm_watch[tid]["fail"] = "tunnel_lost"   # the watchdog reports + tears down
+            _kill_reverse_tunnel(tid)
+            continue
+        if now < s["next_try"] or not _reverse_tunnel_enabled():
+            continue                                          # backing off / not enrolled yet
+        if not alive:
+            rp = _open_reverse_tunnel(s["host_port"], tid, prefer=s["rp"])
+            if tid not in _tun_rentals:                       # torn down while we were dialing
+                _kill_reverse_tunnel(tid)
+                continue
+            if rp and s["rp"] != rp:
+                s["rp"] = rp
+                _save_tunnel_ports()
+            alive = bool(rp)
+        if alive and (not s["vm_id"] or _register_vm_tunnel(s["vm_id"], s["rp"], ip_address="127.0.0.1")):
+            s.update(reg=s["rp"], down_since=None, delay=_TUN_RETRY_MIN_S)
+            report_log(tid, f"reverse tunnel restored: gateway 127.0.0.1:{s['rp']} (re-registered)")
+            continue
+        s["next_try"] = now + s["delay"]
+        s["delay"] = min(s["delay"] * 2, _TUN_RETRY_MAX_S)
 
 
 def _publish_flags(port, host_port=None, bind=None):
@@ -1529,6 +1736,8 @@ def _run_template(task):
     if task.get("health") and host_port:
         cmd += ["--label", f"pb.health={task['health']}", "--label", f"pb.health_port={host_port}"]
     cmd += _interactive_labels(task)           # only an interactive rental is a reap candidate
+    if task.get("vm_id") and host_port:        # lets a restarted agent re-open + re-register its tunnel
+        cmd += ["--label", f"pb.vm_id={task['vm_id']}", "--label", f"pb.host_port={host_port}"]
     # Petabyte Spaces (persistent): restart the app in place on a crash/OOM — same container, same
     # host port, so the reverse tunnel stays valid. The watchdog already treats Docker's "restarting"
     # state as alive, so this needs no watchdog change; after 5 straight failures the container ends
@@ -1595,10 +1804,15 @@ def _run_template(task):
             if task.get("model_arg") and model:
                 cmd += [task["model_arg"], model]
             cmd += list(task.get("args") or [])        # extra image args / batch command
-            cid = subprocess.check_output(cmd, text=True).strip()
+            run = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if run.returncode:                         # keep Docker's stderr: it says WHY
+                raise subprocess.CalledProcessError(run.returncode, cmd, run.stdout, run.stderr)
+            cid = run.stdout.strip()
         finally:
             _remove_env_file(task)
         _register_vm(tid, name)  # watchdog: detect if this container dies
+        if task.get("model_env") == "OLLAMA_MODEL" and model:
+            _start_ollama_pull(tid, name, model)       # the image never reads OLLAMA_MODEL
         if task.get("health") and host_port:
             # A registered tunnel is not a working app: vLLM/llama.cpp download and load the model
             # AFTER this point, and a model too big for the GPU never serves. Tell the server the app
@@ -1653,13 +1867,18 @@ def _run_template(task):
         vm_id = task.get("vm_id")
         if vm_id and port:
             _inject_ssh_key(name, task.get("ssh_pubkey"))
-            if _register_vm_tunnel(vm_id, _hp, ip_address=_node_ip):
+            _registered = _register_vm_tunnel(vm_id, _hp, ip_address=_node_ip)
+            if _registered:
                 report_log(tid, f"tunnel registered: vm {vm_id} -> {_node_ip or 'node'}:{_hp}")
             else:
-                report_log(tid, f"tunnel registration failed for vm {vm_id}; VM may stay 'starting'")
+                report_log(tid, f"tunnel registration failed for vm {vm_id}; VM may stay 'starting'"
+                                + (" (retrying in the background)" if _rev else ""))
+            if _rev:                                   # watch the ssh -R; re-open it if it drops
+                _supervise_tunnel(tid, name, host_port, vm_id, rp=_hp, registered=_registered)
         _set_ui(status="idle", task=None, ok=True)
     except Exception as e:                              # noqa: BLE001
-        report_log(tid, "container launch failed")
+        _why = _launch_failure_reason(e)
+        report_log(tid, f"container launch failed: {_why}")
         _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
                                    "status": "failed"})
         # Mark the TASK failed too (not just the VM): a docker-run failure (e.g. a port collision)
@@ -1667,7 +1886,7 @@ def _run_template(task):
         # while the buyer's VM showed failed. Post a failed result so the two agree.
         try:
             _post_result_ack_retry(_signed_result(tid, status="failed",
-                                                  result="container launch failed"))
+                                                  result=f"container launch failed: {_why}"))
         except Exception:                               # noqa: BLE001
             pass
         # A failed launch never reaches _register_vm, so the watchdog will never GC the labelled
@@ -2264,27 +2483,30 @@ def _pb_vm_scan():
     """One sweep: report any tracked container that has exited (once)."""
     import subprocess as _sp
     with _pb_vm_lock:
-        items = [(tid, d["name"]) for tid, d in _pb_vm_watch.items() if not d["reported"]]
-    for tid, name in items:
-        try:
-            r = _sp.run(["docker", "inspect", "-f", "{{.State.Status}}:{{.State.ExitCode}}", name],
-                        capture_output=True, text=True, timeout=10)
-        except Exception:
-            continue  # docker hiccup — try again next sweep
-        if r.returncode != 0:
-            status, code = "gone", 1            # container was removed entirely
+        items = [(tid, d["name"], d.get("fail")) for tid, d in _pb_vm_watch.items() if not d["reported"]]
+    for tid, name, fail in items:
+        if fail:                                # the agent gave up on it (e.g. its tunnel is lost)
+            status, code = fail, 1
         else:
-            parts = (r.stdout.strip().split(":") + ["1"])
-            status = parts[0]
             try:
-                code = int(parts[1])
+                r = _sp.run(["docker", "inspect", "-f", "{{.State.Status}}:{{.State.ExitCode}}", name],
+                            capture_output=True, text=True, timeout=10)
             except Exception:
-                code = 1
-        if status in ("running", "created", "restarting", "paused"):
-            continue                            # still alive — keep watching
+                continue  # docker hiccup — try again next sweep
+            if r.returncode != 0:
+                status, code = "gone", 1            # container was removed entirely
+            else:
+                parts = (r.stdout.strip().split(":") + ["1"])
+                status = parts[0]
+                try:
+                    code = int(parts[1])
+                except Exception:
+                    code = 1
+            if status in ("running", "created", "restarting", "paused"):
+                continue                            # still alive — keep watching
         final = "completed" if code == 0 else "failed"
         report_log(tid, f"watchdog: job container {name} is {status} (exit {code}) -> reporting {final}")
-        if final == "failed" and status != "gone" and tid not in _pb_log_sent:
+        if final == "failed" and status != "gone" and not fail and tid not in _pb_log_sent:
             _pb_log_sent.add(tid)             # once: an unacknowledged result is retried next sweep
             _tail = _container_log_tail(name)
             if _tail:
@@ -2322,24 +2544,35 @@ def _pb_vm_watchdog():
 
 
 def _restore_vm_watch():
-    """Reattach the watchdog to labelled rentals whose assignment survived an agent restart."""
+    """Reattach the watchdog to labelled rentals whose assignment survived an agent restart, and
+    re-open their reverse tunnels: the ssh -R dies with the agent (every auto-update), which used to
+    leave every live rental billed but unreachable."""
     import execution_receipt
+    import re
     import subprocess
     try:
         result = subprocess.run(["docker", "ps", "-aq", "--filter", "label=pb.interactive=1"],
                                 capture_output=True, text=True, timeout=15, check=False)
         if result.returncode:
             return
+        saved = _saved_tunnel_ports()
         for container in result.stdout.split():
             task_id = _container_label_task(container)
             if task_id and task_id.isdigit() and execution_receipt.knows(int(task_id)):
                 _register_vm(int(task_id), container)
                 hl = subprocess.run(["docker", "inspect", "-f",
-                                     '{{index .Config.Labels "pb.health"}}|{{index .Config.Labels "pb.health_port"}}',
+                                     "|".join('{{index .Config.Labels "%s"}}' % k for k in
+                                              ("pb.health", "pb.health_port", "pb.vm_id", "pb.host_port")),
                                      container], capture_output=True, text=True, timeout=10, check=False)
-                path, _, hp = (hl.stdout or "").strip().partition("|")
+                path, hp, vm_id, tun_hp = ((hl.stdout or "").strip().split("|") + ["", "", ""])[:4]
                 if path.startswith("/") and hp.isdigit():
                     _start_ready_poll(int(task_id), container, int(hp), path)
+                if tun_hp.isdigit() and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", vm_id):
+                    _supervise_tunnel(int(task_id), container, int(tun_hp), vm_id,
+                                      rp=saved.get(int(task_id)))
+                else:
+                    logging.warning(f"rental {task_id}: no pb.vm_id/pb.host_port label (started by "
+                                    "an older agent); its reverse tunnel cannot be restored")
     except (OSError, subprocess.TimeoutExpired):
         logging.warning("Could not restore rental watchdog; Docker is unavailable")
 
