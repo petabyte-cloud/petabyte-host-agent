@@ -1,0 +1,8 @@
+[Unit]
+Description=Petabyte node agent auto-update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/petabyte-agent/update.sh

@@ -1,0 +1,10 @@
+[Unit]
+Description=Petabyte support fix runner (signed fixes for this machine only; see fix-runner.sh)
+
+[Service]
+Type=oneshot
+# Root and unsandboxed on purpose: a fix may need to change Docker/NVIDIA config under /etc, which
+# the agent's own unit (ProtectSystem=full) can't. fix-runner.sh refuses anything not signed for
+# this machine by the pinned release key.
+ExecStart=/bin/bash /opt/petabyte-agent/fix-runner.sh
+TimeoutStartSec=900

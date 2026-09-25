@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Petabyte support fixes the agent receives (installed by: main.py fixes enable)
+
+[Path]
+PathExistsGlob=/var/lib/petabyte-agent/fix-inbox/*.payload
+Unit=petabyte-agent-fix.service
+
+[Install]
+WantedBy=multi-user.target

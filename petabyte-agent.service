@@ -1,0 +1,38 @@
+[Unit]
+Description=Petabyte GPU node agent
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+WorkingDirectory=/opt/petabyte-agent
+EnvironmentFile=/etc/petabyte/agent.env
+ExecStart=/opt/petabyte-agent/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+# Job work dirs must live on a path the Docker daemon ALSO sees. PrivateTmp (below) gives
+# the agent a private /tmp that dockerd does not share, so a workdir created there via
+# mkdtemp() is invisible to `docker run -v <workdir>:/work` — the container then gets an
+# EMPTY /work and every bundle/render/transcode job fails ("can't open /work/..."). Point
+# the agent's tempdir at a host-visible StateDirectory (systemd creates /var/lib/petabyte-agent
+# and adds it to ReadWritePaths) so bind-mount sources resolve for the agent and dockerd alike.
+StateDirectory=petabyte-agent
+Environment=TMPDIR=/var/lib/petabyte-agent
+# /etc is read-only under ProtectSystem=full. Persist assignment receipts in service state.
+Environment=PETABYTE_RECEIPT_STATE=/var/lib/petabyte-agent/assignments.json
+
+# Hardening. The agent talks to the Docker daemon (effectively root-equivalent), so
+# it is not fully sandboxed, but these directives shrink the blast radius of a bug in
+# the agent itself without breaking container launch.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+# PrivateTmp gives the agent its own /tmp; job work dirs are relocated to TMPDIR above so
+# this does not hide bind-mount sources from dockerd (see the note near StateDirectory).
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for Petabyte node agent updates
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

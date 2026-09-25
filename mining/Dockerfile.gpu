@@ -1,0 +1,13 @@
+FROM debian:bookworm-slim AS download
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl
+WORKDIR /miner
+RUN curl -fsSL https://github.com/Lolliedieb/lolMiner-releases/releases/download/1.98a/lolMiner_v1.98a_Lin64.tar.gz -o miner.tar.gz \
+    && echo '0b8078299654a12846e4967f1db3506409cfb8b1031687a910965d1a99c6f270  miner.tar.gz' | sha256sum -c - \
+    && tar -xzf miner.tar.gz --strip-components=1
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libstdc++6 libgomp1 ocl-icd-libopencl1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=download /miner/lolMiner /usr/local/bin/miner
+COPY supervise.sh /usr/local/bin/supervise
+USER 65534:65534
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/supervise"]

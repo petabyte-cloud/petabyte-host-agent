@@ -1,0 +1,6 @@
+# build outputs (reproducible via build.sh)
+petabyte-connect.exe
+*.syso
+dist/
+*.pem
+.tools/
