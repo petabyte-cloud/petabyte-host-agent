@@ -37,6 +37,9 @@ tf._post_result_ack_retry = lambda payload, attempts=4: (_results.append(payload
 tf._signed_result = lambda tid, status="completed", result=None, **k: {
     "task_id": tid, "status": status, "result": result}
 tf._cleanup_job_resources = lambda tid, name=None: None
+# Image admission/ownership has its own fake-Docker suite; keep this runner fixture offline.
+tf.template_storage.prepare = lambda *a, **k: "cached"
+tf._start_storage_guard = lambda *a: None
 tf._isolation_flags = lambda task: []
 tf._reverse_tunnel_enabled = lambda: False
 tf._pb_vm_started["on"] = True                 # no background watchdog thread in a unit test
@@ -75,8 +78,10 @@ tf._start_ollama_pull = lambda tid, name, model: _pulls.append((tid, model))
 with patch("shutil.which", return_value="/usr/bin/docker"), \
      patch("subprocess.run", return_value=Mock(returncode=0, stdout="cid123\n", stderr="")) as _run:
     tf._run_template(dict(_task, task_id=32, template="ollama", model_env="OLLAMA_MODEL",
-                          params={"model": "llama3"}))
+                          params={"model": "llama3", "max_startup_seconds": 300}))
 ok("launching the ollama template starts a pull of the buyer's model", _pulls == [(32, "llama3")])
+ok("budgeted Ollama startup reports loading until the requested model is pulled",
+   any(p[1].get("task_id") == 32 and p[1].get("status") == "loading" for p in _posts))
 ok("the model is still passed as OLLAMA_MODEL (harmless, backward compatible)",
    "--env-file" in _run.call_args.args[0])
 

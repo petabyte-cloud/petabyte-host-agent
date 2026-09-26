@@ -151,6 +151,18 @@ def handle_cli(argv) -> bool:
     (the caller should then stop and NOT launch the node). Exits the process for
     doctor so the exit code reflects preflight health."""
     args = list(argv or [])
+    if args and args[0] == "storage":
+        try:
+            import template_storage
+        except ImportError:  # shared desktop CLI ships no seller Docker ledger
+            raise SystemExit("Template storage is only available in the seller agent install.") from None
+        import json
+        with template_storage.locked():
+            state = template_storage.read()
+        state["policy"] = {"cache_budget_bytes": int(template_storage.policy()[0]),
+                           "disk_reserve_bytes": int(template_storage.policy()[1])}
+        print(json.dumps(state, indent=2))
+        return True
     if args and args[0] == "mining":
         try:
             import idle_mining

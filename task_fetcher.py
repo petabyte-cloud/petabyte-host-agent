@@ -20,6 +20,7 @@ import time as _t
 import httpx
 import safe_fetch
 import gpu_runtime
+import template_storage
 
 import crypto
 import agent_scratch
@@ -247,6 +248,9 @@ def heartbeat_loop():
             _hb = {"spec_id": int(SPEC_ID), "hardware_evidence": hardware_evidence.collect(),
                    "selling_now": _advertise_selling_now(),  # JIT also waits for tunnel enrollment
                    "remote_fixes": _fixes.enabled()}  # owner allowed signed support fixes
+            _storage = template_storage.heartbeat_report(globals().get("_TUN_GW", ""))
+            if _storage is not None:
+                _hb["template_storage"] = _storage
             if _JOB_NET["ok"] is not None:           # can this host isolate a networked app?
                 _hb["job_network"] = dict(_JOB_NET)
             _bundle = _agent_bundle()
@@ -272,6 +276,7 @@ def heartbeat_loop():
                     logging.warning("Idle mining paused: %s", exc)
                     idle_mining.controller.revoke()
                 # Owner may have changed the selling window in the dashboard — adopt it live.
+                template_storage.set_catalog(_body.get("template_image_catalog"))
                 _note_agent_update(_body)       # server-requested signed self-update (job_loop)
                 _sc = _body.get("sell_schedule")
                 if _sc is not None:
@@ -1884,6 +1889,27 @@ def _remove_env_file(task):
             pass
 
 
+def _start_storage_guard(tid, name, volume):
+    def guard():
+        while True:
+            time.sleep(5)
+            with _pb_vm_lock:
+                if tid not in _pb_vm_watch:
+                    return
+            try:
+                reason = template_storage.job_violation(volume)
+            except Exception:
+                continue  # A failed probe is not proof of a quota violation.
+            if reason:
+                report_log(tid, reason + "; stopping this rental")
+                try:
+                    _post_result_ack_retry(_signed_result(tid, status="failed", result=reason))
+                finally:
+                    _cleanup_job_resources(tid, name)
+                return
+    threading.Thread(target=guard, daemon=True, name=f"pb-storage-{tid}").start()
+
+
 def _run_template(task):
     """Launch a one-click stack (Ollama/vLLM/ComfyUI/game server/...) and report it."""
     if task.get("port") and not _reverse_tunnel_enabled():
@@ -1932,7 +1958,7 @@ def _run_template(task):
     # SECURITY (tenant isolation): every job container is labelled with its task id so the
     # watchdog (and any operator) can find, stop and GC exactly this rental's resources, and so
     # a per-task volume/network is never confused with another tenant's.
-    cmd = ["docker", "run", "-d", "--name", name,
+    cmd = ["docker", "run", "--pull=never", "-d", "--name", name,
            "--label", f"pb.task={tid}", "--label", "pb.kind=template"]
     if task.get("health") and host_port:
         cmd += ["--label", f"pb.health={task['health']}", "--label", f"pb.health_port={host_port}"]
@@ -1999,6 +2025,10 @@ def _run_template(task):
         _template_env[task["model_env"]] = model
     try:
         try:
+            outcome = template_storage.prepare(image, tid,
+                cached_only=bool(params.get("cached_image_only", False)),
+                timeout=params.get("max_startup_seconds", 900))
+            report_log(tid, "Docker image " + outcome + "; model/work files are private to this rental")
             cmd += _template_env_flags(task, _template_env)
             cmd += [image]
             # a model delivered as a CLI arg (vllm --model, TGI --model-id, llama.cpp -hf)
@@ -2012,7 +2042,11 @@ def _run_template(task):
         finally:
             _remove_env_file(task)
         _register_vm(tid, name)  # watchdog: detect if this container dies
+        _start_storage_guard(tid, name, vol if task.get("cache") else None)
         if task.get("model_env") == "OLLAMA_MODEL" and model:
+            if params.get("max_startup_seconds"):
+                _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
+                                           "status": "loading"})
             _start_ollama_pull(tid, name, model)       # the image never reads OLLAMA_MODEL
         if task.get("health") and host_port:
             # A registered tunnel is not a working app: vLLM/llama.cpp download and load the model
@@ -3155,8 +3189,8 @@ def _ensure_wipe_image_async():
             img = ("pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime" if cc.isdigit() and int(cc) >= 10
                    else "pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime")   # Blackwell needs CUDA 12.8
             logging.warning(f"VRAM-wipe image missing — pulling {img} (GPU jobs are refused until it lands)")
-            r = subprocess.run(["docker", "pull", img], capture_output=True, timeout=3600)
-            logging.warning(f"VRAM-wipe image {img}: {'cached' if r.returncode == 0 else 'pull FAILED'}")
+            template_storage.prepare(img, 0, timeout=3600)
+            logging.warning(f"VRAM-wipe image {img}: cached")
         except Exception as e:                           # noqa: BLE001 — never crash the agent
             logging.warning(f"VRAM-wipe image pull failed: {e}")
     threading.Thread(target=_pull, daemon=True, name="pb-wipe-image").start()

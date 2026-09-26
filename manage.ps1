@@ -65,7 +65,8 @@ switch ($Action) {
         wsl.exe --unregister $Distro
     } else {
         Write-Host "  keeping $Distro (it was already on your PC); removing only Petabyte files."
-        Agent "rm -rf /opt/petabyte /etc/petabyte 2>/dev/null; rm -f /etc/systemd/system/petabyte-agent.service 2>/dev/null; systemctl daemon-reload 2>/dev/null"
+        Agent "bash /opt/petabyte-agent/uninstall.sh"
+        if ($LASTEXITCODE -ne 0) { throw "Petabyte cleanup failed; retained state for retry." }
     }
 
     # 3. WSL itself: disable only if it wasn't already enabled before us

@@ -345,7 +345,7 @@ if command -v nvidia-smi >/dev/null 2>&1 && [ "${AGENT_ALLOW_UNVERIFIED_VRAM:-fa
   if [ "${_cc:-0}" -ge 10 ] 2>/dev/null; then _wipe=pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
   else _wipe=pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime; fi
   echo "==> caching the VRAM-wipe image $_wipe (one-time; GPU jobs are refused without it)"
-  docker pull "$_wipe" >/dev/null || echo "WARN: could not cache $_wipe; GPU jobs will be refused until: docker pull $_wipe"
+  .venv/bin/python template_storage.py prepare "$_wipe" >/dev/null || echo "WARN: could not cache $_wipe; GPU jobs will be refused until: docker pull $_wipe"
 fi
 
 # Prove it BEFORE listing: build and remove a real per-rental network, exactly as a rental would.
