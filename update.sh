@@ -63,3 +63,16 @@ if rsync -rcni "${RSYNC_EXCL[@]}" "$TMP/$SUBDIR/" "$APP/" | grep -q . ; then
 else
   echo "already up to date"
 fi
+
+# The tree now matches this verified bundle (both branches): record which one, so the agent reports
+# it on its heartbeat and ops can see whether auto-update landed (/admin/nodes/agent-bundles).
+BUNDLE_SHA="$(sha256sum "$TMP/agent.tar.gz" | cut -d' ' -f1)"
+mkdir -p /var/lib/petabyte-agent && echo "$BUNDLE_SHA" > /var/lib/petabyte-agent/bundle.sha256
+
+# Keep this host able to isolate buyers' apps, with no seller action: the SAME check+repair install.sh
+# runs (isolation.py), as root, at most once per signed bundle. It applies only repairs known to be
+# safe for what it finds, never touches Docker Desktop, restarts the agent if it changed anything,
+# and otherwise leaves the node serving batch jobs with the reason on its heartbeat. Runs on BOTH
+# branches: the update that first ships it is applied by the previous update.sh, which lacks this.
+"$APP/.venv/bin/python" "$APP/isolation.py" repair --auto "$BUNDLE_SHA" \
+  || echo "isolation: this host still can't isolate buyers' apps (see above); serving batch jobs only"

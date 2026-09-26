@@ -247,6 +247,11 @@ def heartbeat_loop():
             _hb = {"spec_id": int(SPEC_ID), "hardware_evidence": hardware_evidence.collect(),
                    "selling_now": _advertise_selling_now(),  # JIT also waits for tunnel enrollment
                    "remote_fixes": _fixes.enabled()}  # owner allowed signed support fixes
+            if _JOB_NET["ok"] is not None:           # can this host isolate a networked app?
+                _hb["job_network"] = dict(_JOB_NET)
+            _bundle = _agent_bundle()
+            if _bundle:                               # which signed agent bundle this node runs
+                _hb["agent_bundle"] = _bundle
             if os.getenv("PETABYTE_MINING_FLOOR") == "true":
                 _hb["mining_floor_enabled"] = True
                 _hb["mining_income"] = mining_income.heartbeat_report()
@@ -1037,13 +1042,78 @@ def _task_volume(task) -> str:
     return f"pb-vol-t{task['task_id']}-{task.get('template', 'tpl')}"
 
 
-def _ensure_job_network(tid):
+# Can this host isolate a networked (serving) rental? network_policy refuses every one on Docker
+# Desktop, rootless Docker, non-root or a remote daemon, while --network none batch jobs still run —
+# so the node looked healthy and every buyer app on it was refunded. Probed at startup, re-probed
+# hourly (every 5 min while failing), reported on the heartbeat so the server stops placing apps.
+_JOB_NET = {"ok": None, "reason": None, "hint": None, "repaired": False}
+
+
+def _set_job_network(ok, reason=None):
     try:
         import network_policy
-        return network_policy.ensure(tid)
-    except Exception:
-        logging.warning("job network refused: isolated local firewall unavailable")
+        hint = None if ok else network_policy.hint(reason)
+    except Exception:                                    # noqa: BLE001 — advice must never break a refusal
+        hint = None
+    if (ok, reason) != (_JOB_NET["ok"], _JOB_NET["reason"]) and not ok:
+        logging.warning(f"this node can only run batch jobs: {reason}. To run apps: {hint}")
+    _JOB_NET.update(ok=ok, reason=reason, hint=hint)
+    try:
+        import ui
+        ui.agent_status["job_network"] = dict(_JOB_NET)
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def _probe_job_network():
+    try:
+        import isolation
+        import network_policy
+        # repaired: the auto-update's isolation repair (isolation.py, run as root) changed this host
+        _JOB_NET["repaired"] = bool(isolation.last_repair().get("repaired"))
+        _set_job_network(*network_policy.probe())
+    except Exception as e:                               # noqa: BLE001 — never break the agent
+        logging.info(f"job network probe skipped: {e}")
+
+
+_BUNDLE_FILE = "/var/lib/petabyte-agent/bundle.sha256"   # update.sh / install.sh write it
+
+
+def _agent_bundle():
+    """sha256 of the signed agent bundle this node last applied, or None (git/dev installs).
+    Re-read every heartbeat: update.sh records it after a run that didn't restart the agent."""
+    try:
+        with open(_BUNDLE_FILE) as f:
+            sha = f.read().strip()
+    except OSError:
         return None
+    return sha if len(sha) == 64 and all(ch in "0123456789abcdef" for ch in sha) else None
+
+
+def _job_network_loop():
+    last = time.time()
+    while True:
+        time.sleep(300)                                  # a launch failure is re-checked within 5 min
+        if not _JOB_NET["ok"] or time.time() - last >= 3600:
+            _probe_job_network()
+            last = time.time()
+
+
+def _ensure_job_network(tid):
+    """(network name, None), or (None, reason) when the per-job bridge can't be built."""
+    try:
+        import network_policy
+        return network_policy.ensure(tid), None
+    except Exception as e:                                   # noqa: BLE001 — never crash a job
+        # network_policy.ensure() raises NetworkUnavailable with a DIFFERENT message for each of
+        # ~8 distinct refusals (not root, remote daemon, docker network create failed, firewall
+        # policy drift...). Discarding it left every one of them as the same unactionable line,
+        # so the operator could not tell a missing iptables binary from a hijacked chain (PET-144).
+        logging.warning("job network refused for task %s: %s: %s",
+                        tid, type(e).__name__, e)
+        reason = str(e) or type(e).__name__
+        _set_job_network(False, reason)                  # the real outcome beats the probe
+        return None, reason
 
 
 def _apply_egress_bandwidth_cap(net):
@@ -1358,6 +1428,7 @@ _TUN_KNOWN_HOSTS = "/var/lib/petabyte-agent/known_hosts"
 # send one buyer's traffic to another buyer's app.
 _tun_rentals = {}
 _TUN_PORTS_FILE = "/var/lib/petabyte-agent/tunnel_ports.json"
+_TUN_PORTS_LOCK = threading.Lock()
 _TUN_CONFIRM_S = 20          # wait for ssh's "remote forward success"; > ConnectTimeout=10
 _TUN_RETRY_MIN_S, _TUN_RETRY_MAX_S = 15, 120                  # re-open backoff
 _TUN_GIVE_UP_S = 600         # then fail the rental: the buyer is not billed for an unreachable VM
@@ -1575,15 +1646,27 @@ def _kill_reverse_tunnel(tid):
 
 
 def _save_tunnel_ports():
-    """Persist task_id -> gateway port so a restarted agent re-binds the same ports. Best-effort."""
+    """Persist task_id -> gateway port so a restarted agent re-binds the same ports. Best-effort.
+
+    The supervisor, claim and teardown threads all call this. With one shared ".tmp" path, a writer
+    paused mid-dump kept writing its OLDER snapshot into the inode another writer had just renamed
+    into place: a corrupt file, so a restarted agent re-bound no saved port. The lock orders
+    snapshot+write, and a unique temp file keeps a second agent process off this one's file too."""
     import json
-    try:
-        tmp = _TUN_PORTS_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({str(t): s["rp"] for t, s in list(_tun_rentals.items()) if s.get("rp")}, f)
-        os.replace(tmp, _TUN_PORTS_FILE)
-    except Exception:                                         # noqa: BLE001 - only a preference
-        pass
+    import tempfile
+    with _TUN_PORTS_LOCK:
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_TUN_PORTS_FILE), prefix=".tunnel_ports.")
+            with os.fdopen(fd, "w") as f:
+                json.dump({str(t): s["rp"] for t, s in list(_tun_rentals.items()) if s.get("rp")}, f)
+            os.replace(tmp, _TUN_PORTS_FILE)
+        except Exception:                                     # noqa: BLE001 - only a preference
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 def _saved_tunnel_ports():
@@ -1705,6 +1788,20 @@ def _remove_env_file(task):
 def _run_template(task):
     """Launch a one-click stack (Ollama/vLLM/ComfyUI/game server/...) and report it."""
     if task.get("port") and not _reverse_tunnel_enabled():
+        # SAY WHY. `network_policy` is also what a failed per-job Docker bridge reports, and that
+        # other branch writes a task log explaining itself. This one wrote nothing at all, so the
+        # buyer-visible record of a refused rental was an empty log plus a cause that points at
+        # container networking. On 2026-09-25 that sent a P0 investigation at cloud-init, the
+        # standby image and the subnet firewall for hours, when the truth was that this node's
+        # reverse tunnel had never enrolled (PET-144). The cause string stays `network_policy` —
+        # the server confirms this exact case from its own state in _platform_misplacement(), so
+        # the seller is already not charged for it — but the log line must name the real reason.
+        report_log(task["task_id"],
+                   "template refused: this node has no enrolled reverse tunnel"
+                   + (f" (gateway {_TUN_GW} configured, key {_TUN_KEY} missing)" if _TUN_GW
+                      else " (no gateway: self-enrolment never succeeded — POST /node/tunnel)")
+                   + "; a serving template needs one to publish its port, so the rental is "
+                     "refused up front instead of failing the buyer minutes later")
         _post("/jobs/result", _signed_result(task["task_id"], status="failed", failure_cause="network_policy"))
         _set_ui(status="idle", task=None, fail=True)
         return
@@ -1758,7 +1855,7 @@ def _run_template(task):
     # one host cannot see each other. `none`/`host` (batch/cluster) keep their explicit posture.
     net = None
     if not egress:                             # _egress_flags returned [] == the "limited"/"open" default bridge
-        net = _ensure_job_network(tid)
+        net, why = _ensure_job_network(tid)
         if not net:
             # FAIL CLOSED. Omitting --network here does not mean "no network", it means Docker's
             # SHARED DEFAULT BRIDGE — exactly the co-tenant/host-gateway exposure the block above
@@ -1766,9 +1863,9 @@ def _run_template(task):
             # fail. Adding `--network none` instead would hand the buyer a serving template that
             # can never pull its model or answer the tunnel, so refuse the rental outright and let
             # the server's failure path refund it.
-            report_log(tid, f"template refused: could not create the per-job network pb-net-t{tid}; "
-                            "running on the shared default bridge would expose this rental to "
-                            "co-tenant containers and the host gateway")
+            report_log(tid, f"template refused: could not create the per-job network pb-net-t{tid} "
+                            f"({why}); running on the shared default bridge would expose this "
+                            "rental to co-tenant containers and the host gateway")
             _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
                                        "status": "failed"})
             _cleanup_job_resources(tid)        # drop the labelled volume/network we may have made
@@ -2223,6 +2320,168 @@ def _run_container(task):
         _remove_env_file(task)
 
 
+def _render_setup_expr(samples=None, gpu=True, engine=None):
+    """Blender `--python-expr`, run after the buyer's .blend loads and before `-a` renders it.
+
+    0) `engine` (from _render_plan, only ever 'CYCLES') switches the scene's engine first — a
+       Blender Internal file, or an EEVEE file the buyer asked to convert.
+    1) Cycles defaults to the CPU and a headless container has no saved Blender preferences, so
+       every "GPU render" used to run on the seller's CPU (2026-09-25: no Cycles device was ever
+       chosen). Point Cycles at the GPU the container was given: OptiX, else CUDA/HIP/oneAPI.
+       get_devices_for_type() also returns the CPU row, and a new device entry defaults to
+       use=True, so enabling every row rendered hybrid CPU+GPU (#556) — enable only the GPUs.
+    2) Apply the buyer's requested sample count (POST /render `samples`, previously ignored).
+    3) A movie output format is rendered as PNG frames, so a range split across nodes can be
+       stitched back together (a node can't append to another node's video).
+    It comes from OUR argv, not the scene: --disable-autoexec still blocks the .blend's own scripts.
+    """
+    n = int(samples) if samples else 0
+    return (
+        "import bpy\n"
+        "s = bpy.context.scene\n"
+        + (f"s.render.engine = '{engine}'\n" if engine else "")
+        + "if s.render.is_movie_format:\n"
+        "    s.render.image_settings.file_format = 'PNG'\n"
+        "if s.render.engine == 'CYCLES':\n"
+        f"    if {n} > 0:\n"
+        f"        s.cycles.samples = {n}\n"
+        f"    if {bool(gpu)}:\n"
+        "        p = bpy.context.preferences.addons['cycles'].preferences\n"
+        "        for dt in ('OPTIX', 'CUDA', 'HIP', 'ONEAPI'):\n"
+        "            try:\n"
+        "                p.compute_device_type = dt\n"
+        "                devs = p.get_devices_for_type(dt)\n"
+        "            except Exception:\n"
+        "                continue\n"
+        "            if any(d.type != 'CPU' for d in devs):\n"
+        "                for d in devs:\n"
+        "                    d.use = d.type != 'CPU'\n"
+        "                s.cycles.device = 'GPU'\n"
+        "                print('PBDEVICE=' + dt, flush=True)\n"
+        "                break\n"
+        "        else:\n"
+        "            print('PBDEVICE=CPU', flush=True)\n"
+    )
+
+
+def _render_setup_expr_279(engine=None):
+    """Blender 2.79b `--python-expr` — Python 3.5, so no f-strings in the generated code. Keeps the
+    file's own engine (Blender Internal) unless the buyer named one, writes PNG frames (stitchable
+    across nodes), and uses every core the container's --cpus cap allows (a file saved with FIXED
+    threads would otherwise render on the author's thread count)."""
+    return ("import bpy\n"
+            "s = bpy.context.scene\n"
+            + (f"s.render.engine = '{engine}'\n" if engine else "")
+            + "s.render.image_settings.file_format = 'PNG'\n"
+            "s.render.threads_mode = 'AUTO'\n")
+
+
+# Blender 2.79b: the last release with Blender Internal, the only faithful renderer for a pre-2.8
+# scene. Pinned to the hash download.blender.org publishes in release279b.sha256 (checked
+# 2026-09-26: the downloaded tarball matched it, and its md5 matched release279b.md5).
+BLENDER_279_URL = ("https://download.blender.org/release/Blender2.79/"
+                   "blender-2.79b-linux-glibc219-x86_64.tar.bz2")
+BLENDER_279_SHA256 = "43824a4e0b0c6de6fa34ff224eec44c1cc9f26a95f6f3c8c2558d1c05704183c"
+BLENDER_279_CACHE = "/var/lib/petabyte-agent/blender/2.79b"
+_BLENDER_279_TOP = "blender-2.79b-linux-glibc219-x86_64"      # the tarball's top-level directory
+
+
+def _ensure_blender_279():
+    """Host dir holding Blender 2.79b. The render container runs --network none, so the binary
+    comes from the HOST: fetched ONCE from download.blender.org, refused unless its sha256 matches
+    the pinned published hash, extracted into the agent cache, then bind-mounted READ-ONLY into
+    the render container. Concurrent first renders each download into their own temp dir; the
+    atomic rename means only a complete, verified tree is ever at the final path."""
+    import shutil
+    import tarfile
+    import tempfile
+    final = os.path.join(BLENDER_279_CACHE, _BLENDER_279_TOP)
+    if os.path.isfile(os.path.join(final, "blender")):
+        return final
+    os.makedirs(BLENDER_279_CACHE, exist_ok=True)
+    tmp = tempfile.mkdtemp(dir=BLENDER_279_CACHE)
+    try:
+        tarball, h = os.path.join(tmp, "blender.tar.bz2"), hashlib.sha256()
+        with httpx.stream("GET", BLENDER_279_URL, timeout=600, trust_env=False) as r, \
+                open(tarball, "wb") as f:
+            r.raise_for_status()
+            for chunk in r.iter_bytes():
+                h.update(chunk)
+                f.write(chunk)
+        if h.hexdigest() != BLENDER_279_SHA256:
+            raise RuntimeError(f"Blender 2.79b download sha256 {h.hexdigest()} != pinned "
+                               f"{BLENDER_279_SHA256}; refusing to run it")
+        with tarfile.open(tarball, "r:bz2") as t:
+            t.extractall(tmp, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+        try:
+            os.rename(os.path.join(tmp, _BLENDER_279_TOP), final)
+        except OSError:
+            if not os.path.isfile(os.path.join(final, "blender")):   # not a lost race: real error
+                raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return final
+
+
+def _blend_file_version(path):
+    """Blender version a .blend was saved with, from its 12-byte header: b'BLENDER' + pointer size
+    ('_'/'-') + endianness ('v'/'V') + 3 digits, e.g. b'BLENDER-v275' -> 275. A gzip-compressed
+    .blend (2.7x "Compress File") is read through gzip. None if unreadable or another header —
+    zstd-compressed files (3.0+) and the 5.x header are both 2.8+ anyway."""
+    import gzip
+    try:
+        with open(path, "rb") as f:
+            gz = f.read(2) == b"\x1f\x8b"
+        with (gzip.open if gz else open)(path, "rb") as f:
+            h = f.read(12)
+    except Exception:                                    # noqa: BLE001 — unknown = not legacy
+        return None
+    return int(h[9:12]) if h[:7] == b"BLENDER" and h[9:12].isdigit() else None
+
+
+def _render_plan(file_version, engine="auto", blender_version="latest", detect=lambda: ""):
+    """How to render a scene -> (runner, set_engine, note, refuse_cause).
+
+    runner: "2.79" (host Blender 2.79b, CPU) or "latest" (the render image, GPU); set_engine: the
+    engine to switch the scene to, or None to keep the file's own; note: the line for the buyer's
+    log; refuse_cause: a failure_cause when it must not render. `detect()` returns the engine
+    modern Blender sees; it is called only when the answer changes the plan.
+
+      file          blender_version / engine        -> result
+      pre-2.8       2.79, or engine=BLENDER_RENDER  -> 2.79b on CPU, as authored
+      pre-2.8       latest + auto/CYCLES            -> Cycles on GPU + note (look may differ)
+      2.8+/unknown  2.79, or engine=BLENDER_RENDER  -> refuse (2.79 can't open newer files)
+      2.8+/unknown  engine=CYCLES                   -> convert to Cycles on GPU
+      2.8+/unknown  auto, file engine EEVEE         -> refuse (no headless GPU EEVEE)
+      2.8+/unknown  auto, anything else             -> render as is
+    """
+    engine = engine if engine in ("auto", "CYCLES", "BLENDER_RENDER") else "auto"
+    legacy = file_version is not None and file_version < 280
+    saved = f"Blender {file_version // 100}.{file_version % 100}" if file_version else "a newer Blender"
+    if blender_version in ("2.79", "2.79b") or engine == "BLENDER_RENDER":
+        if not legacy:
+            msg = (f"This .blend was saved in {saved}; Blender 2.79 can only render files saved "
+                   "in 2.79 or earlier. Your .blend was NOT changed — submit again without "
+                   "blender_version=2.79.")
+            return (None, None, msg, "unsupported_blender_version")
+        return ("2.79", None if engine == "auto" else engine, None, None)
+    if legacy:
+        msg = (f"This .blend was saved in {saved} (Blender Internal era); rendering it in Cycles "
+               "on the GPU, so materials and lighting may look different from the original. "
+               "Submit with blender_version=2.79 to render it exactly as authored (Blender 2.79b, "
+               "CPU).")
+        return ("latest", "CYCLES", msg, None)
+    if engine == "CYCLES":
+        return ("latest", "CYCLES", None, None)
+    found = detect() or ""
+    if "EEVEE" in found.upper():
+        msg = (f"This scene's render engine is {found}, which cannot be rendered on a headless "
+               "GPU. Your .blend was NOT changed — set the scene's render engine to Cycles, or "
+               "submit again with engine=CYCLES to convert it, for a fast GPU render.")
+        return (None, None, msg, "unsupported_engine_eevee")
+    return ("latest", None, None, None)
+
+
 def _run_render(task):
     """Render an assigned frame range by launching Blender AS A CONTAINER.
     The seller never installs Blender — the image is pulled on demand and cached;
@@ -2236,6 +2495,12 @@ def _run_render(task):
         report_log(tid, "docker not installed; cannot run render sandbox")
         _post("/jobs/result", _signed_result(tid, status="failed"))
         return
+    # Blender is the container's ENTRYPOINT, not a command handed to the image's own init.
+    # linuxserver/blender's s6 /init boots a whole desktop (Selkies, Wayland, pulseaudio, dbus) around
+    # it, and under --cap-drop ALL its shutdown can't signal those non-root services (no CAP_KILL):
+    # Blender saved the frame and quit in 2s, then the container never exited (5.2.2-ls241,
+    # 2026-09-26) — every probe and render hung until the runtime budget killed it as a failure.
+    ep = ["--entrypoint", "blender", image]
     work = tempfile.mkdtemp(prefix=f"render-{tid}-")
     scene = _os.path.join(work, "scene.blend")
     out_dir = _os.path.join(work, "out"); _os.makedirs(out_dir, exist_ok=True)
@@ -2247,34 +2512,40 @@ def _run_render(task):
                        json={"task_id": tid, "ref": task.get("blend_ref", "")}, trust_env=False).json()
         open(scene, "wb").write(safe_fetch.get(g["download_url"], timeout=120, max_bytes=128 * 1024 * 1024).content)
         report_progress(tid, 15, f"scene fetched; rendering {fs}-{fe} in {image}")
+
         # 1b) Detect the scene's render engine BEFORE committing GPU time. EEVEE(-Next) needs a GPU
         # DISPLAY context that does not exist in a headless container — it errors EGL_BAD_MATCH and
         # crawls in software (tens of minutes/frame). So we do NOT render EEVEE: hand the buyer's
         # file straight back with a note to switch to Cycles (which renders headless on the GPU via
         # OptiX reliably). Best-effort — on any detection error we fall through and just render.
-        engine = ""
-        try:
-            _dcmd = ["docker", "run", "--rm", "--network", "none"]
-            _dcmd += _isolation_flags(task)
-            _dcmd += ["-v", f"{scene}:/scene.blend:ro", image, "blender", "-b", "/scene.blend",
-                      "--disable-autoexec", "--python-expr",
-                      "import bpy;print('PBENGINE='+bpy.context.scene.render.engine)"]
-            _d = subprocess.run(_dcmd, capture_output=True, text=True, timeout=120)
-            for _l in (_d.stdout or "").splitlines():
-                if _l.startswith("PBENGINE="):
-                    engine = _l.split("=", 1)[1].strip()
-        except Exception:                                    # noqa: BLE001 — detection is advisory
-            engine = ""
-        if engine and "EEVEE" in engine.upper():
-            report_log(tid, f"render engine is {engine}; EEVEE is not supported for headless GPU "
-                            "rendering — returning the scene to the buyer unrendered")
-            _post("/jobs/result", _signed_result(
-                tid, status="failed", failure_cause="unsupported_engine_eevee",
-                result=("This scene's render engine is EEVEE, which cannot be rendered on a headless "
-                        "GPU. Your .blend was NOT changed — set the scene's render engine to Cycles "
-                        "and submit again for a fast GPU render.")))
+        def _detect_engine():
+            try:
+                _dcmd = ["docker", "run", "--rm", "--network", "none"]
+                _dcmd += _isolation_flags(task)
+                _dcmd += ["-v", f"{scene}:/scene.blend:ro", *ep, "-b", "/scene.blend",
+                          "--disable-autoexec", "--python-expr",
+                          "import bpy;print('PBENGINE='+bpy.context.scene.render.engine)"]
+                _d = subprocess.run(_dcmd, capture_output=True, text=True, timeout=120, check=False)
+                for _l in (_d.stdout or "").splitlines():
+                    if _l.startswith("PBENGINE="):
+                        return _l.split("=", 1)[1].strip()
+            except Exception:                                # noqa: BLE001 — detection is advisory
+                return ""
+            return ""
+        # A pre-2.8 (Blender Internal) file loads in modern Blender as EEVEE, so the header version
+        # decides first (2026-09-25: a Blender 2.75 scene was refused as EEVEE and could never
+        # render). See _render_plan for the full table.
+        runner, set_engine, note, refuse = _render_plan(
+            _blend_file_version(scene), task.get("engine") or "auto",
+            task.get("blender_version") or "latest", detect=_detect_engine)
+        if refuse:
+            report_log(tid, note)
+            _post("/jobs/result", _signed_result(tid, status="failed", failure_cause=refuse,
+                                                 result=note))
             _set_ui(status="idle", task=None, fail=True)
             return
+        if note:
+            report_log(tid, note)
         # 2) render inside the container (GPU via NVIDIA Container Toolkit).
         # --network none: batch render needs no network -> no exfil / LAN access.
         # _isolation_flags: cap-drop ALL etc. so a malicious .blend (Blender auto-runs
@@ -2283,10 +2554,21 @@ def _run_render(task):
         cmd = ["docker", "run", "--rm", "--network", "none"]
         cmd += _isolation_flags(task)
         cmd += ["-v", f"{scene}:/scene.blend:ro", "-v", f"{out_dir}:/out"]
-        if task.get("gpu"):
-            cmd += [*gpu_runtime.docker_gpu_args()]
-        cmd += [image, "blender", "-b", "/scene.blend", "--disable-autoexec",
-                "-o", "/out/frame_", "-s", str(fs), "-e", str(fe), "-a"]
+        if runner == "2.79":
+            # Blender Internal is CPU-only: no GPU flags. The host's verified 2.79b tree is mounted
+            # read-only and run in the same image (it ships the X/GL libs 2.79 links against).
+            report_progress(tid, 18, "rendering as authored with Blender 2.79b (CPU)")
+            cmd += ["-v", f"{_ensure_blender_279()}:/opt/blender-2.79b:ro",
+                    "--entrypoint", "/opt/blender-2.79b/blender", image,
+                    "-b", "/scene.blend", "--disable-autoexec",
+                    "--python-expr", _render_setup_expr_279(set_engine)]
+        else:
+            if task.get("gpu"):
+                cmd += [*gpu_runtime.docker_gpu_args()]
+            cmd += [*ep, "-b", "/scene.blend", "--disable-autoexec",
+                    "--python-expr", _render_setup_expr(task.get("samples"), gpu=bool(task.get("gpu")),
+                                                        engine=set_engine)]
+        cmd += ["-o", "/out/frame_", "-s", str(fs), "-e", str(fe), "-a"]
         # Hard-kill the container at the buyer's AUTHORIZED runtime budget (audit H1): a render
         # can't consume more of the seller's GPU than the buyer paid to authorize (_run_docker
         # force-removes the container when the client-side timeout fires).
@@ -2514,8 +2796,8 @@ def _pb_vm_scan():
         # Mark 'reported' ONLY on an acknowledged 2xx — a swallowed transport error or a non-2xx
         # (5xx/timeout/401/409) must keep the task in the watch set so the next sweep retries,
         # rather than silently stranding it 'running' with the reservation + card hold held.
-        if not _post_result_ack(_signed_result(tid, status=final,
-                                               result=f"container_{status}_exit_{code}")):
+        if not _post_result_ack(_signed_result(tid, status=final, result=f"container_{status}_exit_{code}",
+                                               failure_cause=fail)):   # e.g. tunnel_lost
             logging.error(f"watchdog: /jobs/result NOT acknowledged for task {tid}; retry next sweep")
             continue                            # not acknowledged — keep watching
         logging.warning(f"watchdog reported task {tid} {final} (container {status}, exit {code})")
@@ -2772,6 +3054,8 @@ def run_agent():
         _gpu_startup_selftest()          # before the first heartbeat can offer this node
     except Exception:                    # noqa: BLE001 — never block startup
         pass
+    _probe_job_network()                 # the first heartbeat already says whether apps can run here
+    threading.Thread(target=_job_network_loop, daemon=True, name="pb-jobnet-probe").start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()   # online while we wait
     _TUN_SETTLED.wait(timeout=240)       # don't claim a serving job this node can't publish yet
     job_loop()

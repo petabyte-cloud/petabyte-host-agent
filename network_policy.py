@@ -8,6 +8,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -25,8 +26,42 @@ class NetworkUnavailable(RuntimeError):
 def _run(args):
     result = subprocess.run(args, capture_output=True, text=True, timeout=15)
     if result.returncode:
-        raise NetworkUnavailable("job network policy unavailable")
+        # Name the command (never its stderr: this reason reaches the buyer's task log).
+        raise NetworkUnavailable(f"job network policy unavailable: `{' '.join(args[:3])}` failed")
     return result.stdout.strip()
+
+
+DESKTOP = "Docker Desktop's daemon can't isolate rentals"
+_HINT = ("run the agent as root on Linux with the native Docker Engine; Docker Desktop and "
+         "rootless Docker can't isolate rentals")
+_HINTS = ((DESKTOP, "on Windows, re-run the Petabyte installer: it moves the agent into its own WSL "
+                    "distro with a native Docker Engine and leaves Docker Desktop as it is; on Linux, "
+                    "install Docker Engine (docker-ce) and run the agent as root"),
+          ("remote container daemon", "unset DOCKER_HOST and switch to the local engine "
+                                      "(`docker context use default`); " + _HINT),
+          ("missing ", "install iptables and iproute2 (e.g. `apt-get install iptables iproute2`)"))
+
+
+def hint(reason):
+    """The seller's next step for a NetworkUnavailable reason."""
+    return next((h for key, h in _HINTS if str(reason).startswith(key)), _HINT)
+
+
+def probe():
+    """(ok, reason): can ensure() work on this host at all? Creates no network and no rule.
+
+    Same daemon check ensure() runs first, plus the tools it shells out to. ok=False means every
+    networked (serving) rental placed here would be refused, so the agent reports it up front."""
+    try:
+        _local_daemon()
+        missing = [tool for tool in ("iptables", "ip6tables", "ip") if not shutil.which(tool)]
+        if missing:
+            return False, "missing " + ", ".join(missing)
+        return True, None
+    except NetworkUnavailable as e:
+        return False, str(e)
+    except Exception as e:                               # noqa: BLE001 — docker absent, hung, bad JSON
+        return False, f"container daemon unreachable ({type(e).__name__})"
 
 
 def _names(tid):
@@ -43,6 +78,8 @@ def _local_daemon():
     if endpoint != "unix:///var/run/docker.sock" or os.getenv("DOCKER_HOST"):
         raise NetworkUnavailable("remote container daemon refused")
     info = json.loads(_run(["docker", "info", "--format", "{{json .}}"]))
+    if info.get("Name") == "docker-desktop" or "Docker Desktop" in str(info.get("OperatingSystem")):
+        raise NetworkUnavailable(DESKTOP)               # e.g. its WSL integration in this distro
     if info.get("Name") != socket.gethostname() or info.get("OSType") != "linux":
         raise NetworkUnavailable("container daemon and firewall must share the host")
 

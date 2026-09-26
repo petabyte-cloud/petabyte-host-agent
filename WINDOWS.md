@@ -23,15 +23,19 @@ $env:PETABYTE_API_KEY="pk_your_node_key"; $env:PRICE_PER_HOUR="1.5"
 irm https://petabyte.market/install.ps1 | iex
 ```
 If Windows installs WSL for the first time it may ask to **reboot — rerun the same
-command after**. The script then: installs Ubuntu 24.04 → enables systemd → runs the
+command after**. The script then: creates the agent's own `Petabyte` WSL distro (Ubuntu 24.04;
+Docker Desktop's WSL integration never serves it, and Docker Desktop is left as it is) →
+enables systemd → runs the
 standard `install.sh` inside WSL (Docker, provision, attest, service) → registers a
 hidden **Scheduled Task** so the node comes online at logon.
 
 ## Verify
 ```powershell
-wsl -d Ubuntu-24.04 -u root -- systemctl status petabyte-agent
-wsl -d Ubuntu-24.04 -u root -- journalctl -u petabyte-agent -f
+wsl -d Petabyte -u root -- systemctl status petabyte-agent
+wsl -d Petabyte -u root -- journalctl -u petabyte-agent -f
 ```
+(Installed before the agent had its own distro? Use `Ubuntu-24.04`; re-running the installer
+moves the node into `Petabyte` if Docker Desktop serves that distro, keeping its listing.)
 The GPU appears in the marketplace exactly like a Linux node.
 
 ## Honest limits

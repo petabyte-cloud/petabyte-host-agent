@@ -1,11 +1,15 @@
 # Petabyte host agent — public source mirror
 
-This repository is a **read-only mirror** of the software GPU owners install to rent out their
-machines on [Petabyte](https://petabyte.market). Every file here is the content of the exact
-signed bundle that host machines download from `https://petabyte.market/agent.tar.gz`.
+This repository is the **MIT-licensed source mirror** of the seller agent GPU owners install
+to rent out their machines on [Petabyte](https://petabyte.market). You can inspect, modify,
+build and redistribute Petabyte's agent code under [LICENSE](LICENSE).
 
-- **Release:** `2c787785b4fa21ba5fa60e45121dfe7470c3be93`
-- **Bundle SHA-256:** `b2d06713a73dfbf10ae57d0226b47d81be84d83285251c8f4fab5b44b4170735`
+The agent payload comes from the verified, signed bundle served at
+`https://petabyte.market/agent.tar.gz`. This README, the license and the verification public
+key are mirror metadata; they may be added or updated separately from that bundle.
+
+- **Release:** `49cb87797c2e27be7ff1b8cced325c522d19acde`
+- **Bundle SHA-256:** `503d91fe1464ed5c3836250483acaa2a8fd876dfd7888738fb97b0e9fa20e24d`
 
 Hosts never install or update from this repository. The installer pins our release public key
 (`release_ed25519.pub`, also in this repo), and the updater (`update.sh`) refuses any bundle whose
@@ -23,11 +27,26 @@ openssl pkeyutl -verify -pubin -inkey release_ed25519.pub -rawin -in agent.tar.g
 sha256sum agent.tar.gz
 # 3. the files are identical to this repository
 tar -xzf agent.tar.gz
-diff -r --exclude=.git --exclude=README.md --exclude=release_ed25519.pub lumaris_agent/ ./
+diff -r --exclude=.git --exclude=README.md --exclude=LICENSE --exclude=release_ed25519.pub lumaris_agent/ ./
 ```
 
 Each release is a commit tagged `release-<sha>`, so the history shows what changed between
 versions.
+
+## Build and contribute
+
+See [INSTALL.md](INSTALL.md) for host installation, [WINDOWS.md](WINDOWS.md) for the Windows
+instructions and [BUILD.md](BUILD.md) for executable builds. For local source development:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Read the installer and configure your own node credential before running the agent. Do not
+commit credentials, signing keys or personal configuration. A modified build is not an
+official signed Petabyte release. Release-signing private keys are never published here.
 
 ## Where to start reading
 
@@ -44,8 +63,10 @@ Other questions: info@petabyte.market. Issues and pull requests are not monitore
 
 ## License
 
-Source available for inspection. Copyright © 2026 Petabyte Cloud, Inc. All rights reserved.
-No license to copy, modify or redistribute is granted beyond what GitHub's terms allow for
-viewing and forking public repositories. The `petabyte` command-line client is separately
-open source (MIT) at [petabyte-cloud/petabyte-client](https://github.com/petabyte-cloud/petabyte-client)
-and on [PyPI](https://pypi.org/project/petabyte-client/).
+Petabyte-authored agent code in this mirror is licensed under the [MIT License](LICENSE).
+Third-party dependencies retain their own licenses. This license does not apply to
+Petabyte's private marketplace backend or separate desktop-app code.
+
+The command-line client is also open source (MIT) at
+[petabyte-cloud/petabyte-client](https://github.com/petabyte-cloud/petabyte-client).
+Product updates are published in the [website changelog](https://petabyte.market/changelog).

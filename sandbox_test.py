@@ -755,5 +755,218 @@ finally:
     tf._sched.clear(); tf._sched.update(_saved[4])
     tf._GPU_UNUSABLE.clear()
 
+
+# --- GPU render: Cycles is pointed at the GPU, samples applied, movie -> PNG frames (2026-09-25) ---
+import task_fetcher as _tf_render
+_expr = _tf_render._render_setup_expr(64, gpu=True)
+compile(_expr, "<render-setup>", "exec")
+ok("render setup expr compiles", True)
+ok("render setup picks OptiX first, then CUDA/HIP/oneAPI",
+   "('OPTIX', 'CUDA', 'HIP', 'ONEAPI')" in _expr and "s.cycles.device = 'GPU'" in _expr)
+ok("render setup applies the buyer's sample count", "s.cycles.samples = 64" in _expr)
+ok("render setup renders a movie format as PNG frames", "is_movie_format" in _expr and "'PNG'" in _expr)
+ok("no GPU requested -> no device switch", "if False:" in _tf_render._render_setup_expr(None, gpu=False))
+_rsrc = src("_run_render")
+ok("_run_render passes the setup expr BEFORE -a (render runs after it)",
+   "--python-expr" in _rsrc and _rsrc.index("_render_setup_expr(") < _rsrc.index('"-a"'))
+ok("...and still disables the scene's own scripts", "--disable-autoexec" in _rsrc)
+
+
+# --- Legacy .blend, Blender 2.79b, GPU-only devices (2026-09-25: a Blender 2.75 Internal scene
+# was refused as EEVEE, and Cycles rendered hybrid CPU+GPU) ---
+import gzip
+import hashlib
+import io
+import shutil
+import tarfile
+import tempfile
+_td = tempfile.mkdtemp()
+
+
+def _blend(name, head, gz=False):
+    p = os.path.join(_td, name)
+    with (gzip.open if gz else open)(p, "wb") as f:
+        f.write(head + b"\0" * 64)
+    return p
+
+
+ok("header: a Blender 2.75 file reads as 275", tf._blend_file_version(_blend("a", b"BLENDER-v275")) == 275)
+ok("header: a gzip-compressed 2.79 file reads as 279",
+   tf._blend_file_version(_blend("b", b"BLENDER_v279", gz=True)) == 279)
+ok("header: a 4.5 file reads as 405", tf._blend_file_version(_blend("c", b"BLENDER-v405")) == 405)
+ok("header: 5.x header / zstd / missing file -> None (treated as modern)",
+   tf._blend_file_version(_blend("d", b"BLENDER17-01v0500")) is None
+   and tf._blend_file_version(_blend("e", b"\x28\xb5\x2f\xfd" + b"x" * 8)) is None
+   and tf._blend_file_version(os.path.join(_td, "missing")) is None)
+
+_probed = []
+
+
+def _det(engine):
+    return lambda: _probed.append(engine) or engine
+
+
+P = tf._render_plan
+_r = P(275, "auto", "latest", detect=_det("BLENDER_EEVEE"))
+ok("legacy + auto -> Cycles on GPU, with a note naming blender_version=2.79",
+   _r[:2] == ("latest", "CYCLES") and "blender_version=2.79" in _r[2] and _r[3] is None)
+ok("...decided by the header, never by modern Blender (which misreads it as EEVEE)", _probed == [])
+ok("legacy + blender_version=2.79 -> 2.79b, keeping the file's engine",
+   P(275, "auto", "2.79") == ("2.79", None, None, None))
+ok("...also spelled 2.79b (blend_inspect's recommended settings)",
+   P(275, "BLENDER_RENDER", "2.79b")[0] == "2.79")
+ok("legacy + engine=BLENDER_RENDER -> 2.79b", P(275, "BLENDER_RENDER")[:2] == ("2.79", "BLENDER_RENDER"))
+_r = P(405, "auto", "latest", detect=_det("BLENDER_EEVEE_NEXT"))
+ok("modern EEVEE + auto -> refused", _r[0] is None and _r[3] == "unsupported_engine_eevee")
+_probed.clear()
+ok("modern EEVEE + engine=CYCLES -> converted to Cycles (no probe needed)",
+   P(405, "CYCLES", "latest", detect=_det("BLENDER_EEVEE")) == ("latest", "CYCLES", None, None)
+   and _probed == [])
+ok("modern Cycles + auto -> rendered as is", P(405, detect=lambda: "CYCLES") == ("latest", None, None, None))
+ok("unreadable header + EEVEE -> refused like any modern file",
+   P(None, detect=lambda: "BLENDER_EEVEE")[3] == "unsupported_engine_eevee")
+ok("2.8+ file + blender_version=2.79 -> refused (2.79 cannot open newer files)",
+   P(405, "auto", "2.79")[3] == "unsupported_blender_version")
+ok("an unknown engine value falls back to auto (never reaches the python expr)",
+   P(405, "x'); import os #", detect=lambda: "CYCLES") == ("latest", None, None, None))
+
+
+class _Dev:
+    def __init__(self, t):
+        self.type, self.use = t, True          # Blender's default for a new device entry
+
+
+def _fake_bpy(devs, engine):
+    prefs = types.SimpleNamespace(compute_device_type="NONE",
+                                  get_devices_for_type=lambda dt: devs.get(dt, []))
+    sc = types.SimpleNamespace(
+        render=types.SimpleNamespace(engine=engine, is_movie_format=True, threads_mode="FIXED",
+                                     image_settings=types.SimpleNamespace(file_format="FFMPEG")),
+        cycles=types.SimpleNamespace(samples=0, device="CPU"))
+    sys.modules["bpy"] = types.SimpleNamespace(context=types.SimpleNamespace(
+        scene=sc, preferences=types.SimpleNamespace(
+            addons={"cycles": types.SimpleNamespace(preferences=prefs)})))
+    return sc, prefs
+
+
+_g, _c, _c0 = _Dev("CUDA"), _Dev("CPU"), _Dev("CPU")
+_sc, _prefs = _fake_bpy({"OPTIX": [_c0], "CUDA": [_g, _c]}, "BLENDER_EEVEE")
+exec(tf._render_setup_expr(64, gpu=True, engine="CYCLES"), {})
+ok("engine=CYCLES switches the scene to Cycles", _sc.render.engine == "CYCLES")
+ok("GPU-only: the GPU row is enabled and the CPU row is NOT (no hybrid render)",
+   _g.use and not _c.use and _sc.cycles.device == "GPU")
+ok("a device type with only a CPU row is skipped (OptiX absent -> CUDA)", _prefs.compute_device_type == "CUDA")
+
+_expr279 = tf._render_setup_expr_279()
+_sc, _ = _fake_bpy({}, "BLENDER_RENDER")
+exec(_expr279, {})
+ok("2.79 expr keeps the file's engine, forces PNG, threads AUTO",
+   _sc.render.engine == "BLENDER_RENDER" and _sc.render.image_settings.file_format == "PNG"
+   and _sc.render.threads_mode == "AUTO")
+ok("2.79 expr is Python 3.5 (no f-strings, no cycles/prefs calls)",
+   "f'" not in _expr279 and 'f"' not in _expr279 and "preferences" not in _expr279)
+sys.modules.pop("bpy", None)
+
+ok("2.79b is pinned to the published release279b.sha256 value over https",
+   tf.BLENDER_279_SHA256 == "43824a4e0b0c6de6fa34ff224eec44c1cc9f26a95f6f3c8c2558d1c05704183c"
+   and tf.BLENDER_279_URL.startswith("https://download.blender.org/"))
+
+
+class _Resp:
+    def __init__(self, data):
+        self.data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_bytes(self):
+        yield self.data
+
+
+_buf = io.BytesIO()
+with tarfile.open(fileobj=_buf, mode="w:bz2") as _t:
+    _ti = tarfile.TarInfo(tf._BLENDER_279_TOP + "/blender")
+    _ti.size, _ti.mode = 3, 0o755
+    _t.addfile(_ti, io.BytesIO(b"elf"))
+_good = _buf.getvalue()
+_saved279 = (tf.httpx.stream, tf.BLENDER_279_CACHE, tf.BLENDER_279_SHA256)
+try:
+    tf.BLENDER_279_CACHE = os.path.join(_td, "b279")
+    tf.httpx.stream = lambda *a, **k: _Resp(_good)
+    try:
+        tf._ensure_blender_279()
+        _refused = False
+    except RuntimeError:
+        _refused = True
+    ok("2.79b: a download that does not match the pinned sha256 is refused, nothing extracted",
+       _refused and not os.path.exists(os.path.join(tf.BLENDER_279_CACHE, tf._BLENDER_279_TOP)))
+    tf.BLENDER_279_SHA256 = hashlib.sha256(_good).hexdigest()
+    _d279 = tf._ensure_blender_279()
+    ok("2.79b: a matching download is extracted into the cache", os.path.isfile(os.path.join(_d279, "blender")))
+    tf.httpx.stream = lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-downloaded"))
+    ok("2.79b: fetched ONCE — the cached tree is reused without the network", tf._ensure_blender_279() == _d279)
+finally:
+    tf.httpx.stream, tf.BLENDER_279_CACHE, tf.BLENDER_279_SHA256 = _saved279
+
+
+def _render_with(head, **extra):
+    """Drive the real _run_render with network/docker stubbed; capture the render argv."""
+    got = {"argv": None, "posts": [], "logs": []}
+    _j = types.SimpleNamespace(json=lambda: {"download_url": "https://x/d", "upload_url": "https://x/u",
+                                             "ref": "s3://b/render/1/seg0/f.tar"})
+    names = ("_run_docker", "_ensure_blender_279", "_post", "report_log", "report_progress", "_set_ui")
+    saved = ([getattr(tf, n) for n in names], shutil.which, tf.httpx.post, tf.httpx.put,
+             tf.safe_fetch.get, tf.gpu_runtime.docker_gpu_args)
+    try:
+        tf._run_docker = lambda argv, timeout=None: got.__setitem__("argv", list(argv))
+        tf._ensure_blender_279 = lambda: "/var/lib/petabyte-agent/blender/2.79b/b"
+        tf._post = lambda path, body: got["posts"].append(body)
+        tf.report_log = lambda tid, m: got["logs"].append(m)
+        tf.report_progress = lambda *a, **k: None
+        tf._set_ui = lambda **k: None
+        shutil.which = lambda n: "/usr/bin/docker"
+        tf.httpx.post = lambda *a, **k: _j
+        tf.httpx.put = lambda *a, **k: None
+        tf.safe_fetch.get = lambda *a, **k: types.SimpleNamespace(content=head + b"\0" * 64)
+        tf.gpu_runtime.docker_gpu_args = lambda: ["--gpus", "all"]
+        tf._run_render({"task_id": 9, "frame_start": 1, "frame_end": 2, "gpu": True,
+                        "image": "linuxserver/blender:latest", **extra})
+    finally:
+        for n, f in zip(names, saved[0]):
+            setattr(tf, n, f)
+        (shutil.which, tf.httpx.post, tf.httpx.put, tf.safe_fetch.get,
+         tf.gpu_runtime.docker_gpu_args) = saved[1:]
+    return got
+
+
+_g279 = _render_with(b"BLENDER-v275", blender_version="2.79")
+_a = _g279["argv"] or []
+ok("2.79 render: --network none + full isolation flags",
+   _a[:5] == ["docker", "run", "--rm", "--network", "none"] and "--cap-drop" in _a
+   and "no-new-privileges" in _a)
+ok("2.79 render: the host 2.79b tree is mounted READ-ONLY and its binary is the entrypoint",
+   "/var/lib/petabyte-agent/blender/2.79b/b:/opt/blender-2.79b:ro" in _a
+   and "--entrypoint" in _a and _a[_a.index("--entrypoint") + 1:][:2]
+   == ["/opt/blender-2.79b/blender", "linuxserver/blender:latest"])
+ok("2.79 render: --disable-autoexec, the 2.79 setup expr, and no GPU flags (Internal is CPU-only)",
+   "--disable-autoexec" in _a and tf._render_setup_expr_279() in _a and "--gpus" not in _a)
+ok("2.79 render completes", _g279["posts"] and _g279["posts"][-1]["proof"].get("status") == "completed")
+_glat = _render_with(b"BLENDER-v275")
+_a = _glat["argv"] or []
+ok("legacy + auto renders modern Blender on the GPU, converted to Cycles, with the buyer note",
+   "--gpus" in _a and any("s.render.engine = 'CYCLES'" in x for x in _a)
+   and any("blender_version=2.79" in m for m in _glat["logs"]))
+# Blender is the ENTRYPOINT: under the image's s6 /init + --cap-drop ALL the container never exited
+# after Blender quit (no CAP_KILL to stop the desktop services), so every render hung to its budget.
+ok("modern render runs blender as the entrypoint, not under the image's /init",
+   "--entrypoint" in _a and _a[_a.index("--entrypoint") + 1:][:2] == ["blender", "linuxserver/blender:latest"])
+ok("...and so does the engine probe", "*ep" in _rsrc.split("def _detect_engine")[1].split("return")[0])
+
 print(f"\n=== sandbox: {'0 failures' if _fail == 0 else str(_fail) + ' FAILED'} ===")
 raise SystemExit(1 if _fail else 0)

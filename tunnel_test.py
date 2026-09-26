@@ -264,12 +264,14 @@ ok("past the give-up window it is handed to the watchdog as failed",
 _posted, _cleaned = [], []
 tf._post_result_ack = lambda payload: (_posted.append(payload), True)[1]
 tf._signed_result = lambda tid, status="completed", result=None, **k: {
-    "task_id": tid, "status": status, "result": result}
+    "task_id": tid, "status": status, "result": result, **k}   # keep failure_cause (PET-144 block below)
 tf._cleanup_job_resources = lambda tid, name=None: _cleaned.append((tid, name))
 _er.forget = lambda tid: None
 tf._pb_vm_scan()
 ok("the watchdog reports it failed (buyer refunded/prorated) without asking docker",
    len(_posted) == 1 and _posted[0]["status"] == "failed" and "tunnel_lost" in _posted[0]["result"])
+ok("...naming failure_cause=tunnel_lost, so the API can tell a platform outage from a seller fault",
+   _posted[0]["failure_cause"] == "tunnel_lost")
 ok("and tears the rental down", _cleaned == [(5, "c5")] and 5 not in tf._pb_vm_watch)
 
 # ------------------------------------------------------------------ restored after an agent restart
@@ -303,6 +305,100 @@ _reg.clear()
 tf._check_tunnels(now=9000.0)
 ok("the next pass re-opens it on that port and re-registers it",
    "127.0.0.1:20004:127.0.0.1:9041" in calls[0] and _reg == [("vm_41", 20004, "127.0.0.1")])
+# ---------------------------------------------------------------- PET-144: refusing SAYS WHY
+# A node with no enrolled tunnel refuses a serving template in milliseconds and reports
+# failure_cause=network_policy -- the same cause a failed per-job Docker bridge reports. That
+# branch logged nothing at all, so the buyer's task log was empty and the only visible signal
+# pointed at container networking. 27 rentals were charged and refunded on 2026-09-25 before
+# anyone could tell the two apart. The refusal must name the reverse tunnel.
+_logs.clear()
+_results = []
+tf._post = lambda path, body: _results.append((path, body))
+tf._set_ui = lambda **_kw: None
+tf._TUN_GW, tf._TUN_KEY = "", "/nonexistent/tunnel_key"
+tf._run_template({"task_id": 4141, "port": 8888, "template": "jupyter"})
+ok("a serving template is still refused when the tunnel never enrolled",
+   bool(_results) and _results[-1][0] == "/jobs/result"
+   and _results[-1][1]["status"] == "failed")
+ok("the cause stays network_policy (the server's placement carve-out keys off it)",
+   _results[-1][1].get("failure_cause") == "network_policy")
+ok("and the task log now names the reverse tunnel, not the container network",
+   any("reverse tunnel" in m for m in _logs))
+ok("an un-enrolled node points at the enrolment endpoint",
+   any("/node/tunnel" in m for m in _logs))
+
+_logs.clear(); _results.clear()
+tf._TUN_GW = "pbtun@203.0.113.1"          # gateway configured, key still absent
+tf._run_template({"task_id": 4142, "port": 8888, "template": "vllm"})
+ok("a configured gateway with no key names the key path instead",
+   any("/nonexistent/tunnel_key" in m for m in _logs)
+   and not any("/node/tunnel" in m for m in _logs))
+
+# ---------------------------------------------------------------- PET-144: _ensure_job_network
+# It swallowed every network_policy.ensure() refusal into one fixed string, so ~8 distinct
+# causes (not root, remote daemon, `docker network create` failed, firewall drift...) were
+# indistinguishable in the operator's log.
+import logging as _logging                                        # noqa: E402
+_warnings = []
+_real_warning = _logging.warning
+_logging.warning = lambda msg, *a, **kw: _warnings.append((msg % a) if a else str(msg))
+_saved_np = sys.modules.pop("network_policy", None)
+try:
+    class _Boom:
+        @staticmethod
+        def ensure(_tid):
+            raise RuntimeError("job network ownership or isolation mismatch")
+
+    sys.modules["network_policy"] = _Boom
+    ok("a refused job network still returns no network (fail closed), with its reason",
+       tf._ensure_job_network(77) == (None, "job network ownership or isolation mismatch"))
+    ok("and the real refusal reason reaches the log",
+       any("ownership or isolation mismatch" in w for w in _warnings))
+    ok("with the task id, so it can be correlated", any("77" in w for w in _warnings))
+finally:
+    _logging.warning = _real_warning
+    sys.modules.pop("network_policy", None)
+    if _saved_np is not None:
+        sys.modules["network_policy"] = _saved_np
+
+# ------------------------------------------------------------------ concurrent saves of the port file
+# Two threads saving at once (supervisor + a teardown) shared one ".tmp" path: the one paused
+# mid-dump then wrote its OLDER snapshot into the file the other had already renamed into place.
+tf._tun_rentals.clear()
+tf._tun_rentals[81] = {"rp": 20010}
+_paused, _resume, _real_dump = threading.Event(), threading.Event(), json.dump
+
+
+def _slow_dump(obj, f, *a, **k):
+    if not _paused.is_set():                  # the first writer stalls mid-save
+        _paused.set()
+        _resume.wait(5)
+    return _real_dump(obj, f, *a, **k)
+
+
+json.dump = _slow_dump
+try:
+    w1 = threading.Thread(target=tf._save_tunnel_ports)
+    w1.start()
+    _paused.wait(5)
+    tf._tun_rentals[82] = {"rp": 20011}       # the newer state a second thread saves meanwhile
+    w2 = threading.Thread(target=tf._save_tunnel_ports)
+    w2.start()
+    w2.join(0.5)
+    _resume.set()
+    w1.join(5)
+    w2.join(5)
+finally:
+    json.dump = _real_dump
+try:
+    with open(tf._TUN_PORTS_FILE) as _f:
+        _saved = json.load(_f)
+except ValueError:
+    _saved = "corrupt"
+ok("concurrent saves leave the NEWEST port map, never a corrupt or older one",
+   _saved == {"81": 20010, "82": 20011})
+ok("...and no temp file is left behind",
+   os.listdir(os.path.dirname(tf._TUN_PORTS_FILE)) == ["tunnel_ports.json"])
 
 print()
 print("=== tunnel: " + ("0 failures" if _fail == 0 else str(_fail) + " FAILED") + " ===")

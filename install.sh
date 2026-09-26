@@ -20,8 +20,35 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y python3 python3-venv git curl ca-certificates rsync wireguard-tools
 
+echo "==> fetching agent"
+mkdir -p "$APP" /var/lib/petabyte-agent
+# Which agent bundle this node runs (the agent reports it; update.sh keeps it current). Unknown
+# for a local copy or a git clone.
+rm -f /var/lib/petabyte-agent/bundle.sha256
+if [ -f "./task_fetcher.py" ]; then
+  cp -r ./* "$APP"/                          # running from inside lumaris_agent/ locally
+else
+  TMP=$(mktemp -d)
+  # Preferred: fetch the agent bundle from OUR server (no GitHub needed => works when the
+  # repo is private, and no host ever holds a git credential).
+  if curl -fsSL "$PETABYTE_API_URL/agent.tar.gz" -o "$TMP/agent.tar.gz" 2>/dev/null \
+     && tar -xzf "$TMP/agent.tar.gz" -C "$TMP" 2>/dev/null && [ -d "$TMP/lumaris_agent" ]; then
+    cp -r "$TMP/lumaris_agent/." "$APP"/
+    sha256sum "$TMP/agent.tar.gz" | cut -d' ' -f1 > /var/lib/petabyte-agent/bundle.sha256
+  else
+    # Fallback: clone the repo (needs access if the repo is private).
+    echo "==> agent bundle unavailable, falling back to git clone"
+    git clone --depth 1 "$REPO" "$TMP/repo"
+    cp -r "$TMP/repo/$SUBDIR/." "$APP"/
+  fi
+  rm -rf "$TMP"
+fi
+
 echo "==> installing Docker (sandbox runtime)"
-command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
+# Buyers' apps need the LOCAL native Docker Engine (network_policy: per-rental network + firewall).
+# isolation.py is the one check+repair the agent and the signed auto-update share: it installs or
+# enables Docker Engine when that is safe, never touches Docker Desktop, and prints why otherwise.
+python3 "$APP/isolation.py" repair || true
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "==> installing nvidia-container-toolkit (GPU in containers; native + WSL2)"
@@ -280,8 +307,7 @@ SCUNIT
   grep -q "^PB_JOB_SCRATCH_REQUIRE_RAM=" "$ENVF" 2>/dev/null || echo "PB_JOB_SCRATCH_REQUIRE_RAM=1" >> "$ENVF"
 fi
 
-echo "==> fetching agent"
-mkdir -p "$APP" /etc/petabyte
+mkdir -p /etc/petabyte
 
 # Pin the release verification PUBLIC key. The API substitutes it into this script at download
 # time; update.sh then requires every future agent bundle to be signed by the matching offline
@@ -294,23 +320,6 @@ if ! grep -q "BEGIN PUBLIC KEY" /etc/petabyte/release_ed25519.pub 2>/dev/null; t
   rm -f /etc/petabyte/release_ed25519.pub
 fi
 
-if [ -f "./task_fetcher.py" ]; then
-  cp -r ./* "$APP"/                          # running from inside lumaris_agent/ locally
-else
-  TMP=$(mktemp -d)
-  # Preferred: fetch the agent bundle from OUR server (no GitHub needed => works when the
-  # repo is private, and no host ever holds a git credential).
-  if curl -fsSL "$PETABYTE_API_URL/agent.tar.gz" -o "$TMP/agent.tar.gz" 2>/dev/null \
-     && tar -xzf "$TMP/agent.tar.gz" -C "$TMP" 2>/dev/null && [ -d "$TMP/lumaris_agent" ]; then
-    cp -r "$TMP/lumaris_agent/." "$APP"/
-  else
-    # Fallback: clone the repo (needs access if the repo is private).
-    echo "==> agent bundle unavailable, falling back to git clone"
-    git clone --depth 1 "$REPO" "$TMP/repo"
-    cp -r "$TMP/repo/$SUBDIR/." "$APP"/
-  fi
-  rm -rf "$TMP"
-fi
 cd "$APP"
 python3 -m venv .venv
 .venv/bin/pip install -q -U pip
@@ -339,12 +348,27 @@ if command -v nvidia-smi >/dev/null 2>&1 && [ "${AGENT_ALLOW_UNVERIFIED_VRAM:-fa
   docker pull "$_wipe" >/dev/null || echo "WARN: could not cache $_wipe; GPU jobs will be refused until: docker pull $_wipe"
 fi
 
-echo "==> registering + attesting this node"
-PETABYTE_AGENT_KEY="$KEYF" AGENT_ENV="$ENVF" \
-  PETABYTE_API_URL="$PETABYTE_API_URL" PETABYTE_API_KEY="$PETABYTE_API_KEY" \
-  PRICE_PER_HOUR="${PRICE_PER_HOUR:-}" UNITS="${UNITS:-1}" GPU_MODEL="${GPU_MODEL:-}" \
-  PROVIDER="${PROVIDER:-}" \
-  .venv/bin/python provision.py
+# Prove it BEFORE listing: build and remove a real per-rental network, exactly as a rental would.
+echo "==> self-test: can this machine isolate buyers' apps?"
+if ! .venv/bin/python isolation.py selftest; then
+  echo "!! ------------------------------------------------------------------------------------------"
+  echo "!! This machine can only run BATCH jobs until you fix the problem above. It still lists, but"
+  echo "!! buyers' apps will not be placed here. After fixing it, re-run this installer."
+  echo "!! ------------------------------------------------------------------------------------------"
+fi
+
+# PETABYTE_KEEP_SPEC=1 (the Windows installer moving an existing node into its own WSL distro):
+# keep the copied registration instead of listing this machine a second time.
+if [ "${PETABYTE_KEEP_SPEC:-}" = "1" ] && grep -q '^PETABYTE_SPEC_ID=.' "$ENVF" 2>/dev/null && [ -s "$KEYF" ]; then
+  echo "==> keeping this node's existing registration ($(grep '^PETABYTE_SPEC_ID=' "$ENVF"))"
+else
+  echo "==> registering + attesting this node"
+  PETABYTE_AGENT_KEY="$KEYF" AGENT_ENV="$ENVF" \
+    PETABYTE_API_URL="$PETABYTE_API_URL" PETABYTE_API_KEY="$PETABYTE_API_KEY" \
+    PRICE_PER_HOUR="${PRICE_PER_HOUR:-}" UNITS="${UNITS:-1}" GPU_MODEL="${GPU_MODEL:-}" \
+    PROVIDER="${PROVIDER:-}" \
+    .venv/bin/python provision.py
+fi
 
 # Kata: turn the runtime on for this node when it was installed above (provision.py preserves
 # operator-set lines, so this survives re-provisioning). GPU jobs stay on gVisor until the operator
