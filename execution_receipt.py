@@ -103,11 +103,18 @@ def remember(task):
     with _lock:
         path, scope = _restore()
         _tasks[int(task["task_id"])] = {
-            "spec_id": task.get("spec_id"), "assignment": task.get("assignment", ""), "saved_at": time.time()}
+            "spec_id": task.get("spec_id"), "assignment": task.get("assignment", ""),
+            "lease_generation": task.get("lease_generation", 0), "saved_at": time.time()}
         _tasks.move_to_end(int(task["task_id"]))
         while len(_tasks) > 4096:
             _tasks.popitem(last=False)
         _persist(path, scope)
+
+
+def generation(tid):
+    with _lock:
+        _restore()
+        return _tasks.get(int(tid), {}).get("lease_generation", 0)
 
 
 def make(tid, *, status="completed", result=None, content_hash=None, output_hash=None):

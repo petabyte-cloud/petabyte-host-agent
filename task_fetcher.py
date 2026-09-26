@@ -272,6 +272,7 @@ def heartbeat_loop():
                     logging.warning("Idle mining paused: %s", exc)
                     idle_mining.controller.revoke()
                 # Owner may have changed the selling window in the dashboard — adopt it live.
+                _note_agent_update(_body)       # server-requested signed self-update (job_loop)
                 _sc = _body.get("sell_schedule")
                 if _sc is not None:
                     _sched["start"], _sched["end"] = _parse_sched(_sc)
@@ -491,20 +492,36 @@ def _to_str(obj):
     return obj if isinstance(obj, str) else json.dumps(obj)
 
 
+def _lease_payload(payload):
+    if "task_id" in payload:
+        import execution_receipt
+        return {**payload, "lease_generation": execution_receipt.generation(payload["task_id"])}
+    return payload
+
+
 def _post(path, payload):
     try:
-        httpx.post(f"{API_URL}{path}", headers=HEADERS, json=payload, timeout=15, trust_env=False)
+        httpx.post(f"{API_URL}{path}", headers=HEADERS, json=_lease_payload(payload), timeout=15, trust_env=False)
     except Exception as e:                              # noqa: BLE001
         logging.error(f"{path} error: {e}")
 
 
-def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5) -> bool:
+def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_generation=None) -> bool:
     """P1-7: report node:port to the control plane so a template VM flips starting->running and
     the gateway can route buyers to it. ip_address is optional — the server falls back to the
     public source IP of this request. Retries a few times: right after /launch the VMRoute may not
     be committed yet (409 'not in a registrable state'), and a transient 5xx must not strand the
     VM in 'starting'. register_vm_tunnel is idempotent, so retrying is safe."""
     body = {"vm_id": str(vm_id), "tunnel_port": int(tunnel_port)}
+    if lease_generation is not None:
+        body["lease_generation"] = lease_generation
+    # Persisted receipts survive an agent restart; only this VM's execution can
+    # re-register its tunnel after a migration.
+    for tid, rental in _tun_rentals.items():
+        if rental.get("vm_id") == vm_id:
+            import execution_receipt
+            body["lease_generation"] = execution_receipt.generation(tid)
+            break
     if ip_address:
         body["ip_address"] = ip_address
     delay = 2
@@ -552,7 +569,7 @@ def _post_result_ack(payload) -> bool:
     seller's unit consumed and the buyer's escrow held. Retrying is safe: /jobs/result is
     idempotent on a terminal task (returns 200 {"idempotent": true})."""
     try:
-        r = httpx.post(f"{API_URL}/jobs/result", headers=HEADERS, json=payload, timeout=15, trust_env=False)
+        r = httpx.post(f"{API_URL}/jobs/result", headers=HEADERS, json=_lease_payload(payload), timeout=15, trust_env=False)
     except Exception as e:                              # noqa: BLE001
         logging.error(f"/jobs/result error: {e}")
         return False
@@ -588,27 +605,41 @@ def report_log(task_id, line):
     _post("/jobs/log", {"task_id": task_id, "line": line})
 
 
-def _restore_volume(volume, restore_ref, task_id):
+def _restore_volume(volume, restore_ref, task_id, task=None):
     """Download via a pre-signed GET URL, VERIFY the signed hash, decrypt, restore."""
     if not restore_ref:
-        return
+        return True
     try:
-        import hashlib, subprocess, os as _os
+        import hashlib
         from cryptography.fernet import Fernet
         g = httpx.post(f"{API_URL}/jobs/restore_url", headers=HEADERS, timeout=15,
-                       json={"task_id": task_id, "snapshot_ref": restore_ref}, trust_env=False).json()
+                       json=_lease_payload({"task_id": task_id, "snapshot_ref": restore_ref}), trust_env=False)
+        g.raise_for_status()
+        g = g.json()
         enc = safe_fetch.get(g["download_url"], timeout=120, max_bytes=128 * 1024 * 1024).content
         if g.get("content_hash") and hashlib.sha256(enc).hexdigest() != g["content_hash"]:
             report_log(task_id, "RESTORE INTEGRITY CHECK FAILED — aborting")
-            return
+            return False
         data = Fernet(g["enc_key"].encode()).decrypt(enc)      # client-side decrypt
-        _os.makedirs(f"/var/lib/petabyte/vol/{volume}", exist_ok=True)
-        local = f"/tmp/{volume}-restore.tar"
-        open(local, "wb").write(data)
-        subprocess.check_call(["tar", "-xf", local, "-C", f"/var/lib/petabyte/vol/{volume}"])
+        import io, tarfile, workspace_snapshot
+        destination = workspace_snapshot.directory(task or {"task_id": task_id}, volume)
+        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            if sum(member.size for member in archive.getmembers()) > 128 * 1024 * 1024:
+                raise ValueError("expanded workspace exceeds the restore limit")
+            # The archive came from an untrusted seller. Reject traversal, devices
+            # and escaping links rather than unpacking as root through plain tar.
+            def confined(member, path):
+                safe = tarfile.data_filter(member, path)
+                # Container images use fixed numeric service UIDs. Dropping their
+                # ownership makes a restored Jupyter/Blender directory root-owned
+                # and unwritable. Preserve it only after the confinement checks.
+                return safe.replace(uid=member.uid, gid=member.gid) if safe else None
+            archive.extractall(destination, filter=confined)
         report_log(task_id, f"restored {volume} from {restore_ref} (verified)")
+        return True
     except Exception as e:                              # noqa: BLE001
         logging.error(f"restore failed: {e}")
+        return False
 
 
 def _backup_once(task, volume):
@@ -618,14 +649,22 @@ def _backup_once(task, volume):
     try:
         import subprocess, hashlib, time as _tt
         from cryptography.fernet import Fernet
-        local = f"/tmp/{volume}-{int(_tt.time())}.tar"
-        subprocess.check_call(["tar", "-cf", local,
-                               "-C", f"/var/lib/petabyte/vol/{volume}", "."])
+        import tempfile, workspace_snapshot
+        source = workspace_snapshot.directory(task, volume)
+        handle, local = tempfile.mkstemp(prefix=f"pb-backup-t{tid}-", suffix=".tar")
+        os.close(handle)
+        subprocess.check_call(["tar", "-cf", local, "-C", source, "."])
         grant = httpx.post(f"{API_URL}/jobs/backup_url", headers=HEADERS, timeout=15,
-                           json={"task_id": tid,
-                                 "filename": f"{volume}-{int(_tt.time())}.tar.enc"}, trust_env=False).json()
-        enc = Fernet(grant["enc_key"].encode()).encrypt(open(local, "rb").read())
-        httpx.put(grant["upload_url"], content=enc, timeout=300, trust_env=False)
+                           json=_lease_payload({"task_id": tid,
+                                 "filename": f"{volume}-{__import__('uuid').uuid4().hex}.tar.enc"}), trust_env=False)
+        grant.raise_for_status()
+        grant = grant.json()
+        with open(local, "rb") as archive:
+            enc = Fernet(grant["enc_key"].encode()).encrypt(archive.read())
+        if len(enc) > 128 * 1024 * 1024:
+            raise ValueError("workspace checkpoint exceeds the 128 MiB restore limit")
+        uploaded = httpx.put(grant["upload_url"], content=enc, timeout=300, trust_env=False)
+        uploaded.raise_for_status()
         h = hashlib.sha256(enc).hexdigest()             # hash of the uploaded bytes
         proof = {"task_id": tid, "output_hash": h[:16], "ts": int(_tt.time())}
         _post("/jobs/checkpoint", {"task_id": tid, "snapshot_ref": grant["snapshot_ref"],
@@ -634,6 +673,12 @@ def _backup_once(task, volume):
         report_log(tid, f"backup -> {grant['snapshot_ref']} ({len(enc)} bytes, encrypted)")
     except Exception as e:                              # noqa: BLE001
         logging.error(f"backup failed: {e}")
+    finally:
+        if "local" in locals():
+            try:
+                os.unlink(local)
+            except OSError:
+                pass
 
 
 def _start_backup_thread(task):
@@ -1090,6 +1135,55 @@ def _agent_bundle():
     return sha if len(sha) == 64 and all(ch in "0123456789abcdef" for ch in sha) else None
 
 
+# The server says (heartbeat `agent_update`) that a newer SIGNED bundle is served. job_loop runs the
+# same update the 6-hourly timer runs, but now and only between jobs: update.sh restarts the agent,
+# which would kill a job mid-run. update.sh still verifies the bundle against the pinned release key
+# and refuses anything unsigned or tampered, so this can only ever apply a genuinely signed release.
+_UPDATE_UNIT = "petabyte-agent-update.service"
+_UPDATE_RETRY_S = 1800        # a refused/failed update (e.g. bad signature) retries at most this often
+_AGENT_UPDATE = {"wanted": None, "started": 0.0}
+
+
+def _note_agent_update(body):
+    au = body.get("agent_update") if isinstance(body, dict) else None
+    want = str(au.get("bundle") or "") if isinstance(au, dict) and au.get("required") else ""
+    _AGENT_UPDATE["wanted"] = want if len(want) == 64 else None
+
+
+def _systemctl(*args):
+    import subprocess as _sp
+    try:
+        return _sp.run(["systemctl", *args], capture_output=True, text=True, timeout=15)
+    except (OSError, _sp.TimeoutExpired):
+        return None
+
+
+def _self_update_holds_claims():
+    """True while a server-requested self-update is starting or running: job_loop claims nothing, so
+    the agent restart that update.sh performs never lands mid-job. Respects the seller's opt-out:
+    PETABYTE_AUTO_UPDATE=false leaves the update timer uninstalled, and then nothing runs here."""
+    want = _AGENT_UPDATE["wanted"]
+    if not want or want == _agent_bundle():
+        return False
+    st = _systemctl("is-active", _UPDATE_UNIT)
+    if st is not None and st.stdout.strip() in ("activating", "active"):
+        return True                                  # update.sh is running: wait for its restart
+    if time.time() - _AGENT_UPDATE["started"] < _UPDATE_RETRY_S:
+        return False                                 # tried recently and it did not land: keep serving
+    en = _systemctl("is-enabled", "petabyte-agent-update.timer")
+    if en is None or en.stdout.strip() != "enabled":
+        return False                                 # auto-update opted out / not a systemd host
+    _AGENT_UPDATE["started"] = time.time()
+    r = _systemctl("start", "--no-block", _UPDATE_UNIT)
+    if r is None or r.returncode != 0:
+        logging.warning("agent self-update could not start: %s", (r.stderr if r else "")[:200])
+        return False
+    logging.info("newer signed agent available (%s…): updating before the next job", want[:12])
+    if _con:
+        _con.line("update", "newer signed agent available — updating before the next job")
+    return True
+
+
 def _job_network_loop():
     last = time.time()
     while True:
@@ -1149,6 +1243,11 @@ def _cleanup_job_resources(tid, name=None):
     no leaked disk/network on the host. Everything is scoped by the pb.task=<tid> label, so it can
     only ever remove THIS rental's resources."""
     import subprocess
+    live = [vm for vm, entry in _LIVE_TEMPLATES.items() if entry["task"]["task_id"] == tid]
+    for vm in live:
+        entry = _LIVE_TEMPLATES.pop(vm)
+        if entry.get("stop"):
+            entry["stop"].set()
     _kill_reverse_tunnel(tid)                            # drop the ssh -R for this rental (if any)
     try:
         if name:
@@ -1807,7 +1906,12 @@ def _run_template(task):
         return
     tid = task["task_id"]
     _set_ui(status="running", task=f"Template {task.get('template')} #{tid}")
-    _restore_volume(task.get("volume"), task.get("restore_from"), task["task_id"])
+    if _restore_volume(task.get("volume"), task.get("restore_from"), tid, task) is False:
+        report_log(tid, "Host recovery refused: checkpoint could not be restored; saved work was not replaced with an empty workspace")
+        _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "", "status": "failed"})
+        _cleanup_job_resources(tid)
+        _set_ui(status="idle", task=None, fail=True)
+        return
     _backup_stop = _start_backup_thread(task)
     if task.get("vm_id"):        # register so the heartbeat can checkpoint this job on a preempt signal
         _LIVE_TEMPLATES[task["vm_id"]] = {"task": task, "volume": task.get("volume") or "task-data",
@@ -1964,7 +2068,8 @@ def _run_template(task):
         vm_id = task.get("vm_id")
         if vm_id and port:
             _inject_ssh_key(name, task.get("ssh_pubkey"))
-            _registered = _register_vm_tunnel(vm_id, _hp, ip_address=_node_ip)
+            _registered = _register_vm_tunnel(vm_id, _hp, ip_address=_node_ip,
+                                              lease_generation=task.get("lease_generation", 0))
             if _registered:
                 report_log(tid, f"tunnel registered: vm {vm_id} -> {_node_ip or 'node'}:{_hp}")
             else:
@@ -2121,7 +2226,7 @@ def _run_benchmark(task):
     _set_ui(status="idle", task=None, ok=True)
 
 
-def _run_docker(argv, timeout=None):
+def _run_docker(argv, timeout=None, *, capture_output=False, text=False, check=True):
     """Run a `docker run --rm ...` command with a unique --name, and if the CLIENT times out,
     force-remove the daemon-owned container. Killing the local docker client does NOT stop the
     container (--rm only fires when the container itself exits), so without this a timed-out
@@ -2133,7 +2238,7 @@ def _run_docker(argv, timeout=None):
         name = "pb-task-" + _uuid.uuid4().hex[:12]
         argv = list(argv[:3]) + ["--name", name] + list(argv[3:])
     try:
-        return _sp.run(argv, check=True, timeout=timeout)
+        return _sp.run(argv, check=check, timeout=timeout, capture_output=capture_output, text=text)
     except _sp.TimeoutExpired:
         if name:
             try:
@@ -2340,8 +2445,7 @@ def _render_setup_expr(samples=None, gpu=True, engine=None):
         "import bpy\n"
         "s = bpy.context.scene\n"
         + (f"s.render.engine = '{engine}'\n" if engine else "")
-        + "if s.render.is_movie_format:\n"
-        "    s.render.image_settings.file_format = 'PNG'\n"
+        + "s.render.image_settings.file_format = 'PNG'\n"
         "if s.render.engine == 'CYCLES':\n"
         f"    if {n} > 0:\n"
         f"        s.cycles.samples = {n}\n"
@@ -2360,7 +2464,7 @@ def _render_setup_expr(samples=None, gpu=True, engine=None):
         "                print('PBDEVICE=' + dt, flush=True)\n"
         "                break\n"
         "        else:\n"
-        "            print('PBDEVICE=CPU', flush=True)\n"
+        "            raise RuntimeError('No Cycles GPU device is available; refusing CPU fallback for the requested GPU render')\n"
     )
 
 
@@ -2482,6 +2586,32 @@ def _render_plan(file_version, engine="auto", blender_version="latest", detect=l
     return ("latest", None, None, None)
 
 
+def _render_frame_files(directory, frame_start, frame_end):
+    """Refuse an empty/partial or unsafe archive even when Blender returned zero."""
+    from pathlib import Path
+    import stat
+    root = Path(directory)
+    expected = {f"frame_{n:04d}.png" for n in range(int(frame_start), int(frame_end) + 1)}
+    actual = {p.name for p in root.iterdir()}
+    if actual != expected:
+        raise RuntimeError(f"Render frame range incomplete: expected {len(expected)} PNG frames, found {len(actual)} files")
+    files = []
+    for name in sorted(expected):
+        path = root / name
+        if not stat.S_ISREG(path.lstat().st_mode) or path.stat().st_size < 45:
+            raise RuntimeError(f"Render output is not a regular complete PNG: {name}")
+        with path.open('rb') as f:
+            header = f.read(24)
+            f.seek(-12, 2)
+            end = f.read()
+        if (header[:8] != b'\x89PNG\r\n\x1a\n' or header[12:16] != b'IHDR'
+                or not int.from_bytes(header[16:20], 'big') or not int.from_bytes(header[20:24], 'big')
+                or end != b'\x00\x00\x00\x00IEND\xaeB`\x82'):
+            raise RuntimeError(f"Render output has invalid or truncated PNG structure: {name}")
+        files.append(path)
+    return files
+
+
 def _run_render(task):
     """Render an assigned frame range by launching Blender AS A CONTAINER.
     The seller never installs Blender — the image is pulled on demand and cached;
@@ -2525,7 +2655,7 @@ def _run_render(task):
                 _dcmd += ["-v", f"{scene}:/scene.blend:ro", *ep, "-b", "/scene.blend",
                           "--disable-autoexec", "--python-expr",
                           "import bpy;print('PBENGINE='+bpy.context.scene.render.engine)"]
-                _d = subprocess.run(_dcmd, capture_output=True, text=True, timeout=120, check=False)
+                _d = _run_docker(_dcmd, capture_output=True, text=True, timeout=120, check=False)
                 for _l in (_d.stdout or "").splitlines():
                     if _l.startswith("PBENGINE="):
                         return _l.split("=", 1)[1].strip()
@@ -2566,14 +2696,16 @@ def _run_render(task):
             if task.get("gpu"):
                 cmd += [*gpu_runtime.docker_gpu_args()]
             cmd += [*ep, "-b", "/scene.blend", "--disable-autoexec",
+                    "--python-exit-code", "86",
                     "--python-expr", _render_setup_expr(task.get("samples"), gpu=bool(task.get("gpu")),
                                                         engine=set_engine)]
-        cmd += ["-o", "/out/frame_", "-s", str(fs), "-e", str(fe), "-a"]
+        cmd += ["-o", "/out/frame_", "-s", str(fs), "-e", str(fe), "-j", "1", "-a"]
         # Hard-kill the container at the buyer's AUTHORIZED runtime budget (audit H1): a render
         # can't consume more of the seller's GPU than the buyer paid to authorize (_run_docker
         # force-removes the container when the client-side timeout fires).
         _rt = task.get("max_runtime_s")
         _run_docker(cmd, timeout=(int(_rt) if _rt else None))
+        _render_frame_files(out_dir, fs, fe)
         report_progress(tid, 85, "uploading frames")
         # 3) tar the frames and upload as the buyer's DOWNLOADABLE output — UNENCRYPTED, under the
         # job's output prefix — so an artist downloads exactly the frames Blender rendered, via
@@ -2584,7 +2716,8 @@ def _run_render(task):
         grant = httpx.post(f"{API_URL}/jobs/output_put", headers=HEADERS, timeout=15,
                            json={"task_id": tid, "filename": f"frames_{fs}_{fe}.tar"}, trust_env=False).json()
         raw = open(bundle, "rb").read()
-        httpx.put(grant["upload_url"], content=raw, timeout=600, trust_env=False)   # plain bytes — the buyer's artifact
+        uploaded = httpx.put(grant["upload_url"], content=raw, timeout=600, trust_env=False)
+        uploaded.raise_for_status()   # storage rejection is failure, never a completed result
         _post("/jobs/result", _signed_result(tid, status="completed",
                                              result=grant["ref"],   # clean s3 URI -> /jobs/output_url
                                              content_hash=hashlib.sha256(raw).hexdigest()))
@@ -2869,6 +3002,9 @@ def job_loop():
                 if not _fix_pending:
                     _JOB_RUNNING.set()          # claim window: the heartbeat won't queue a fix now
             if _fix_pending:                     # a support fix is queued/running: no new jobs
+                time.sleep(POLL_S)
+                continue
+            if _self_update_holds_claims():      # updating to a newer signed agent: no new jobs
                 time.sleep(POLL_S)
                 continue
             # spec_id pins the claim to THIS machine: one account's machines (or every JIT standby

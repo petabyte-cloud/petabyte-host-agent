@@ -15,6 +15,7 @@ import os as _os
 import sys
 import types
 import inspect
+import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -764,7 +765,7 @@ ok("render setup expr compiles", True)
 ok("render setup picks OptiX first, then CUDA/HIP/oneAPI",
    "('OPTIX', 'CUDA', 'HIP', 'ONEAPI')" in _expr and "s.cycles.device = 'GPU'" in _expr)
 ok("render setup applies the buyer's sample count", "s.cycles.samples = 64" in _expr)
-ok("render setup renders a movie format as PNG frames", "is_movie_format" in _expr and "'PNG'" in _expr)
+ok("render setup always writes PNG frames", "s.render.image_settings.file_format = 'PNG'" in _expr)
 ok("no GPU requested -> no device switch", "if False:" in _tf_render._render_setup_expr(None, gpu=False))
 _rsrc = src("_run_render")
 ok("_run_render passes the setup expr BEFORE -a (render runs after it)",
@@ -915,16 +916,35 @@ finally:
     tf.httpx.stream, tf.BLENDER_279_CACHE, tf.BLENDER_279_SHA256 = _saved279
 
 
-def _render_with(head, **extra):
+def _render_with(head, output_frames=(1, 2), upload_status=200, probe_timeout=False, **extra):
     """Drive the real _run_render with network/docker stubbed; capture the render argv."""
-    got = {"argv": None, "posts": [], "logs": []}
+    got = {"argv": None, "posts": [], "logs": [], "probe_commands": []}
     _j = types.SimpleNamespace(json=lambda: {"download_url": "https://x/d", "upload_url": "https://x/u",
                                              "ref": "s3://b/render/1/seg0/f.tar"})
     names = ("_run_docker", "_ensure_blender_279", "_post", "report_log", "report_progress", "_set_ui")
     saved = ([getattr(tf, n) for n in names], shutil.which, tf.httpx.post, tf.httpx.put,
-             tf.safe_fetch.get, tf.gpu_runtime.docker_gpu_args)
+             tf.safe_fetch.get, tf.gpu_runtime.docker_gpu_args, subprocess.run)
     try:
-        tf._run_docker = lambda argv, timeout=None: got.__setitem__("argv", list(argv))
+        real_docker = tf._run_docker
+        def render_docker(argv, timeout=None, **kwargs):
+            if probe_timeout and kwargs.get('capture_output'):
+                return real_docker(argv, timeout=timeout, **kwargs)
+            import base64
+            got['argv'] = list(argv)
+            directory = next(v[:-5] for v in argv if isinstance(v, str) and v.endswith(':/out'))
+            # A real, decodable one-pixel PNG, not an empty Docker-success fixture.
+            png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jD1sAAAAASUVORK5CYII=')
+            for frame in output_frames:
+                with open(os.path.join(directory, f'frame_{frame:04d}.png'), 'wb') as f:
+                    f.write(png)
+        if probe_timeout:
+            def probe_run(argv, **kwargs):
+                got['probe_commands'].append(list(argv))
+                if argv[:2] == ['docker', 'run']:
+                    raise subprocess.TimeoutExpired(argv, kwargs.get('timeout'))
+                return types.SimpleNamespace(returncode=0, stdout='')
+            subprocess.run = probe_run
+        tf._run_docker = render_docker
         tf._ensure_blender_279 = lambda: "/var/lib/petabyte-agent/blender/2.79b/b"
         tf._post = lambda path, body: got["posts"].append(body)
         tf.report_log = lambda tid, m: got["logs"].append(m)
@@ -932,7 +952,12 @@ def _render_with(head, **extra):
         tf._set_ui = lambda **k: None
         shutil.which = lambda n: "/usr/bin/docker"
         tf.httpx.post = lambda *a, **k: _j
-        tf.httpx.put = lambda *a, **k: None
+        def upload_response(*a, **k):
+            def raise_for_status():
+                if upload_status >= 300:
+                    raise RuntimeError(f'Upload failed: {upload_status}')
+            return types.SimpleNamespace(raise_for_status=raise_for_status)
+        tf.httpx.put = upload_response
         tf.safe_fetch.get = lambda *a, **k: types.SimpleNamespace(content=head + b"\0" * 64)
         tf.gpu_runtime.docker_gpu_args = lambda: ["--gpus", "all"]
         tf._run_render({"task_id": 9, "frame_start": 1, "frame_end": 2, "gpu": True,
@@ -941,7 +966,7 @@ def _render_with(head, **extra):
         for n, f in zip(names, saved[0]):
             setattr(tf, n, f)
         (shutil.which, tf.httpx.post, tf.httpx.put, tf.safe_fetch.get,
-         tf.gpu_runtime.docker_gpu_args) = saved[1:]
+         tf.gpu_runtime.docker_gpu_args, subprocess.run) = saved[1:]
     return got
 
 
@@ -966,7 +991,54 @@ ok("legacy + auto renders modern Blender on the GPU, converted to Cycles, with t
 # after Blender quit (no CAP_KILL to stop the desktop services), so every render hung to its budget.
 ok("modern render runs blender as the entrypoint, not under the image's /init",
    "--entrypoint" in _a and _a[_a.index("--entrypoint") + 1:][:2] == ["blender", "linuxserver/blender:latest"])
+ok('GPU setup exceptions fail Blender before rendering',
+   _a.index('--python-exit-code') < _a.index('--python-expr') and _a[_a.index('--python-exit-code')+1] == '86')
+ok('the requested range is contiguous regardless of the saved scene frame step',
+   _a[_a.index('-j')+1] == '1')
 ok("...and so does the engine probe", "*ep" in _rsrc.split("def _detect_engine")[1].split("return")[0])
+
+for _frames in ((), (1,)):
+    _bad = _render_with(b'BLENDER-v275', output_frames=_frames)
+    ok(f'render refuses an incomplete frame range {_frames}',
+       _bad['posts'] and _bad['posts'][-1]['proof'].get('status') == 'failed')
+_bad = _render_with(b'BLENDER-v275', upload_status=403)
+ok('render does not claim completion after an unsuccessful output upload',
+   _bad['posts'] and _bad['posts'][-1]['proof'].get('status') == 'failed')
+_sc, _prefs = _fake_bpy({'OPTIX': [_Dev('CPU')], 'CUDA': [_Dev('CPU')]}, 'CYCLES')
+_no_gpu_refused = False
+try:
+    exec(tf._render_setup_expr(4, gpu=True, engine='CYCLES'), {})
+except RuntimeError:
+    _no_gpu_refused = True
+ok('a requested GPU render refuses silent CPU fallback', _no_gpu_refused)
+
+with tempfile.TemporaryDirectory(prefix='pb-render-frame-check-') as _frame_dir:
+    _frame = os.path.join(_frame_dir, 'frame_0001.png')
+    with open(_frame, 'wb') as f:
+        f.write(b'not a PNG' * 10)
+    _refused = False
+    try:
+        tf._render_frame_files(_frame_dir, 1, 1)
+    except RuntimeError:
+        _refused = True
+    ok('corrupt output cannot pass the PNG frame check', _refused)
+    os.unlink(_frame)
+    os.symlink('/etc/hosts', _frame)
+    _refused = False
+    try:
+        tf._render_frame_files(_frame_dir, 1, 1)
+    except RuntimeError:
+        _refused = True
+    ok('a symlink cannot be bundled as a buyer frame', _refused)
+
+_probe = _render_with(b'BLENDER-v300', probe_timeout=True)
+_commands = _probe['probe_commands']
+_starts = [a for a in _commands if a[:2] == ['docker', 'run']]
+_removes = [a for a in _commands if a[:3] == ['docker', 'rm', '-f']]
+ok('timed-out engine probe removes its own named container before render continues',
+   len(_starts) == 1 and '--name' in _starts[0] and len(_removes) == 1
+   and _removes[0][-1] == _starts[0][_starts[0].index('--name') + 1]
+   and _probe['posts'][-1]['status'] == 'completed')
 
 print(f"\n=== sandbox: {'0 failures' if _fail == 0 else str(_fail) + ' FAILED'} ===")
 raise SystemExit(1 if _fail else 0)
