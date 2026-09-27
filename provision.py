@@ -198,8 +198,8 @@ def verify_declared_gpu(gpu_model, gpu_count):
     could set GPU_MODEL='NVIDIA H100 80GB HBM3' on a box with no GPU and get an attested, priced
     H100 listing — attestation proves key possession, not silicon. This is the honest-agent gate:
     if a GPU is declared, nvidia-smi must show at least that many NVIDIA GPUs on this host, or we
-    stop. It does NOT defend against a seller who patches the agent (only a server-timed benchmark
-    does — see the REQUIRE_VERIFIED_HW path), but it stops the trivial env-var lie and a
+    stop. It does NOT defend against a seller who patches the agent; neither a signed report
+    nor a software benchmark proves physical GPU identity. It stops the trivial env-var lie and a
     misconfigured driver. Bypass for a legitimately GPU-less listing is impossible (there is
     nothing to claim); ALLOW_UNVERIFIED_GPU=true exists only for CI/dev harnesses that fake a GPU
     and is honoured only in an explicitly non-production environment (_unverified_gpu_override).

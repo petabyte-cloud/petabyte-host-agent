@@ -2251,13 +2251,22 @@ def _run_benchmark(task):
             proof["challenge_hash"] = crypto.compute_test_hash(int(_size), int(_seed))
         except Exception:                            # noqa: BLE001 — never crash the agent
             pass
+    if task.get("runtime_check"):
+        import benchmark_runtime
+        try:
+            proof["runtime_check"] = benchmark_runtime.run(
+                task["runtime_check"], _run_docker,
+                _isolation_flags({"gpu": True, "memory": "4g", "cpus": 2, "pids": 256}),
+                gpu_runtime.docker_gpu_args())
+        except ValueError:
+            proof["runtime_check"] = {"status": "failed"}
     import execution_receipt, hardware_evidence
     proof.update(execution_receipt.make(tid, result=None, output_hash=proof.get("output_hash")))
     proof["hardware_evidence"] = hardware_evidence.collect()
-    httpx.post(f"{API_URL}/jobs/benchmark_result", headers=HEADERS, timeout=20, json={
+    response = httpx.post(f"{API_URL}/jobs/benchmark_result", headers=HEADERS, timeout=20, json={
         "spec_id": spec_id, "tokens_sec": tokens_sec,
         "meta": meta, "proof": proof, "signature": crypto.sign_proof(proof)}, trust_env=False)
-    _set_ui(status="idle", task=None, ok=True)
+    _set_ui(status="idle", task=None, ok=response.is_success)
 
 
 def _run_docker(argv, timeout=None, *, capture_output=False, text=False, check=True):
