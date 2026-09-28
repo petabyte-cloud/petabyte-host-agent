@@ -6,6 +6,9 @@ import json
 import os
 import subprocess
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
+import urllib.error
 
 import diagnostics as d
 
@@ -106,6 +109,51 @@ ok("sends its own User-Agent (Cloudflare 403s Python-urllib; Sebastian 2026-09-2
 ok("posts spec id, reason and report",
    bool(req) and json.loads(req.data) == {"spec_id": 45, "reason": "startup GPU container self-test failed",
                                            "report": "REPORT"})
+
+# Automatic template reporting must not block the task or launch another GPU operation.
+pending=[]
+checks=[]
+class _AutoResp(_Resp):
+    def read(self,*a):return b'{"sent":true,"report_id":17}'
+with patch.object(d.threading,'Thread',side_effect=lambda **kw:pending.append(kw) or
+                  SimpleNamespace(start=lambda:None)), \
+     patch.object(d,'collect',side_effect=lambda reason,spec,gpu_test:checks.append(gpu_test) or 'REPORT'), \
+     patch.object(d.urllib.request,'urlopen',side_effect=lambda req,timeout=0:sent.append(req) or _AutoResp()):
+    ok("default sharing is enabled without remote fixes", d.enabled())
+    ok("first template failure starts a background collector",d.schedule('template pytorch: prepare IMAGE_UNAVAILABLE',
+       evidence=f'api_key={SECRET_KEY}\nregistry transport failed\nAuthorization: Bearer abc.def.ghi'))
+    ok("collector runs off the task thread and only one can run",len(pending)==1 and not checks
+       and not d.schedule('second failure') and d.status()['last_upload']=='sending')
+    pending[0]['target']()
+    payload=json.loads(sent[-1].data)
+    ok("support receives the masked actual error, no extra GPU test",checks==[False]
+       and 'registry transport failed' in payload['report'] and SECRET_KEY not in payload['report']
+       and 'abc.def.ghi' not in payload['report'])
+    ok("successful report and id are exposed without credentials",d.status()['last_upload']=='sent'
+       and d.status()['last_report_id']==17 and 'api_key' not in str(d.status()))
+    ok("accepted report suppresses further collection for an hour",not d.schedule('another failure'))
+
+d._NEXT_UPLOAD=0
+pending=[]
+with patch.object(d.threading,'Thread',side_effect=lambda **kw:pending.append(kw) or
+                  SimpleNamespace(start=lambda:None)), \
+     patch.object(d,'send',side_effect=urllib.error.HTTPError('https://petabyte.example',429,'limited',{},None)):
+    d.schedule('limited');pending[0]['target']()
+    ok("server rate limit prevents repeated expensive collection",d.status()['last_upload']=='rate_limited'
+       and not d.schedule('again'))
+d._NEXT_UPLOAD=0
+pending=[]
+with patch.object(d.threading,'Thread',side_effect=lambda **kw:pending.append(kw) or
+                  SimpleNamespace(start=lambda:None)),patch.object(d,'send',side_effect=OSError('secret error')):
+    d.schedule('network failed');pending[0]['target']()
+    ok("failed upload backs off without leaking the error",d.status()['last_upload']=='failed'
+       and 0 < d._NEXT_UPLOAD-d.time.monotonic() <= 300 and 'secret' not in str(d.status()))
+with patch.dict(os.environ,{'PB_SHARE_DIAGNOSTICS':'false','PETABYTE_VERBOSE':'1'}):
+    ok("seller opt-out prevents collection and is reported",not d.schedule('ignored')
+       and d.status()['sharing_enabled'] is False and d.status()['verbose'] is True)
+with patch.object(d,'_mask',side_effect=lambda x:x):
+    ok("diagnostic token masking survives disabled general log redaction",
+       'abc.def.ghi' not in d.redact('Authorization: Bearer abc.def.ghi'))
 os.unlink(env_file.name)
 print("\nOK — node diagnostics are masked, bounded and opt-out-able" if not _fail else f"\n{_fail} FAILED")
 raise SystemExit(1 if _fail else 0)

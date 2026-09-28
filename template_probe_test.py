@@ -19,6 +19,9 @@ IMAGE='quay.io/jupyter/pytorch-notebook@sha256:'+'a'*64
 
 class AgentTests(unittest.TestCase):
     def setUp(self):
+        # All uploads mocked: these tests must not touch seller credentials or the network.
+        self.reports=patch('diagnostics.schedule').start()
+        self.addCleanup(patch.stopall)
         self.ch=server.issue(IMAGE);self.ch['template']='pytorch';self.ch['env']={}
         self.answer=dict(self.ch,status='completed',app_ready=True,output_hash=server.expected_hash(self.ch))
     def run_probe(self,runner,prepare=lambda *a,**k:None):
@@ -42,6 +45,29 @@ class AgentTests(unittest.TestCase):
         out=self.run_probe(lambda *a,**k:SimpleNamespace(returncode=0,stdout='secret\n'*10000))
         self.assertEqual(out['failure'],'CHECK_FAILED')
         self.assertNotIn('secret',str(out))
+    def test_docker_failure_evidence_goes_to_private_diagnostics_only(self):
+        error=subprocess.CalledProcessError(1,['docker','pull',IMAGE],output='download incomplete',
+                                           stderr='registry transport error')
+        def bad(*a,**kw):raise error
+        answer=self.run_probe(None,bad)
+        self.assertEqual(answer['failure'],'IMAGE_UNAVAILABLE')
+        self.assertNotIn('transport',str(answer));self.assertNotIn('download',str(answer))
+        self.assertEqual(self.reports.call_count,1)
+        call=self.reports.call_args
+        self.assertIn('prepare IMAGE_UNAVAILABLE',call.args[0])
+        self.assertIn('registry transport error',call.kwargs['evidence'])
+        self.assertIn('download incomplete',call.kwargs['evidence'])
+        self.reports.reset_mock()
+        out=self.run_probe(lambda *a,**k:SimpleNamespace(returncode=1,stdout='',stderr='CUDA loader error'))
+        self.assertEqual(out['failure'],'CHECK_FAILED')
+        self.assertIn('CUDA loader error',self.reports.call_args.kwargs['evidence'])
+    def test_diagnostics_failure_never_breaks_signed_answer(self):
+        self.reports.side_effect=RuntimeError('collector unavailable')
+        def timeout(*a,**kw):raise subprocess.TimeoutExpired('docker pull',120,
+                                                               output=b'layer 1 downloading',stderr=b'network stalled')
+        answer=self.run_probe(None,timeout)
+        self.assertEqual(answer['failure'],'IMAGE_UNAVAILABLE')
+        self.assertIn('network stalled',self.reports.call_args.kwargs['evidence'])
     def test_invalid_inputs_never_prepare_an_image(self):
         for key,value in [('image','anything:latest'),('nonce','wrong'),('template','custom'),('env',{'DOCKER_HOST':'evil'})]:
             bad=dict(self.ch,**{key:value})
@@ -51,6 +77,7 @@ class AgentTests(unittest.TestCase):
         def run(*a,**kw):
             agent._CANCEL.set();return SimpleNamespace(returncode=0,stdout=json.dumps(self.answer))
         self.assertEqual(self.run_probe(run)['failure'],'CHECK_FAILED')
+        self.reports.assert_not_called()
         agent._RUNNING.set()
         with patch.object(subprocess,'run',return_value=SimpleNamespace(stdout='a'*12+'\n--all\n')) as mock:
             agent.yield_to_paid_work()

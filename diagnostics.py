@@ -13,6 +13,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import threading
 import time
 import urllib.request
 
@@ -24,6 +26,7 @@ MAX_CHARS = 150_000              # whole report; the server refuses more than 20
 _SECTION_MAX = 20_000
 
 _MASKS = [
+    (re.compile(r"(?i)Bearer\s+[A-Za-z0-9._-]+"), "Bearer «redacted»"),
     (re.compile(r"://[^/\s:@]+:[^@\s]+@"), "://«credentials»@"),
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "«email»"),
     (re.compile(r"\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b"), "«mac»"),
@@ -142,16 +145,26 @@ def collect(reason, spec_id="?", gpu_test=True):
     return "\n".join(parts)[:MAX_CHARS]
 
 
-def send(reason, gpu_test=True, env=None):
+def enabled(env=None):
+    env = env if env is not None else _env()
+    return env.get("PB_SHARE_DIAGNOSTICS", "true").strip().lower() != "false"
+
+
+def send(reason, gpu_test=True, env=None, evidence=None):
     """Collect and upload. Returns (report, server reply), or (None, None) when opted out or
     unconfigured. Raises on network/HTTP errors (callers treat the report as best-effort)."""
     env = env if env is not None else _env()
-    if env.get("PB_SHARE_DIAGNOSTICS", "true").strip().lower() == "false":
+    if not enabled(env):
         return None, None
     url, key, spec = env.get("PETABYTE_API_URL"), env.get("PETABYTE_API_KEY"), env.get("PETABYTE_SPEC_ID")
     if not (url and key and spec):
         return None, None
     report = collect(reason, spec, gpu_test)
+    if evidence:
+        # Fixed template checks only; never buyer workload output. Private support report,
+        # not public readiness evidence. Bound input before regex processing.
+        report = ("===== failing template check =====\n" + redact(str(evidence)[-12_000:])
+                  + "\n\n" + report)[:MAX_CHARS]
     req = urllib.request.Request(
         url.rstrip("/") + "/nodes/diagnostics", method="POST",
         data=json.dumps({"spec_id": int(spec), "reason": reason[:200], "report": report}).encode(),
@@ -160,3 +173,58 @@ def send(reason, gpu_test=True, env=None):
                  "User-Agent": f"petabyte-agent/{RELEASE}"})
     with urllib.request.urlopen(req, timeout=60) as r:
         return report, json.load(r)
+
+
+_UPLOAD_LOCK = threading.Lock()
+_NEXT_UPLOAD = 0.0
+_UPLOAD_STATE = {"last_upload": "never", "last_attempt_at": None, "last_report_id": None}
+
+
+def status():
+    """Only bounded operational flags leave the node; no config values or log content."""
+    with _UPLOAD_LOCK:
+        state = dict(_UPLOAD_STATE)
+    state.update(sharing_enabled=enabled(), verbose=os.getenv("PETABYTE_VERBOSE", "").lower() in
+                 ("1", "true", "yes", "on") or "--verbose" in sys.argv
+                 or os.getenv("LOG_LEVEL", "").upper() == "DEBUG")
+    return state
+
+
+def schedule(reason, *, evidence=None):
+    """Best-effort support upload, never GPU execution or a blocking job/heartbeat.
+
+    One collector at a time, at most once/hour after acceptance (also on server 429).
+    Network failures retry after five minutes. Seller opt-out is checked again by send().
+    """
+    global _NEXT_UPLOAD
+    if not enabled():
+        return False
+    with _UPLOAD_LOCK:
+        if _UPLOAD_STATE["last_upload"] == "sending" or time.monotonic() < _NEXT_UPLOAD:
+            return False
+        _UPLOAD_STATE.update(last_upload="sending", last_attempt_at=time.time())
+
+    def upload():
+        global _NEXT_UPLOAD
+        outcome, report_id, cooldown = "failed", None, 300
+        try:
+            _, reply = send(reason, gpu_test=False, evidence=evidence)
+            if isinstance(reply, dict) and reply.get("sent") is True:
+                outcome, cooldown = "sent", 3600
+                value = reply.get("report_id")
+                report_id = value if type(value) is int and value > 0 else None
+        except Exception as exc:  # no raw exception/config in heartbeat or public evidence
+            if getattr(exc, "code", None) == 429:
+                outcome, cooldown = "rate_limited", 3600
+        finally:
+            with _UPLOAD_LOCK:
+                _UPLOAD_STATE.update(last_upload=outcome, last_report_id=report_id)
+                _NEXT_UPLOAD = time.monotonic() + cooldown
+    try:
+        threading.Thread(target=upload, daemon=True, name="pb-template-diagnostics").start()
+    except Exception:
+        with _UPLOAD_LOCK:
+            _UPLOAD_STATE["last_upload"] = "failed"
+            _NEXT_UPLOAD = time.monotonic() + 300
+        return False
+    return True

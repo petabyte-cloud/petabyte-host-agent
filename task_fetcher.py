@@ -248,6 +248,11 @@ def heartbeat_loop():
             _hb = {"spec_id": int(SPEC_ID), "hardware_evidence": hardware_evidence.collect(),
                    "selling_now": _advertise_selling_now(),  # JIT also waits for tunnel enrollment
                    "remote_fixes": _fixes.enabled()}  # owner allowed signed support fixes
+            try:
+                import diagnostics
+                _hb["diagnostics"] = diagnostics.status()
+            except Exception:
+                pass  # optional support metadata never breaks liveness
             _storage = template_storage.heartbeat_report(globals().get("_TUN_GW", ""))
             if _storage is not None:
                 _hb["template_storage"] = _storage
