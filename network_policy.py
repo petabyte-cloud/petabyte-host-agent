@@ -96,12 +96,18 @@ def _routes():
     return sorted(denied)
 
 
-def _rules(iface, prefix, denied):
+def _rules(iface, prefix, denied, allowed_udp_port=None):
     outbound, inbound, host = prefix + "O", prefix + "I", prefix + "H"
+    game_in = (["-s", "10.9.0.1/32", "-p", "udp", "--dport", str(int(allowed_udp_port)), "-j", "RETURN"]
+               if allowed_udp_port else None)
+    # A Palworld reply goes through its own job bridge to the gateway's temporary per-client UDP
+    # relay socket. Constrain that exception by destination, protocol and container source port.
+    game_out = (["-d", "10.9.0.1/32", "-p", "udp", "--sport", str(int(allowed_udp_port)),
+                 "--dport", "32768:60999", "-j", "RETURN"] if allowed_udp_port else None)
     chains = {
-        outbound: [["-d", cidr, "-j", "DROP"] for cidr in denied] + [["-j", "RETURN"]],
-        inbound: [["-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "RETURN"],
-                  ["-j", "DROP"]],
+        outbound: ([game_out] if game_out else []) + [["-d", cidr, "-j", "DROP"] for cidr in denied] + [["-j", "RETURN"]],
+        inbound: [["-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "RETURN"]]
+                  + ([game_in] if game_in else []) + [["-j", "DROP"]],
         host: [["-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "RETURN"],
                ["-j", "DROP"]],
     }
@@ -121,7 +127,7 @@ def _ensure_rule(tool, chain, rule):
         _run([tool, "-w", "5", "-I", chain, "1", *rule])
 
 
-def ensure(tid):
+def ensure(tid, allowed_udp_port=None):
     """Create/revalidate a private job bridge before any buyer container may start."""
     _local_daemon()
     iface, prefix = _names(tid)
@@ -140,7 +146,7 @@ def ensure(tid):
             or net.get("Options", {}).get("com.docker.network.bridge.enable_icc") != "false"
             or net.get("Containers")):
         raise NetworkUnavailable("job network ownership or isolation mismatch")
-    chains, hooks4, hooks6 = _rules(iface, prefix, _routes())
+    chains, hooks4, hooks6 = _rules(iface, prefix, _routes(), allowed_udp_port)
     # A fresh bridge has no workload. Never flush a chain: if an existing policy differs,
     # refuse the launch and leave its protective rules intact for operator review.
     import shlex

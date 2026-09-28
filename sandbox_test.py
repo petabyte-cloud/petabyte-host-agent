@@ -432,7 +432,7 @@ ok("the per-task volume is created with a pb.task label so teardown finds only t
    'volume", "create", "--label", f"pb.task=' in src("_run_template"))
 # CO-TENANT isolation: a networked template runs on its OWN bridge, not the shared default bridge.
 ok("a networked template attaches a per-job network (co-tenant isolation)",
-   "_ensure_job_network(tid)" in src("_run_template") and hasattr(tf, "_ensure_job_network"))
+   "net, why = _ensure_job_network(" in src("_run_template") and hasattr(tf, "_ensure_job_network"))
 ok("_ensure_job_network delegates to the verified firewall policy",
    "network_policy.ensure(tid)" in src("_ensure_job_network"))
 # FAIL CLOSED: omitting --network is NOT "no network", it is the shared default bridge. If the

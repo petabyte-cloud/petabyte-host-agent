@@ -522,7 +522,8 @@ def _post(path, payload):
         logging.error(f"{path} error: {e}")
 
 
-def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_generation=None) -> bool:
+def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_generation=None,
+                        game_udp_host_port=None) -> bool:
     """P1-7: report node:port to the control plane so a template VM flips starting->running and
     the gateway can route buyers to it. ip_address is optional — the server falls back to the
     public source IP of this request. Retries a few times: right after /launch the VMRoute may not
@@ -540,6 +541,8 @@ def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_g
             break
     if ip_address:
         body["ip_address"] = ip_address
+    if game_udp_host_port is not None:
+        body["game_udp_host_port"] = int(game_udp_host_port)
     delay = 2
     for i in range(attempts):
         try:
@@ -1209,11 +1212,13 @@ def _job_network_loop():
             last = time.time()
 
 
-def _ensure_job_network(tid):
+def _ensure_job_network(tid, allowed_udp_port=None):
     """(network name, None), or (None, reason) when the per-job bridge can't be built."""
     try:
         import network_policy
-        return network_policy.ensure(tid), None
+        net = (network_policy.ensure(tid, allowed_udp_port=allowed_udp_port)
+               if allowed_udp_port is not None else network_policy.ensure(tid))
+        return net, None
     except Exception as e:                                   # noqa: BLE001 — never crash a job
         # network_policy.ensure() raises NetworkUnavailable with a DIFFERENT message for each of
         # ~8 distinct refusals (not root, remote daemon, docker network create failed, firewall
@@ -1295,6 +1300,17 @@ def _free_host_port():
     s = socket.socket()
     try:
         s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _free_udp_host_port(bind_ip):
+    """Reserve a free UDP host port on the node's private game WireGuard address."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind((str(bind_ip), 0))
         return s.getsockname()[1]
     finally:
         s.close()
@@ -1958,6 +1974,25 @@ def _run_template(task):
     # port (the old fixed 0.0.0.0:port:port meant one interactive VM per node). The gateway reaches
     # the VM at node_ip:host_port — this is exactly what we register as the tunnel port below.
     host_port = _free_host_port() if port else None
+    game_udp_host_port = None
+    game_wg_ip = None
+    if task.get("template") == "palworld":
+        import ipaddress
+        _game_addr = os.getenv("PB_EGRESS_ADDR", "").strip()
+        try:
+            game_wg_ip = str(ipaddress.ip_interface(_game_addr).ip)
+        except ValueError:
+            game_wg_ip = None
+        try:
+            import egress_vpn
+            if not game_wg_ip or not egress_vpn.enabled() or not egress_vpn.ensure_tunnel():
+                raise RuntimeError("Palworld needs the seller's enrolled WireGuard game tunnel")
+            game_udp_host_port = _free_udp_host_port(game_wg_ip)
+        except Exception as _e:
+            report_log(tid, f"Palworld refused: public UDP forwarding is unavailable ({_e})")
+            _post("/jobs/result", _signed_result(tid, status="failed", failure_cause="network_policy"))
+            _set_ui(status="idle", task=None, fail=True)
+            return
     params = task.get("params", {})
     report_progress(tid, 10, f"pulling {image}")
     import shutil, subprocess, uuid as _uuid
@@ -1986,6 +2021,8 @@ def _run_template(task):
     # reaches it via the outbound ssh -R opened after start. Otherwise publish on the public NIC.
     _rev = _reverse_tunnel_enabled() and bool(port)
     cmd += _publish_flags(port, host_port, bind="127.0.0.1" if _rev else None)
+    if game_udp_host_port is not None:
+        cmd += ["-p", f"{game_wg_ip}:{game_udp_host_port}:{port}/udp"]
     cmd += _isolation_flags(task)              # Phase-1 sandbox (gVisor if present)
     egress = _egress_flags(task)
     cmd += egress                              # protect the HOST's home internet
@@ -1996,7 +2033,8 @@ def _run_template(task):
     # one host cannot see each other. `none`/`host` (batch/cluster) keep their explicit posture.
     net = None
     if not egress:                             # _egress_flags returned [] == the "limited"/"open" default bridge
-        net, why = _ensure_job_network(tid)
+        net, why = _ensure_job_network(
+            tid, allowed_udp_port=(port if task.get("template") == "palworld" else None))
         if not net:
             # FAIL CLOSED. Omitting --network here does not mean "no network", it means Docker's
             # SHARED DEFAULT BRIDGE — exactly the co-tenant/host-gateway exposure the block above
@@ -2046,6 +2084,12 @@ def _run_template(task):
             if task.get("model_arg") and model:
                 cmd += [task["model_arg"], model]
             cmd += list(task.get("args") or [])        # extra image args / batch command
+            # This launches the requested workload, so the argv intentionally includes values
+            # returned by the trusted API. It is always an argv list (shell=False); the new host
+            # bind address is parsed and normalized by ipaddress, its UDP port comes from bind(0),
+            # and the container port is fixed by the curated Palworld template. No value becomes
+            # shell syntax or a Docker option.
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
             run = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if run.returncode:                         # keep Docker's stderr: it says WHY
                 raise subprocess.CalledProcessError(run.returncode, cmd, run.stdout, run.stderr)
@@ -2113,8 +2157,10 @@ def _run_template(task):
         vm_id = task.get("vm_id")
         if vm_id and port:
             _inject_ssh_key(name, task.get("ssh_pubkey"))
-            _registered = _register_vm_tunnel(vm_id, _hp, ip_address=_node_ip,
-                                              lease_generation=task.get("lease_generation", 0))
+            _registered = _register_vm_tunnel(
+                vm_id, _hp, ip_address=(_node_ip if task.get("template") != "palworld" else None),
+                lease_generation=task.get("lease_generation", 0),
+                game_udp_host_port=game_udp_host_port)
             if _registered:
                 report_log(tid, f"tunnel registered: vm {vm_id} -> {_node_ip or 'node'}:{_hp}")
             else:

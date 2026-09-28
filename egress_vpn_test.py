@@ -87,7 +87,8 @@ ev._run = lambda args, check=True: _up.append(args)
 ev.subprocess.run = lambda *a, **k: None
 ok("ensure_tunnel works with a read-only WG_DIR", ev.ensure_tunnel())
 ok("wg-quick brought up from STATE_DIR conf",
-   _up == [["wg-quick", "up", os.path.join(ev.STATE_DIR, "wg-egress.conf")]])
+   _up == [["wg-quick", "up", os.path.join(ev.STATE_DIR, "wg-egress.conf")],
+           ["ip", "route", "replace", "10.9.0.1/32", "dev", "wg-egress"]])
 
 print("\n=== egress_vpn: " + ("0 failures" if _fail == 0 else str(_fail) + " FAILED") + " ===")
 raise SystemExit(1 if _fail else 0)

@@ -119,6 +119,9 @@ def ensure_tunnel() -> bool:
         os.umask(old)
     if not _iface_up():
         _run(["wg-quick", "up", conf], check=False)
+    # Game UDP replies arrive from the gateway's 10.9.0.1 address. Keep this host-only /32 route
+    # on the WireGuard interface; Table=off deliberately avoids changing the seller's default route.
+    _run(["ip", "route", "replace", "10.9.0.1/32", "dev", IFACE], check=False)
     for knob in ("all", "default", IFACE):
         subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{knob}.rp_filter=2"],
                        capture_output=True)
