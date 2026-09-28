@@ -268,6 +268,12 @@ def heartbeat_loop():
             r = httpx.post(f"{API_URL}/heartbeat", json=_hb, headers=HEADERS, timeout=10, trust_env=False)
             if r.status_code == 200:
                 _body = r.json()
+                if _body.get("pause_template_probes"):
+                    try:
+                        import template_probe
+                        template_probe.yield_to_paid_work()
+                    except Exception:
+                        logging.warning("Could not stop optional template probe; its runtime remains bounded")
                 try:
                     with _pb_vm_lock:
                         _live = any(not v.get("reported") for v in _pb_vm_watch.values())
@@ -2209,6 +2215,25 @@ def _measure_blender_score():
         return None
 
 
+def _run_template_probe(task):
+    """Unpaid, bounded diagnostic using the same cleanup and GPU isolation as rentals."""
+    import json
+    import template_probe
+    import execution_receipt
+    tid = task["task_id"]
+    _set_ui(status="running", task=f"Template check #{tid}")
+    answer = template_probe.run(task["template_probe"], _run_docker, template_storage.prepare,
+        _isolation_flags({"gpu": True, "memory": "4g", "cpus": 2, "pids": 256}),
+        gpu_runtime.docker_gpu_args(), tid)
+    result = json.dumps(answer, separators=(",", ":"))
+    status = "completed" if answer.get("status") == "completed" else "failed"
+    proof = execution_receipt.make(tid, result=result, status=status)
+    response = httpx.post(f"{API_URL}/jobs/result", headers=HEADERS, timeout=20, trust_env=False,
+        json={"task_id": tid, "status": status, "result": result,
+              "proof": proof, "signature": crypto.sign_proof(proof)})
+    _set_ui(status="idle", task=None, ok=response.is_success)
+
+
 def _run_benchmark(task):
     """Measure LLM tokens/sec + FP16 matmul TFLOPS + Blender Open Data, submit a SIGNED result.
     Every measured score goes INSIDE the signed proof so the server checks the attributable
@@ -3120,6 +3145,8 @@ def job_loop():
                             _run_template(task)
                         elif tt == "benchmark":
                             _run_benchmark(task)
+                        elif tt == "template_probe":
+                            _run_template_probe(task)
                         elif tt == "render":
                             _run_render(task)
                         elif tt == "transcode":

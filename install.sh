@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Petabyte one-line node installer (Ubuntu/Debian).
 #   PETABYTE_API_URL=https://petabyte.market PETABYTE_API_KEY=pk_your_node_key \
-#     bash <(curl -fsSL https://petabyte.market/install.sh)
-# The /install page generates this exact command with your key already filled in.
+#     export PETABYTE_API_URL=https://petabyte.market PETABYTE_API_KEY=pk_your_node_key
+#     curl -fsSL https://petabyte.market/install.sh | sudo --preserve-env=PETABYTE_API_URL,PETABYTE_API_KEY bash
+# The /install page generates the token-bound equivalent with sudo.
 # PRICE_PER_HOUR is optional: leave it unset and the node auto-prices from its GPU's
 # benchmark; set it (e.g. PRICE_PER_HOUR=1.5) to pin your own rate.
 set -euo pipefail

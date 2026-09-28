@@ -29,7 +29,7 @@ print(json.dumps({"output_hash":digest}, separators=(",", ":")))
 '''
 
 
-def run(challenge, runner, isolation_flags, gpu_flags):
+def validate(challenge):
     if not isinstance(challenge, dict) or type(challenge.get("version")) is not int or challenge["version"] != 1:
         raise ValueError("unsupported runtime challenge")
     if type(challenge.get("n")) is not int or challenge["n"] != 64:
@@ -40,6 +40,12 @@ def run(challenge, runner, isolation_flags, gpu_flags):
     if (not isinstance(image, str) or len(image) > 512 or
             not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:+-]*@sha256:[0-9a-f]{64}", image)):
         raise ValueError("a digest-pinned runtime image is required")
+    return challenge
+
+
+def run(challenge, runner, isolation_flags, gpu_flags):
+    validate(challenge)
+    nonce, image = challenge["nonce"], challenge["image"]
     result = {k: challenge[k] for k in ("version", "nonce", "n", "image")}
     result["status"] = "failed"
     try:
