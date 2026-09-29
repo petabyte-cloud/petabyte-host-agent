@@ -6,7 +6,7 @@ Wants=docker.service
 [Service]
 WorkingDirectory=/opt/petabyte-agent
 EnvironmentFile=/etc/petabyte/agent.env
-ExecStart=/opt/petabyte-agent/.venv/bin/python main.py
+ExecStart=/opt/petabyte-agent/run-agent.sh
 Restart=always
 RestartSec=5
 

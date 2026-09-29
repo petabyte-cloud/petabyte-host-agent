@@ -20,6 +20,40 @@
 # can use --gpus all.
 
 $ErrorActionPreference = "Stop"
+
+
+# Ask immediately, but never make unattended installers wait for input.
+# Reuse the seller's previous choice; first install defaults to leaving power policy unchanged.
+$StateDir = Join-Path $env:ProgramData "Petabyte"
+$StateFile = Join-Path $StateDir "install-state.json"
+$prev = $null
+if (Test-Path $StateFile) { try { $prev = Get-Content $StateFile -Raw | ConvertFrom-Json } catch {} }
+$keepAwakeDefault = if ($prev -and $null -ne $prev.keepAwake) { [bool]$prev.keepAwake } else { $false }
+$keepAwake = $keepAwakeDefault
+$keepAwakeEnv = ([string]$env:PETABYTE_KEEP_AWAKE).Trim().ToLowerInvariant()
+if ($keepAwakeEnv -in @("true","1","yes","y")) { $keepAwake = $true }
+elseif ($keepAwakeEnv -in @("false","0","no","n")) { $keepAwake = $false }
+else {
+    Write-Host "Do you want this PC to stay awake while the Petabyte seller agent is running? [y/N; 15s timeout]"
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true).Key
+                if ($key -eq [ConsoleKey]::Y) { $keepAwake = $true; break }
+                if ($key -eq [ConsoleKey]::N) { $keepAwake = $false; break }
+                if ($key -eq [ConsoleKey]::Enter) { break }
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    } catch {
+        # No interactive console (for example, irm ... | iex in an automated shell).
+        $keepAwake = $keepAwakeDefault
+    }
+}
+$env:PETABYTE_KEEP_AWAKE = ([string]$keepAwake).ToLowerInvariant()
+if ($keepAwake) { Write-Host "Keep-awake enabled for the agent only." -ForegroundColor Cyan }
+else { Write-Host "Keep-awake disabled; existing Windows power settings are unchanged." -ForegroundColor Cyan }
 # The agent's OWN distro. Buyers' apps need the NATIVE Docker Engine (each rental gets its own
 # firewalled network); a distro served by Docker Desktop's WSL integration (often the seller's own
 # Ubuntu) can't isolate them, and Docker Desktop must never be touched. So: a distro of our own.
@@ -55,11 +89,7 @@ if (-not $wslOk) {
 }
 wsl.exe --set-default-version 2 | Out-Null
 
-$StateDir = Join-Path $env:ProgramData "Petabyte"
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
-$StateFile = Join-Path $StateDir "install-state.json"
-$prev = $null
-if (Test-Path $StateFile) { try { $prev = Get-Content $StateFile -Raw | ConvertFrom-Json } catch {} }
 
 # An earlier install in another distro (before the agent had its own): upgrade it IN PLACE when its
 # Docker is native; MOVE it here, keeping the same node registration, when Docker Desktop serves it.
@@ -78,7 +108,7 @@ if ($old -and (HasDistro $old)) {
 $distroPre = if ($prev -and $prev.distro -eq $Distro) { [bool]$prev.distroPreexisted } else { [bool](HasDistro $Distro) }
 if ($prev) { $wslPre = [bool]$prev.wslPreexisted }
 @{ wslPreexisted = [bool]$wslPre; distroPreexisted = $distroPre;
-   distro = $Distro; installedAt = (Get-Date).ToString("o") } |
+   distro = $Distro; keepAwake = [bool]$keepAwake; installedAt = (Get-Date).ToString("o") } |
    ConvertTo-Json | Set-Content $StateFile
 
 if (-not (HasDistro $Distro)) {
@@ -129,6 +159,7 @@ $sh = @(
     $keep,
     "export PETABYTE_API_URL='$($env:PETABYTE_API_URL)'",
     "export PETABYTE_API_KEY='$($env:PETABYTE_API_KEY)'",
+    "export PETABYTE_KEEP_AWAKE='$($env:PETABYTE_KEEP_AWAKE)'",
     "export PRICE_PER_HOUR='$(if ($env:PRICE_PER_HOUR) { $env:PRICE_PER_HOUR } else { '' })'",
     "export PETABYTE_SELL_SCHEDULE='$(if ($env:PETABYTE_SELL_SCHEDULE) { $env:PETABYTE_SELL_SCHEDULE } else { 'always' })'",
     "export PETABYTE_IDLE_MINING='$(if ($env:PETABYTE_IDLE_MINING) { $env:PETABYTE_IDLE_MINING } else { 'true' })'",
@@ -155,6 +186,58 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 Register-ScheduledTask -TaskName "PetabyteNode" -Action $action -Trigger $trigger `
     -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName "PetabyteNode"
+
+# Keep the Windows host awake only while the WSL seller service is active.
+# This does not keep the display on or override manual sleep/lid actions.
+if ($keepAwake) {
+    $KeepAwakeScriptPath = Join-Path $StateDir "keep-awake.ps1"
+    @'
+param([Parameter(Mandatory=$true)][string]$Distro)
+$ErrorActionPreference = "SilentlyContinue"
+if (-not ("PetabytePower.Native" -as [type])) {
+    Add-Type -Namespace PetabytePower -Name Native -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint SetThreadExecutionState(uint esFlags);
+"@
+}
+$ES_CONTINUOUS = [Convert]::ToUInt32("80000000", 16)
+$ES_SYSTEM_REQUIRED = [uint32]0x00000001
+try {
+    while ($true) {
+        $task = Get-ScheduledTask -TaskName "PetabyteNode" -ErrorAction SilentlyContinue
+        $active = $false
+        if ($task -and $task.State -eq "Running") {
+            wsl.exe -d $Distro -u root -- systemctl is-active --quiet petabyte-agent
+            $active = ($LASTEXITCODE -eq 0)
+        }
+        if ($active) {
+            [void][PetabytePower.Native]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED)
+        } else {
+            [void][PetabytePower.Native]::SetThreadExecutionState($ES_CONTINUOUS)
+        }
+        Start-Sleep -Seconds 30
+    }
+} finally {
+    [void][PetabytePower.Native]::SetThreadExecutionState($ES_CONTINUOUS)
+}
+'@ | Set-Content -Path $KeepAwakeScriptPath -Encoding UTF8
+    try {
+        $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $keepAction = New-ScheduledTaskAction -Execute "powershell.exe" `
+            -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$KeepAwakeScriptPath`" -Distro `"$Distro`""
+        $keepTrigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+        $keepPrincipal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
+        $keepSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden
+        Register-ScheduledTask -TaskName "PetabyteKeepAwake" -Action $keepAction -Trigger $keepTrigger `
+            -Principal $keepPrincipal -Settings $keepSettings -Force | Out-Null
+        Start-ScheduledTask -TaskName "PetabyteKeepAwake"
+    } catch {
+        Write-Host "WARNING: could not register the optional keep-awake helper: $_" -ForegroundColor Yellow
+    }
+} else {
+    try { Stop-ScheduledTask -TaskName "PetabyteKeepAwake" -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-ScheduledTask -TaskName "PetabyteKeepAwake" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+}
 
 Write-Host ""
 Write-Host "node online (inside WSL2)." -ForegroundColor Green

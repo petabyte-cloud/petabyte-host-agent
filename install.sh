@@ -7,6 +7,36 @@
 # PRICE_PER_HOUR is optional: leave it unset and the node auto-prices from its GPU's
 # benchmark; set it (e.g. PRICE_PER_HOUR=1.5) to pin your own rate.
 set -euo pipefail
+ENVF=/etc/petabyte/agent.env
+
+# Ask before installing. curl | sudo bash uses stdin for the script, so only read /dev/tty.
+# A missing terminal, timeout, or unrecognized answer must never block or fail installation.
+_KEEP_AWAKE_DEFAULT=false
+if [ -r "$ENVF" ]; then
+  _saved_keep_awake="$(sed -n 's/^PETABYTE_KEEP_AWAKE=//p' "$ENVF" | tail -n 1)"
+  [ "$_saved_keep_awake" = true ] && _KEEP_AWAKE_DEFAULT=true
+fi
+_KEEP_AWAKE="${PETABYTE_KEEP_AWAKE:-}"
+if [ "$_KEEP_AWAKE" != true ] && [ "$_KEEP_AWAKE" != false ]; then
+  if { : < /dev/tty; } 2>/dev/null; then
+    printf "Do you want this PC to stay awake while the Petabyte seller agent is running? [y/N; 15s timeout] " > /dev/tty
+    _keep_awake_answer=""
+    if IFS= read -r -t 15 _keep_awake_answer < /dev/tty; then
+      case "$_keep_awake_answer" in
+        y|Y|yes|YES) _KEEP_AWAKE=true ;;
+        n|N|no|NO) _KEEP_AWAKE=false ;;
+        *) _KEEP_AWAKE="$_KEEP_AWAKE_DEFAULT" ;;
+      esac
+    else
+      _KEEP_AWAKE="$_KEEP_AWAKE_DEFAULT"
+    fi
+  else
+    printf "Do you want this PC to stay awake while the Petabyte seller agent is running? [y/N] (no terminal; continuing with keep-awake=%s)\n" "$_KEEP_AWAKE_DEFAULT"
+    _KEEP_AWAKE="$_KEEP_AWAKE_DEFAULT"
+  fi
+fi
+case "$_KEEP_AWAKE" in true|false) ;; *) _KEEP_AWAKE="$_KEEP_AWAKE_DEFAULT" ;; esac
+
 : "${PETABYTE_API_URL:?set PETABYTE_API_URL}"
 : "${PETABYTE_API_KEY:?set PETABYTE_API_KEY (create one on the /install page)}"
 REPO="${PETABYTE_REPO:-https://github.com/petabyte-cloud/petabyte.git}"
@@ -370,6 +400,14 @@ else
     PROVIDER="${PROVIDER:-}" \
     .venv/bin/python provision.py
 fi
+
+# Persist the optional preference. New installs default off; reruns preserve their saved choice.
+if grep -q '^PETABYTE_KEEP_AWAKE=' "$ENVF" 2>/dev/null; then
+  sed -i "s/^PETABYTE_KEEP_AWAKE=.*/PETABYTE_KEEP_AWAKE=$_KEEP_AWAKE/" "$ENVF"
+else
+  printf 'PETABYTE_KEEP_AWAKE=%s\n' "$_KEEP_AWAKE" >> "$ENVF"
+fi
+echo "==> keep-awake $_KEEP_AWAKE (seller agent only; the display can still turn off)"
 
 # Kata: turn the runtime on for this node when it was installed above (provision.py preserves
 # operator-set lines, so this survives re-provisioning). GPU jobs stay on gVisor until the operator

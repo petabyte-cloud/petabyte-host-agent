@@ -27,7 +27,7 @@ command after**. The script then: creates the agent's own `Petabyte` WSL distro 
 Docker Desktop's WSL integration never serves it, and Docker Desktop is left as it is) →
 enables systemd → runs the
 standard `install.sh` inside WSL (Docker, provision, attest, service) → registers a
-hidden **Scheduled Task** so the node comes online at logon.
+hidden **Scheduled Task** so the node comes online at logon. The installer first asks whether Windows should stay awake while the seller agent is running (15-second timeout; no terminal/no answer safely defaults off). If opted in, a separate hidden task uses Windows' idle-sleep inhibitor only while the WSL `petabyte-agent` service is active. It leaves the display and manual sleep/lid controls alone. Set `$env:PETABYTE_KEEP_AWAKE="true"` or `"false"` to choose without prompting.
 
 ## Verify
 ```powershell
@@ -40,7 +40,7 @@ The GPU appears in the marketplace exactly like a Linux node.
 
 ## Honest limits
 - The node is online while the machine is on and WSL is running (the scheduled task
-  keeps it alive after logon). Sleep/hibernate takes it offline — the reaper will
+  keeps it alive after logon). With keep-awake disabled, sleep/hibernate takes it offline — the reaper will
   refund any in-flight booking, and heartbeats resume on wake.
 - Laptops on battery may throttle; price accordingly.
 - Firecracker/KVM microVM paths don't apply on Windows — the sandbox is Docker inside

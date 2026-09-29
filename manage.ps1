@@ -33,6 +33,8 @@ switch ($Action) {
   "pause" {
     Write-Host "Pausing Petabyte node (stays installed, just stops earning/running)..."
     Agent "systemctl stop petabyte-agent"
+    try { Disable-ScheduledTask -TaskName "PetabyteKeepAwake" -ErrorAction SilentlyContinue | Out-Null } catch {}
+    try { Stop-ScheduledTask -TaskName "PetabyteKeepAwake" -ErrorAction SilentlyContinue } catch {}
     try { Disable-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue | Out-Null } catch {}
     wsl.exe --shutdown
     Write-Host "Paused. Nothing runs until you resume. Resume anytime with -Action resume." -ForegroundColor Green
@@ -42,6 +44,10 @@ switch ($Action) {
     Write-Host "Resuming Petabyte node..."
     try { Enable-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue | Out-Null } catch {}
     try { Start-ScheduledTask -TaskName $Task } catch {}
+    if ($state.keepAwake) {
+        try { Enable-ScheduledTask -TaskName "PetabyteKeepAwake" -ErrorAction SilentlyContinue | Out-Null } catch {}
+        try { Start-ScheduledTask -TaskName "PetabyteKeepAwake" -ErrorAction SilentlyContinue } catch {}
+    }
     Start-Sleep -Seconds 3
     Agent "systemctl start petabyte-agent"
     Write-Host "Resumed — node coming back online." -ForegroundColor Green
@@ -56,6 +62,8 @@ switch ($Action) {
     Write-Host "Uninstalling Petabyte node..." -ForegroundColor Yellow
     # 1. stop + remove the agent and auto-start task
     Agent "systemctl disable --now petabyte-agent"
+    try { Stop-ScheduledTask -TaskName "PetabyteKeepAwake" -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-ScheduledTask -TaskName "PetabyteKeepAwake" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
     try { Unregister-ScheduledTask -TaskName $Task -Confirm:$false -ErrorAction SilentlyContinue } catch {}
 
     # 2. the distro: unregister only if WE created it; otherwise just remove the agent files
