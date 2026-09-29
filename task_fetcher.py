@@ -840,7 +840,8 @@ def _isolation_flags(task):
                                        also what makes the host egress firewall
                                        (install.sh DOCKER-USER rules) un-bypassable
                                        from inside a job.
-      * --security-opt no-new-privileges — no setuid escalation.
+      * --security-opt no-new-privileges — no setuid escalation, except the
+        platform's Fedora KDE desktop, whose abc user needs sudo for package installs.
       * --pids-limit                — fork-bomb cap.
       * --memory/--memory-swap/--cpus — sized to the booking when the server sends them
                                        (never guessed high, so a big legit rental isn't
@@ -861,9 +862,18 @@ def _isolation_flags(task):
     mix; the default profile is byte-for-byte the pre-existing hardening.
     """
     import subprocess
-    flags = ["--cap-drop", "ALL",
-             "--security-opt", "no-new-privileges",
-             "--pids-limit", str(task.get("pids") or 1024)]
+    flags = ["--cap-drop", "ALL", "--pids-limit", str(task.get("pids") or 1024)]
+    # The pinned Webtop image already grants its abc desktop user passwordless sudo.
+    # NNP blocks the setuid transition, producing a broken terminal. Permit that
+    # transition ONLY for the server-declared Fedora KDE template task. Root remains
+    # inside the container, with the same reduced capability whitelist, private
+    # network/volume and resource limits; never grant privileged mode or host mounts.
+    # An arbitrary image/batch job cannot opt in through a buyer parameter.
+    desktop_sudo = (task.get("task_type") == "template"
+                    and task.get("template") == "fedora-kde"
+                    and task.get("allow_sudo") is True)
+    if not desktop_sudo:
+        flags += ["--security-opt", "no-new-privileges"]
     # Some images start as root, chown their data dir, then drop to an unprivileged user
     # (gosu/su-exec/s6/linuxserver, most game servers). --cap-drop ALL removes CAP_SETUID/SETGID so
     # that drop fails ("operation not permitted") and the container exits at boot. Re-add ONLY the

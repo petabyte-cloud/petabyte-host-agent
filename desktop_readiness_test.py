@@ -15,6 +15,29 @@ import execution_receipt
 
 
 class DesktopReadiness(unittest.TestCase):
+    def test_sudo_is_limited_to_the_fedora_desktop(self):
+        runtimes = "map[kata:{/usr/bin/kata-runtime []} runc:{runc []}]"
+        desktop = dict(task_type="template", template="fedora-kde",
+                       allow_sudo=True, init_caps=["SETUID", "SETGID", "CHOWN",
+                                                   "DAC_OVERRIDE", "FOWNER"],
+                       memory="4g", cpus=2)
+        with patch.object(tf.subprocess, "check_output", return_value=runtimes):
+            flags = tf._isolation_flags(desktop)
+            self.assertEqual(flags[:2], ["--runtime", "kata"])
+            self.assertNotIn("no-new-privileges", flags)
+            self.assertEqual(flags[flags.index("--cap-drop") + 1], "ALL")
+            self.assertIn("--memory", flags)
+            self.assertIn("--pids-limit", flags)
+            self.assertNotIn("--privileged", flags)
+            self.assertNotIn("--mount", flags)
+
+            # A buyer-supplied flag cannot enable setuid for an arbitrary image,
+            # a different template, or a non-template task.
+            for changed in ({"template": "custom"}, {"task_type": "container"},
+                            {"allow_sudo": "true"}, {"allow_sudo": False}):
+                other = {**desktop, **changed}
+                self.assertIn("no-new-privileges", tf._isolation_flags(other))
+
     def test_minecraft_initial_launch_preserves_protocol_health_check(self):
         task = dict(task_id=44, template="minecraft", image="local-test", port=25565,
                     health="/", health_process="minecraft", egress="none")
