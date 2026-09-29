@@ -10,8 +10,11 @@ Auth is the real encrypted API key (X-API-KEY). Heartbeat runs on its own thread
 so a long-running job never makes the node look offline (which would get it reaped).
 """
 import hashlib
+import json
 import logging
 import os
+import socket
+import subprocess
 import threading
 import time
 
@@ -523,13 +526,15 @@ def _post(path, payload):
 
 
 def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_generation=None,
-                        game_udp_host_port=None) -> bool:
+                        game_udp_host_port=None, service_bridge=False) -> bool:
     """P1-7: report node:port to the control plane so a template VM flips starting->running and
     the gateway can route buyers to it. ip_address is optional — the server falls back to the
     public source IP of this request. Retries a few times: right after /launch the VMRoute may not
     be committed yet (409 'not in a registrable state'), and a transient 5xx must not strand the
     VM in 'starting'. register_vm_tunnel is idempotent, so retrying is safe."""
     body = {"vm_id": str(vm_id), "tunnel_port": int(tunnel_port)}
+    if service_bridge:
+        body["service_bridge"] = True
     if lease_generation is not None:
         body["lease_generation"] = lease_generation
     # Persisted receipts survive an agent restart; only this VM's execution can
@@ -538,6 +543,8 @@ def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_g
         if rental.get("vm_id") == vm_id:
             import execution_receipt
             body["lease_generation"] = execution_receipt.generation(tid)
+            if tid in _port_bridges:
+                body["service_bridge"] = True
             break
     if ip_address:
         body["ip_address"] = ip_address
@@ -1342,13 +1349,13 @@ def _wait_for_template_port(host_port, container_name, timeout_s=180):
     return False
 
 
-def _start_ready_poll(tid, name, host_port, path):
+def _start_ready_poll(tid, name, host_port, path, auth=None, process=None):
     import threading
-    threading.Thread(target=_await_ready, args=(tid, name, host_port, path),
+    threading.Thread(target=_await_ready, args=(tid, name, host_port, path, auth, process),
                      name=f"pb-ready-{tid}", daemon=True).start()
 
 
-def _await_ready(tid, name, host_port, path):
+def _await_ready(tid, name, host_port, path, auth=None, process=None):
     """Poll http://127.0.0.1:<host_port><path> until it answers 200, then report 'ready'. Stops
     when the watchdog has reported the container (it died) or after PB_READY_TIMEOUT_S (a 30 GB
     model download can take a long time; never ready = never billed, so a long limit is safe)."""
@@ -1360,7 +1367,15 @@ def _await_ready(tid, name, host_port, path):
         if not alive:
             return
         try:
-            if httpx.get(url, timeout=3, trust_env=False).status_code == 200:
+            options = {"auth": tuple(auth)} if auth else {}
+            if httpx.get(url, timeout=3, trust_env=False, **options).status_code == 200:
+                if process:
+                    # An nginx login page is not proof that a desktop session booted.
+                    if process != "plasmashell" or subprocess.run(
+                            ["docker", "exec", name, "pgrep", "-x", "plasmashell"],
+                            capture_output=True, timeout=5).returncode != 0:
+                        time.sleep(5)
+                        continue
                 _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
                                            "status": "ready"})
                 report_log(tid, "app is ready: health check passed")
@@ -1550,6 +1565,54 @@ _TUN_GW = os.getenv("PB_TUNNEL_GATEWAY", "").strip()          # e.g. pbtun@137.1
 _TUN_KEY = os.getenv("PB_TUNNEL_KEY", "/etc/petabyte/tunnel_key")
 _TUN_PORTS = os.getenv("PB_TUNNEL_PORTS", "20000-20050")
 _tunnels = {}                                                 # task_id -> (remoteport, Popen)
+_port_bridges = {}
+_PORT_BRIDGES_FILE = "/var/lib/petabyte-agent/port_bridges.json"
+_PORT_BRIDGES_LOCK = threading.RLock()
+
+
+def _persist_port_bridges():
+    import tempfile
+    with _PORT_BRIDGES_LOCK:
+        if os.path.islink(_PORT_BRIDGES_FILE):
+            raise ValueError("bridge state must not be a symlink")
+        fd, path = tempfile.mkstemp(dir=os.path.dirname(_PORT_BRIDGES_FILE), prefix=".port_bridges.")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump({str(tid): state["config"] for tid, state in _port_bridges.items()}, handle)
+            os.replace(path, _PORT_BRIDGES_FILE)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+
+def _restore_port_bridge(tid, name):
+    """Restore only this recorded rental's actual loopback Docker bindings."""
+    import port_bridge
+    import execution_receipt
+    try:
+        import stat
+        info = os.lstat(_PORT_BRIDGES_FILE)
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024
+                or info.st_uid != os.getuid() or info.st_mode & 0o077):
+            return None
+        with open(_PORT_BRIDGES_FILE) as handle:
+            config = json.load(handle).get(str(tid))
+        if (not config or config["container"] != name or not execution_receipt.knows(tid)
+                or config["generation"] != execution_receipt.generation(tid)):
+            return None
+        info = subprocess.run(["docker", "inspect", name], capture_output=True,
+                              text=True, timeout=10, check=True)
+        actual = json.loads(info.stdout)[0]["NetworkSettings"]["Ports"]
+        for endpoint in config["endpoints"]:
+            expected = {"HostIp": "127.0.0.1", "HostPort": str(endpoint["host_port"])}
+            if expected not in (actual.get(f"{endpoint['container_port']}/{endpoint['protocol']}") or []):
+                return None
+        bridge = port_bridge.Bridge(config["endpoints"], config["token"], config["generation"]).start()
+        with _PORT_BRIDGES_LOCK:
+            _port_bridges[tid] = dict(bridge=bridge, config=config)
+        return bridge.port
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        return None
 # Self-enrolled key + known_hosts live in the unit's StateDirectory ($HOME is read-only there).
 _TUN_STATE_KEY = "/var/lib/petabyte-agent/tunnel_key"
 _TUN_KNOWN_HOSTS = "/var/lib/petabyte-agent/known_hosts"
@@ -1768,6 +1831,14 @@ def _kill_reverse_tunnel(tid):
         pass
     if _tun_rentals.pop(tid, None) is not None:
         _save_tunnel_ports()
+    with _PORT_BRIDGES_LOCK:
+        bridge = _port_bridges.pop(tid, None)
+    if bridge:
+        bridge["bridge"].shutdown()
+        try:
+            _persist_port_bridges()
+        except (OSError, ValueError):
+            logging.error("could not persist service bridge cleanup")
     t = _tunnels.pop(tid, None)
     if t:
         try:
@@ -2001,13 +2072,51 @@ def _run_template(task):
                                    "status": "failed"})
         return
     name = f"pb-{task.get('template')}-{_uuid.uuid4().hex[:8]}"
+    _service_endpoints = []
+    _service_bridge = None
+    _health_port = host_port
+    try:
+        if task.get("public_services"):
+            import port_bridge
+            for item in task["public_services"]:
+                kind = socket.SOCK_DGRAM if item["protocol"] == "udp" else socket.SOCK_STREAM
+                with socket.socket(socket.AF_INET, kind) as listener:
+                    listener.bind(("127.0.0.1", 0))
+                    local_port = listener.getsockname()[1]
+                _service_endpoints.append(dict(container_port=item["container_port"],
+                                               protocol=item["protocol"], host_port=local_port))
+            _service_bridge = port_bridge.Bridge(_service_endpoints, task["service_credential"],
+                                                 task.get("lease_generation", 0))
+            _service_bridge.start()
+            host_port = _service_bridge.port
+            _health_port = next((item["host_port"] for item in _service_endpoints
+                                 if item["container_port"] == port and item["protocol"] == "tcp"), None)
+            with _PORT_BRIDGES_LOCK:
+                _port_bridges[tid] = dict(bridge=_service_bridge,
+                    config=dict(container=name, endpoints=_service_endpoints,
+                                token=task["service_credential"], generation=task.get("lease_generation", 0)))
+    except Exception as error:
+        if _service_bridge:
+            _service_bridge.shutdown()
+        report_log(tid, f"template service bridge could not start: {_launch_failure_reason(error)}")
+        _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "", "status": "failed"})
+        try:
+            _post_result_ack_retry(_signed_result(tid, status="failed", failure_cause="network_policy"))
+        finally:
+            _cleanup_job_resources(tid, name)
+            _set_ui(status="idle", task=None, fail=True)
+        return
     # SECURITY (tenant isolation): every job container is labelled with its task id so the
     # watchdog (and any operator) can find, stop and GC exactly this rental's resources, and so
     # a per-task volume/network is never confused with another tenant's.
     cmd = ["docker", "run", "--pull=never", "-d", "--name", name,
            "--label", f"pb.task={tid}", "--label", "pb.kind=template"]
-    if task.get("health") and host_port:
-        cmd += ["--label", f"pb.health={task['health']}", "--label", f"pb.health_port={host_port}"]
+    if task.get("health") and _health_port:
+        cmd += ["--label", f"pb.health={task['health']}", "--label", f"pb.health_port={_health_port}"]
+        if task.get("health_process") == "plasmashell":
+            cmd += ["--label", "pb.health_process=plasmashell"]
+    if _service_bridge:
+        cmd += ["--label", "pb.service_bridge=1"]
     cmd += _interactive_labels(task)           # only an interactive rental is a reap candidate
     if task.get("vm_id") and host_port:        # lets a restarted agent re-open + re-register its tunnel
         cmd += ["--label", f"pb.vm_id={task['vm_id']}", "--label", f"pb.host_port={host_port}"]
@@ -2020,7 +2129,11 @@ def _run_template(task):
     # Reverse-tunnel mode binds the container to LOOPBACK (nothing public on this node); the gateway
     # reaches it via the outbound ssh -R opened after start. Otherwise publish on the public NIC.
     _rev = _reverse_tunnel_enabled() and bool(port)
-    cmd += _publish_flags(port, host_port, bind="127.0.0.1" if _rev else None)
+    if _service_bridge:
+        for endpoint in _service_endpoints:
+            cmd += ["-p", f"127.0.0.1:{endpoint['host_port']}:{endpoint['container_port']}/{endpoint['protocol']}"]
+    else:
+        cmd += _publish_flags(port, host_port, bind="127.0.0.1" if _rev else None)
     if game_udp_host_port is not None:
         cmd += ["-p", f"{game_wg_ip}:{game_udp_host_port}:{port}/udp"]
     cmd += _isolation_flags(task)              # Phase-1 sandbox (gVisor if present)
@@ -2097,20 +2210,25 @@ def _run_template(task):
         finally:
             _remove_env_file(task)
         _register_vm(tid, name)  # watchdog: detect if this container dies
+        if _service_bridge:
+            _persist_port_bridges()  # a restart must never rebind a different rental's service
         _start_storage_guard(tid, name, vol if task.get("cache") else None)
         if task.get("model_env") == "OLLAMA_MODEL" and model:
             if params.get("max_startup_seconds"):
                 _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
                                            "status": "loading"})
             _start_ollama_pull(tid, name, model)       # the image never reads OLLAMA_MODEL
-        if task.get("health") and host_port:
+        if task.get("health") and _health_port:
             # A registered tunnel is not a working app: vLLM/llama.cpp download and load the model
             # AFTER this point, and a model too big for the GPU never serves. Tell the server the app
             # is loading; _await_ready reports 'ready' once the health endpoint answers. Billing and
             # the buyer's "Open" link wait for that.
             _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
                                        "status": "loading"})
-            _start_ready_poll(tid, name, host_port, task["health"])
+            if task.get("health_auth"):
+                _start_ready_poll(tid, name, _health_port, task["health"], task["health_auth"], task.get("health_process"))
+            else:
+                _start_ready_poll(tid, name, _health_port, task["health"])
         # Colab-style /run: if a notebook URL was passed, fetch it INTO the running container's
         # work dir so it opens ready-to-run. Best-effort and image-agnostic (a plain `docker exec`
         # after start — never overrides the image's startup, so a fetch failure can't break the
@@ -2121,7 +2239,7 @@ def _run_template(task):
                 _prefetch_notebook(name, task.get("cache") or "/home/jovyan/work", nb_url)
             except Exception as _e:  # noqa: BLE001 — prefetch is best-effort
                 report_log(tid, "notebook prefetch skipped: download or container write rejected")
-        if task.get("template") == "finetune" and not _wait_for_template_port(host_port, name):
+        if task.get("template") == "finetune" and not _wait_for_template_port(_health_port, name):
             report_log(tid, "Axolotl JupyterLab did not open its service port; failing the rental")
             try:
                 _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
@@ -2160,7 +2278,7 @@ def _run_template(task):
             _registered = _register_vm_tunnel(
                 vm_id, _hp, ip_address=(_node_ip if task.get("template") != "palworld" else None),
                 lease_generation=task.get("lease_generation", 0),
-                game_udp_host_port=game_udp_host_port)
+                game_udp_host_port=game_udp_host_port, service_bridge=bool(_service_bridge))
             if _registered:
                 report_log(tid, f"tunnel registered: vm {vm_id} -> {_node_ip or 'node'}:{_hp}")
             else:
@@ -3096,11 +3214,29 @@ def _restore_vm_watch():
                 _register_vm(int(task_id), container)
                 hl = subprocess.run(["docker", "inspect", "-f",
                                      "|".join('{{index .Config.Labels "%s"}}' % k for k in
-                                              ("pb.health", "pb.health_port", "pb.vm_id", "pb.host_port")),
+                                              ("pb.health", "pb.health_port", "pb.vm_id", "pb.host_port", "pb.service_bridge", "pb.health_process")),
                                      container], capture_output=True, text=True, timeout=10, check=False)
-                path, hp, vm_id, tun_hp = ((hl.stdout or "").strip().split("|") + ["", "", ""])[:4]
+                path, hp, vm_id, tun_hp, bridge_flag, health_process = ((hl.stdout or "").strip().split("|") + [""] * 6)[:6]
+                if bridge_flag == "1":
+                    restored = _restore_port_bridge(int(task_id), container)
+                    if restored is None:
+                        with _pb_vm_lock:
+                            _pb_vm_watch[int(task_id)]["fail"] = "service_bridge_state_lost"
+                        continue
+                    tun_hp = str(restored)
                 if path.startswith("/") and hp.isdigit():
-                    _start_ready_poll(int(task_id), container, int(hp), path)
+                    if health_process == "plasmashell":
+                        info = subprocess.run(["docker", "inspect", container], capture_output=True,
+                                              text=True, timeout=10, check=True)
+                        env = dict(item.split("=", 1) for item in json.loads(info.stdout)[0]["Config"]["Env"] if "=" in item)
+                        if env.get("CUSTOM_USER") != "petabyte" or not env.get("PASSWORD"):
+                            with _pb_vm_lock:
+                                _pb_vm_watch[int(task_id)]["fail"] = "desktop_auth_state_lost"
+                            continue
+                        _start_ready_poll(int(task_id), container, int(hp), path,
+                                          ["petabyte", env["PASSWORD"]], "plasmashell")
+                    else:
+                        _start_ready_poll(int(task_id), container, int(hp), path)
                 if tun_hp.isdigit() and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", vm_id):
                     _supervise_tunnel(int(task_id), container, int(tun_hp), vm_id,
                                       rp=saved.get(int(task_id)))

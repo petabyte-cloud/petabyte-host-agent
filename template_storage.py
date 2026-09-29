@@ -167,7 +167,8 @@ def report(gateway=""):
                 current = inspect(ref)
                 if current:
                     images.append(hashlib.sha256(ref.encode()).hexdigest())
-            result = {"version": 1, "probe_version": 1, "images": images, "cache_budget_bytes": int(budget),
+            result = {"version": 1, "probe_version": 1, "port_bridge_version": 1,
+                      "images": images, "cache_budget_bytes": int(budget),
                       "cache_bytes": sum(x["bytes"] for x in state["images"].values()),
                       "disk_free_bytes": free_bytes(), "disk_reserve_bytes": int(reserve)}
         if gateway:
