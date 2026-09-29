@@ -1,10 +1,11 @@
 """Rental-scoped TCP/UDP bridge carried inside the authenticated SSH reverse tunnel.
 
-Only a platform-declared container port can be selected. The peer never supplies
-an IP address or host port. UDP datagrams retain their boundaries; each client
-gets its own connected UDP socket. The outer transport is SSH/TCP, so UDP can
-experience head-of-line blocking during packet loss.
+Only platform-declared container ports can be selected. TCP uses authenticated
+SSH; native UDP uses the enrolled WireGuard peer and rental-authenticated frames.
+Peers never supply an IP or host port. The legacy UDP/TCP path is refused when a
+native listener is configured.
 """
+import hashlib
 import hmac
 import json
 import select
@@ -15,6 +16,145 @@ import time
 
 MAGIC = b"PBPORT1\n"
 MAX_DATAGRAM = 65507
+UDP_HEADER = struct.Struct("!8sBQH16sQI")
+UDP_MAGIC = b"PBUDP1\0\0"
+MAX_NATIVE_DATAGRAM = MAX_DATAGRAM - UDP_HEADER.size - 32
+
+
+def udp_frame(token, generation, port, session, sequence, payload, reply=False):
+    """Authenticate datagrams within WireGuard; never put the rental secret on the wire."""
+    if len(payload) > MAX_NATIVE_DATAGRAM:
+        raise ValueError("oversize native UDP datagram")
+    header = UDP_HEADER.pack(UDP_MAGIC, int(reply), generation, port, session,
+                             sequence, int(time.time()))
+    body = header + payload
+    return body + hmac.new(token.encode(), body, hashlib.sha256).digest()
+
+
+def udp_decode(data, token, generation, reply=False):
+    if not UDP_HEADER.size + 32 <= len(data) <= MAX_DATAGRAM:
+        raise ValueError("invalid native UDP frame")
+    body, signature = data[:-32], data[-32:]
+    if not hmac.compare_digest(signature, hmac.new(token.encode(), body, hashlib.sha256).digest()):
+        raise ValueError("invalid native UDP authentication")
+    magic, direction, lease, port, session, sequence, issued = UDP_HEADER.unpack(body[:UDP_HEADER.size])
+    if (magic != UDP_MAGIC or direction != int(reply) or lease != generation
+            or abs(time.time() - issued) > 15):
+        raise ValueError("stale or misdirected native UDP frame")
+    return port, session, sequence, body[UDP_HEADER.size:]
+
+
+class ReplayWindow:
+    """Allow packet reordering within 256 packets while rejecting duplicate frames."""
+    def __init__(self):
+        self.highest, self.bits = -1, 0
+
+    def accept(self, sequence):
+        if sequence > self.highest:
+            shift = sequence - self.highest
+            self.bits = ((self.bits << shift) if shift < 256 else 0) & ((1 << 256) - 1)
+            self.highest = sequence
+            self.bits |= 1
+            return True
+        distance = self.highest - sequence
+        if distance >= 256 or self.bits & (1 << distance):
+            return False
+        self.bits |= 1 << distance
+        return True
+
+
+class DatagramBridge:
+    """Bounded UDP-to-UDP relay, bound ONLY to the node's enrolled WireGuard address.
+
+    Targets are fixed loopback Docker bindings. Requests must come from the gateway
+    and authenticate the current rental, generation, declared service and direction.
+    One connected socket per client keeps replies isolated; no TCP fallback exists.
+    """
+    def __init__(self, endpoints, token, generation, bind, gateway, slots, port=0):
+        self.endpoints = {p: host for (p, protocol), host in endpoints.items() if protocol == "udp"}
+        self.token, self.generation, self.gateway, self.slots = token, generation, gateway, slots
+        self.stop, self.lock = threading.Event(), threading.Lock()
+        self.sessions = {}
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.listener.bind((bind, port))
+            self.listener.settimeout(.5)
+        except BaseException:
+            close(self.listener)
+            raise
+        self.port = self.listener.getsockname()[1]
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            while not self.stop.is_set():
+                with self.lock:
+                    for key, state in list(self.sessions.items()):
+                        if time.monotonic() - state["last"] > 30:
+                            close(state["socket"])
+                            self.sessions.pop(key)
+                            self.slots.release()
+                    replies = {state["socket"]: (key, state) for key, state in self.sessions.items()}
+                readable, _, _ = select.select([self.listener, *replies], [], [], .5)
+                for sock in readable:
+                    if self.stop.is_set():
+                        return
+                    try:
+                        if sock is self.listener:
+                            data, source = sock.recvfrom(MAX_DATAGRAM + 1)
+                            if source[0] != self.gateway:
+                                continue
+                            port, session, sequence, payload = udp_decode(data, self.token, self.generation)
+                            if port not in self.endpoints:
+                                continue
+                            key = (port, session, source)
+                            with self.lock:
+                                state = self.sessions.get(key)
+                                if state is None:
+                                    if not self.slots.acquire(blocking=False):
+                                        continue
+                                    upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                                    try:
+                                        upstream.connect(("127.0.0.1", self.endpoints[port]))
+                                        upstream.settimeout(.5)
+                                    except BaseException:
+                                        close(upstream)
+                                        self.slots.release()
+                                        raise
+                                    state = dict(socket=upstream, window=ReplayWindow(), sequence=0,
+                                                 last=time.monotonic())
+                                    self.sessions[key] = state
+                                if not state["window"].accept(sequence):
+                                    continue
+                                state["last"] = time.monotonic()
+                                state["socket"].send(payload)
+                        else:
+                            (port, session, source), state = replies[sock]
+                            payload = sock.recv(MAX_NATIVE_DATAGRAM + 1)
+                            frame = udp_frame(self.token, self.generation, port, session,
+                                              state["sequence"], payload, reply=True)
+                            state["sequence"] += 1
+                            self.listener.sendto(frame, source)
+                            state["last"] = time.monotonic()
+                    except (OSError, ValueError):
+                        continue
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self.lock:
+                for state in self.sessions.values():
+                    close(state["socket"])
+                    self.slots.release()
+                self.sessions.clear()
+
+    def shutdown(self):
+        self.stop.set()
+        close(self.listener)
+        with self.lock:
+            for state in self.sessions.values():
+                close(state["socket"])
 
 
 def exact(sock, size):
@@ -77,7 +217,8 @@ def splice(left, right, stop=None, on_reply=None, idle_seconds=7200):
 
 
 class Bridge:
-    def __init__(self, endpoints, token, generation, max_connections=128):
+    def __init__(self, endpoints, token, generation, max_connections=128,
+                 udp_bind=None, udp_gateway=None, udp_port=0):
         if not isinstance(token, str) or not 32 <= len(token) <= 128:
             raise ValueError("bridge needs a rental credential")
         if type(generation) is not int or generation < 0:
@@ -110,10 +251,26 @@ class Bridge:
             close(self.listener)
             raise
         self.port = self.listener.getsockname()[1]
+        self.datagrams = None
+        try:
+            if udp_bind:
+                if not udp_gateway or not any(proto == "udp" for _, proto in self.endpoints):
+                    raise ValueError("native UDP needs a gateway and declared UDP service")
+                self.datagrams = DatagramBridge(self.endpoints, token, generation, udp_bind,
+                                                udp_gateway, self.slots, udp_port)
+        except BaseException:
+            close(self.listener)
+            raise
+
+    @property
+    def udp_port(self):
+        return self.datagrams.port if self.datagrams else None
 
     def start(self):
         try:
             threading.Thread(target=self._accept, daemon=True).start()
+            if self.datagrams:
+                self.datagrams.start()
         except RuntimeError:
             self.shutdown()
             raise
@@ -159,6 +316,8 @@ class Bridge:
                     or type(request.get("port")) is not int):
                 return
             protocol = request.get("protocol")
+            if protocol == "udp" and self.datagrams:
+                return  # Native UDP rentals must never silently fall back to SSH/TCP.
             host_port = self.endpoints.get((request["port"], protocol))
             if not host_port:
                 return
@@ -195,6 +354,8 @@ class Bridge:
     def shutdown(self):
         self.stop.set()
         close(self.listener)
+        if self.datagrams:
+            self.datagrams.shutdown()
         with self.lock:
             peers = list(self.peers)
         for peer in peers:

@@ -15,6 +15,58 @@ import execution_receipt
 
 
 class DesktopReadiness(unittest.TestCase):
+    def test_wireguard_readiness_requires_recent_expected_peer_handshake(self):
+        import egress_vpn
+        from unittest.mock import Mock
+        with patch.dict(os.environ, PB_EGRESS_GATEWAY_PUBKEY="expected-peer"), \
+             patch.object(egress_vpn, "enabled", return_value=True), \
+             patch.object(egress_vpn.shutil, "which", return_value="wg"), \
+             patch.object(egress_vpn.time, "time", return_value=1000):
+            for stdout, expected in [("expected-peer\t990\n", True), ("different-peer\t990\n", False),
+                                      ("expected-peer\t0\n", False), ("expected-peer\t800\n", False),
+                                      ("expected-peer\t1100\n", False), ("expected-peer\tbad\n", False)]:
+                with patch.object(egress_vpn, "_run", return_value=Mock(returncode=0, stdout=stdout)):
+                    self.assertIs(egress_vpn.peer_ready(), expected)
+
+    def test_native_udp_restores_exact_assignment_and_fails_without_wireguard(self):
+        import egress_vpn
+        endpoint = [dict(container_port=10014, protocol="udp", host_port=12345)]
+        saved = dict(udp_bind="10.9.0.7", udp_gateway="10.9.0.1", udp_port=32000)
+        with patch.dict(os.environ, PB_EGRESS_ADDR="10.9.0.7/32"), \
+             patch.object(egress_vpn, "enabled", return_value=True), \
+             patch.object(egress_vpn, "peer_ready", return_value=True), \
+             patch.object(egress_vpn, "ensure_tunnel", return_value=True):
+            self.assertEqual(tf._native_bridge_options(endpoint, saved), saved)
+            for stale in [{**saved, "udp_bind": "10.9.0.8"}, {**saved, "udp_gateway": "169.254.169.254"},
+                          {**saved, "udp_port": True}]:
+                with self.assertRaises(ValueError):
+                    tf._native_bridge_options(endpoint, stale)
+            with patch.object(egress_vpn, "ensure_tunnel", return_value=False):
+                with self.assertRaises(ValueError):
+                    tf._native_bridge_options(endpoint)
+            with patch.object(egress_vpn, "peer_ready", return_value=False), patch.object(tf.time, "sleep"):
+                with self.assertRaises(ValueError):
+                    tf._native_bridge_options(endpoint)
+            rule = egress_vpn.service_udp_rule(32000)
+            self.assertIn("wg-egress", rule)
+            self.assertIn("10.9.0.1/32", rule)
+            self.assertIn("10.9.0.7/32", rule)
+            self.assertNotIn("0.0.0.0/0", rule)
+
+    def test_native_listener_firewall_removed_on_failure_and_shutdown(self):
+        import egress_vpn
+        import port_bridge
+        from unittest.mock import Mock
+        bridge = Mock(udp_port=32000)
+        bridge.start.side_effect = RuntimeError("thread capacity")
+        with patch.object(port_bridge, "Bridge", return_value=bridge), \
+             patch.object(egress_vpn, "service_udp_firewall") as firewall:
+            with self.assertRaises(RuntimeError):
+                tf._start_service_bridge([], "a" * 64, 4, {})
+            firewall.assert_any_call(32000)
+            firewall.assert_any_call(32000, remove=True)
+            bridge.shutdown.assert_called_once()
+
     def test_bridge_start_failure_reports_failure_and_cleans_up(self):
         task = dict(task_id=42, template="custom", image="local-test", port=8080,
                     public_services=[dict(container_port=8080, protocol="tcp")],

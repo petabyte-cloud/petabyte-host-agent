@@ -32,6 +32,7 @@ import ipaddress
 import os
 import shutil
 import subprocess
+import time
 
 IFACE = "wg-egress"
 TABLE = "51821"                       # dedicated route table id for buyer internet egress
@@ -126,6 +127,41 @@ def ensure_tunnel() -> bool:
         subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{knob}.rp_filter=2"],
                        capture_output=True)
     return _iface_up()
+
+
+def service_udp_rule(port):
+    if type(port) is not int or not 1024 <= port <= 65535:
+        raise ValueError("invalid native UDP listener")
+    address = str(ipaddress.ip_interface(os.environ["PB_EGRESS_ADDR"]).ip)
+    return ["-i", IFACE, "-s", "10.9.0.1/32", "-d", address + "/32", "-p", "udp",
+            "--dport", str(port), "-m", "comment", "--comment", "pb-native-service", "-j", "ACCEPT"]
+
+
+def peer_ready():
+    """A configured/up interface alone does not prove the gateway is reachable."""
+    if not enabled() or not shutil.which("wg"):
+        return False
+    result = _run(["wg", "show", IFACE, "latest-handshakes"], check=False)
+    if result.returncode:
+        return False
+    for row in result.stdout.splitlines():
+        fields = row.split()
+        if len(fields) == 2 and fields[0] == os.getenv("PB_EGRESS_GATEWAY_PUBKEY"):
+            try:
+                return 0 <= time.time() - int(fields[1]) <= 180
+            except ValueError:
+                return False
+    return False
+
+
+def service_udp_firewall(port, remove=False):
+    """Open only this authenticated listener to the gateway on WireGuard, never WAN."""
+    rule = service_udp_rule(port)
+    present = _run(["iptables", "-C", "INPUT", *rule], check=False).returncode == 0
+    if present and remove:
+        _run(["iptables", "-D", "INPUT", *rule])
+    elif not present and not remove:
+        _run(["iptables", "-I", "INPUT", "1", *rule])
 
 
 def bridge_commands(subnet: str, wan: str, *, table: str = TABLE, mss: int | None = None):

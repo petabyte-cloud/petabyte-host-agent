@@ -526,7 +526,7 @@ def _post(path, payload):
 
 
 def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_generation=None,
-                        game_udp_host_port=None, service_bridge=False) -> bool:
+                        game_udp_host_port=None, service_bridge=False, service_udp_port=None) -> bool:
     """P1-7: report node:port to the control plane so a template VM flips starting->running and
     the gateway can route buyers to it. ip_address is optional — the server falls back to the
     public source IP of this request. Retries a few times: right after /launch the VMRoute may not
@@ -535,6 +535,8 @@ def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_g
     body = {"vm_id": str(vm_id), "tunnel_port": int(tunnel_port)}
     if service_bridge:
         body["service_bridge"] = True
+    if service_udp_port is not None:
+        body["service_udp_port"] = service_udp_port
     if lease_generation is not None:
         body["lease_generation"] = lease_generation
     # Persisted receipts survive an agent restart; only this VM's execution can
@@ -545,6 +547,8 @@ def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_g
             body["lease_generation"] = execution_receipt.generation(tid)
             if tid in _port_bridges:
                 body["service_bridge"] = True
+                if _port_bridges[tid]["bridge"].udp_port:
+                    body["service_udp_port"] = _port_bridges[tid]["bridge"].udp_port
             break
     if ip_address:
         body["ip_address"] = ip_address
@@ -1570,6 +1574,52 @@ _PORT_BRIDGES_FILE = "/var/lib/petabyte-agent/port_bridges.json"
 _PORT_BRIDGES_LOCK = threading.RLock()
 
 
+def _native_bridge_options(endpoints, saved=None):
+    if not any(item["protocol"] == "udp" for item in endpoints):
+        if saved:
+            raise ValueError("unexpected native UDP state")
+        return {}
+    import ipaddress
+    import egress_vpn
+    if not egress_vpn.enabled() or not egress_vpn.ensure_tunnel():
+        raise ValueError("public UDP requires an enrolled WireGuard tunnel")
+    for attempt in range(20):
+        if egress_vpn.peer_ready():
+            break
+        if attempt == 19:
+            raise ValueError("public UDP gateway handshake is not ready")
+        time.sleep(.5)
+    bind = str(ipaddress.ip_interface(os.environ["PB_EGRESS_ADDR"]).ip)
+    gateway = "10.9.0.1"
+    if saved and (saved.get("udp_bind") != bind or saved.get("udp_gateway") != gateway
+                  or type(saved.get("udp_port")) is not int or not 1024 <= saved["udp_port"] <= 65535):
+        raise ValueError("native UDP assignment changed during restart")
+    return dict(udp_bind=bind, udp_gateway=gateway, udp_port=saved["udp_port"] if saved else 0)
+
+
+def _start_service_bridge(endpoints, token, generation, native):
+    import port_bridge
+    import egress_vpn
+    bridge = port_bridge.Bridge(endpoints, token, generation, **native)
+    try:
+        if bridge.udp_port:
+            egress_vpn.service_udp_firewall(bridge.udp_port)
+        return bridge.start()
+    except BaseException:
+        _shutdown_service_bridge(bridge)
+        raise
+
+
+def _shutdown_service_bridge(bridge):
+    bridge.shutdown()
+    if bridge.udp_port:
+        import egress_vpn
+        try:
+            egress_vpn.service_udp_firewall(bridge.udp_port, remove=True)
+        except (OSError, ValueError, subprocess.SubprocessError, RuntimeError):
+            pass  # The closed authenticated socket is fenced even if rule removal fails.
+
+
 def _persist_port_bridges():
     import tempfile
     with _PORT_BRIDGES_LOCK:
@@ -1587,7 +1637,6 @@ def _persist_port_bridges():
 
 def _restore_port_bridge(tid, name):
     """Restore only this recorded rental's actual loopback Docker bindings."""
-    import port_bridge
     import execution_receipt
     try:
         import stat
@@ -1607,7 +1656,10 @@ def _restore_port_bridge(tid, name):
             expected = {"HostIp": "127.0.0.1", "HostPort": str(endpoint["host_port"])}
             if expected not in (actual.get(f"{endpoint['container_port']}/{endpoint['protocol']}") or []):
                 return None
-        bridge = port_bridge.Bridge(config["endpoints"], config["token"], config["generation"]).start()
+        native = _native_bridge_options(config["endpoints"], config.get("native_udp"))
+        if native and not config.get("native_udp"):
+            return None  # An older UDP journal has no assigned native port; do not guess on restart.
+        bridge = _start_service_bridge(config["endpoints"], config["token"], config["generation"], native)
         with _PORT_BRIDGES_LOCK:
             _port_bridges[tid] = dict(bridge=bridge, config=config)
         return bridge.port
@@ -1834,7 +1886,7 @@ def _kill_reverse_tunnel(tid):
     with _PORT_BRIDGES_LOCK:
         bridge = _port_bridges.pop(tid, None)
     if bridge:
-        bridge["bridge"].shutdown()
+        _shutdown_service_bridge(bridge["bridge"])
         try:
             _persist_port_bridges()
         except (OSError, ValueError):
@@ -2077,7 +2129,6 @@ def _run_template(task):
     _health_port = host_port
     try:
         if task.get("public_services"):
-            import port_bridge
             for item in task["public_services"]:
                 kind = socket.SOCK_DGRAM if item["protocol"] == "udp" else socket.SOCK_STREAM
                 with socket.socket(socket.AF_INET, kind) as listener:
@@ -2085,19 +2136,22 @@ def _run_template(task):
                     local_port = listener.getsockname()[1]
                 _service_endpoints.append(dict(container_port=item["container_port"],
                                                protocol=item["protocol"], host_port=local_port))
-            _service_bridge = port_bridge.Bridge(_service_endpoints, task["service_credential"],
-                                                 task.get("lease_generation", 0))
-            _service_bridge.start()
+            native = _native_bridge_options(_service_endpoints)
+            _service_bridge = _start_service_bridge(_service_endpoints, task["service_credential"],
+                                                    task.get("lease_generation", 0), native)
+            if native:
+                native["udp_port"] = _service_bridge.udp_port
             host_port = _service_bridge.port
             _health_port = next((item["host_port"] for item in _service_endpoints
                                  if item["container_port"] == port and item["protocol"] == "tcp"), None)
             with _PORT_BRIDGES_LOCK:
                 _port_bridges[tid] = dict(bridge=_service_bridge,
                     config=dict(container=name, endpoints=_service_endpoints,
-                                token=task["service_credential"], generation=task.get("lease_generation", 0)))
+                                token=task["service_credential"], generation=task.get("lease_generation", 0),
+                                native_udp=native or None))
     except Exception as error:
         if _service_bridge:
-            _service_bridge.shutdown()
+            _shutdown_service_bridge(_service_bridge)
         report_log(tid, f"template service bridge could not start: {_launch_failure_reason(error)}")
         _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "", "status": "failed"})
         try:
@@ -2278,7 +2332,8 @@ def _run_template(task):
             _registered = _register_vm_tunnel(
                 vm_id, _hp, ip_address=(_node_ip if task.get("template") != "palworld" else None),
                 lease_generation=task.get("lease_generation", 0),
-                game_udp_host_port=game_udp_host_port, service_bridge=bool(_service_bridge))
+                game_udp_host_port=game_udp_host_port, service_bridge=bool(_service_bridge),
+                service_udp_port=_service_bridge.udp_port if _service_bridge else None)
             if _registered:
                 report_log(tid, f"tunnel registered: vm {vm_id} -> {_node_ip or 'node'}:{_hp}")
             else:

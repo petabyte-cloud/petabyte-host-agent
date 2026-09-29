@@ -167,10 +167,16 @@ def report(gateway=""):
                 current = inspect(ref)
                 if current:
                     images.append(hashlib.sha256(ref.encode()).hexdigest())
-            result = {"version": 1, "probe_version": 1, "port_bridge_version": 1,
+            result = {"version": 1, "probe_version": 1, "port_bridge_version": 1, "native_udp_version": 1,
                       "images": images, "cache_budget_bytes": int(budget),
                       "cache_bytes": sum(x["bytes"] for x in state["images"].values()),
                       "disk_free_bytes": free_bytes(), "disk_reserve_bytes": int(reserve)}
+        import egress_vpn
+        try:
+            result["native_udp_ready"] = bool(egress_vpn.enabled() and egress_vpn.ensure_tunnel()
+                                               and egress_vpn.peer_ready())
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            result["native_udp_ready"] = False
         if gateway:
             try:
                 host = gateway.rsplit("@", 1)[-1]
