@@ -1372,14 +1372,20 @@ def _await_ready(tid, name, host_port, path, auth=None, process=None):
             return
         try:
             options = {"auth": tuple(auth)} if auth else {}
-            if httpx.get(url, timeout=3, trust_env=False, **options).status_code == 200:
-                if process:
+            if process == "minecraft":
+                # The pinned image's monitor speaks the Java status protocol, not HTTP.
+                ready = subprocess.run(["docker", "exec", name, "mc-health"],
+                                       capture_output=True, timeout=5).returncode == 0
+            else:
+                ready = httpx.get(url, timeout=3, trust_env=False, **options).status_code == 200
+                if ready and process:
                     # An nginx login page is not proof that a desktop session booted.
                     if process != "plasmashell" or subprocess.run(
                             ["docker", "exec", name, "pgrep", "-x", "plasmashell"],
                             capture_output=True, timeout=5).returncode != 0:
                         time.sleep(5)
                         continue
+            if ready:
                 _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
                                            "status": "ready"})
                 report_log(tid, "app is ready: health check passed")
@@ -2167,8 +2173,8 @@ def _run_template(task):
            "--label", f"pb.task={tid}", "--label", "pb.kind=template"]
     if task.get("health") and _health_port:
         cmd += ["--label", f"pb.health={task['health']}", "--label", f"pb.health_port={_health_port}"]
-        if task.get("health_process") == "plasmashell":
-            cmd += ["--label", "pb.health_process=plasmashell"]
+        if task.get("health_process") in {"plasmashell", "minecraft"}:
+            cmd += ["--label", "pb.health_process=" + task["health_process"]]
     if _service_bridge:
         cmd += ["--label", "pb.service_bridge=1"]
     cmd += _interactive_labels(task)           # only an interactive rental is a reap candidate
@@ -2282,7 +2288,8 @@ def _run_template(task):
             if task.get("health_auth"):
                 _start_ready_poll(tid, name, _health_port, task["health"], task["health_auth"], task.get("health_process"))
             else:
-                _start_ready_poll(tid, name, _health_port, task["health"])
+                _start_ready_poll(tid, name, _health_port, task["health"],
+                                  process=task.get("health_process"))
         # Colab-style /run: if a notebook URL was passed, fetch it INTO the running container's
         # work dir so it opens ready-to-run. Best-effort and image-agnostic (a plain `docker exec`
         # after start — never overrides the image's startup, so a fetch failure can't break the
@@ -3291,7 +3298,8 @@ def _restore_vm_watch():
                         _start_ready_poll(int(task_id), container, int(hp), path,
                                           ["petabyte", env["PASSWORD"]], "plasmashell")
                     else:
-                        _start_ready_poll(int(task_id), container, int(hp), path)
+                        _start_ready_poll(int(task_id), container, int(hp), path,
+                                          process=health_process or None)
                 if tun_hp.isdigit() and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", vm_id):
                     _supervise_tunnel(int(task_id), container, int(tun_hp), vm_id,
                                       rp=saved.get(int(task_id)))

@@ -15,6 +15,65 @@ import execution_receipt
 
 
 class DesktopReadiness(unittest.TestCase):
+    def test_minecraft_initial_launch_preserves_protocol_health_check(self):
+        task = dict(task_id=44, template="minecraft", image="local-test", port=25565,
+                    health="/", health_process="minecraft", egress="none")
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch.object(tf.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="owned-cid", stderr="")), \
+             patch.object(tf, "_set_ui"), patch.object(tf, "_restore_volume"), \
+             patch.object(tf, "_start_backup_thread"), patch.object(tf, "_free_host_port", return_value=18000), \
+             patch.object(tf, "_reverse_tunnel_enabled", return_value=True), \
+             patch.object(tf, "_open_reverse_tunnel", return_value=21000), \
+             patch.object(tf, "report_progress"), \
+             patch.object(tf, "_isolation_flags", return_value=[]), \
+             patch.object(tf.template_storage, "prepare", return_value="cached"), \
+             patch.object(tf, "_register_vm"), patch.object(tf, "_start_storage_guard"), \
+             patch.object(tf, "report_log"), patch.object(tf, "_post"), \
+             patch.object(tf, "_start_ready_poll") as poll:
+            tf._run_template(task)
+        poll.assert_called_once()
+        self.assertEqual(poll.call_args.args[0], 44)
+        self.assertEqual(poll.call_args.args[2:], (18000, "/"))
+        self.assertEqual(poll.call_args.kwargs, {"process": "minecraft"})
+
+    def test_minecraft_restart_preserves_protocol_health_check(self):
+        with patch.object(tf.subprocess, "run", side_effect=[
+                SimpleNamespace(returncode=0, stdout="owned-container"),
+                SimpleNamespace(returncode=0, stdout="/|18000|minecraft-vm|18000||minecraft")]), \
+             patch.object(tf, "_saved_tunnel_ports", return_value={}), \
+             patch.object(tf, "_container_label_task", return_value="43"), \
+             patch.object(execution_receipt, "knows", return_value=True), \
+             patch.object(tf, "_register_vm"), patch.object(tf, "_supervise_tunnel"), \
+             patch.object(tf, "_start_ready_poll") as poll:
+            tf._restore_vm_watch()
+        poll.assert_called_once_with(43, "owned-container", 18000, "/", process="minecraft")
+
+    def test_minecraft_waits_for_protocol_monitor_and_never_uses_http(self):
+        tf._pb_vm_watch[43] = {}
+        self.addCleanup(tf._pb_vm_watch.pop, 43, None)
+        with patch.object(tf.httpx, "get") as http, \
+             patch.object(tf.subprocess, "run", side_effect=[SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]) as docker, \
+             patch.object(tf.time, "sleep"), patch.object(tf, "_post") as post, \
+             patch.object(tf, "report_log"):
+            tf._await_ready(43, "pb-minecraft-owned", 18000, "/", process="minecraft")
+        self.assertFalse(http.called)
+        self.assertEqual(docker.call_count, 2)
+        self.assertEqual(docker.call_args.args[0], ["docker", "exec", "pb-minecraft-owned", "mc-health"])
+        self.assertEqual(post.call_args.args[1]["status"], "ready")
+
+    def test_minecraft_timeout_never_reports_ready(self):
+        tf._pb_vm_watch[43] = {}
+        self.addCleanup(tf._pb_vm_watch.pop, 43, None)
+        with patch.dict(os.environ, PB_READY_TIMEOUT_S="2"), \
+             patch.object(tf.time, "monotonic", side_effect=[0, 1, 3]), \
+             patch.object(tf.time, "sleep"), patch.object(tf.httpx, "get") as http, \
+             patch.object(tf.subprocess, "run", return_value=SimpleNamespace(returncode=1)), \
+             patch.object(tf, "_post") as post, patch.object(tf, "report_log") as log:
+            tf._await_ready(43, "pb-minecraft-owned", 18000, "/", process="minecraft")
+        self.assertFalse(post.called)
+        self.assertFalse(http.called)
+        self.assertIn("not billed", log.call_args.args[1])
+
     def test_wireguard_readiness_requires_recent_expected_peer_handshake(self):
         import egress_vpn
         from unittest.mock import Mock
