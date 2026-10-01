@@ -3326,12 +3326,59 @@ def _register_vm(task_id, name):
             _pb_thr.Thread(target=_pb_vm_watchdog, name="pb-vm-watchdog", daemon=True).start()
 
 
+# Crypto mining is not allowed in rentals (2026-10-01: a free-credit buyer ran WildRig on a rented
+# RTX 2060 behind an encoded pool on a bare AWS IP, invisible to the gateway's pool-domain denylist).
+# Detect it by WHAT RUNS in the rental: a known miner binary or a stratum pool URL on its command line.
+# ponytail: name/URL match only; a renamed binary with its pool in a config file slips through.
+_MINER_RE = re.compile(
+    r"(?i)(?:^|[/\s])(?:wildrig\S*|t-?rex|lolminer|gminer|nbminer|bzminer|rigel|srbminer\S*|teamredminer"
+    r"|onezerominer|xmrig\S*|nanominer|phoenixminer|ethminer|kawpowminer|ccminer|cpuminer\S*|z-enemy"
+    r"|excavator|nheqminer|miniz|bminer)(?:\s|$)|stratum\d?\+(?:tcp|ssl|tls)://")
+_MINER_CHECK_S = 60
+
+
+def _miner_hit(ps_args):
+    """The first process line (from `docker top <c> -eo args`) that is a crypto miner, else None."""
+    for line in (ps_args or "").splitlines()[1:]:   # skip the ARGS/COMMAND header
+        if _MINER_RE.search(line.strip()):
+            return line.strip()[:200]
+    return None
+
+
+def _rental_miner(tid, name):
+    """Throttled (per rental, once a minute) check of a live rental's processes for a miner."""
+    now = time.time()
+    with _pb_vm_lock:
+        w = _pb_vm_watch.get(tid)
+        if not w or now - w.get("miner_checked", 0) < _MINER_CHECK_S:
+            return None
+        w["miner_checked"] = now
+    try:
+        r = subprocess.run(["docker", "top", name, "-eo", "args"], capture_output=True, text=True, timeout=10)
+    except Exception:                                    # noqa: BLE001 — docker hiccup: next minute
+        return None
+    return _miner_hit(r.stdout) if r.returncode == 0 else None
+
+
 def _pb_vm_scan():
     """One sweep: report any tracked container that has exited (once)."""
     import subprocess as _sp
     with _pb_vm_lock:
         items = [(tid, d["name"], d.get("fail")) for tid, d in _pb_vm_watch.items() if not d["reported"]]
     for tid, name, fail in items:
+        if not fail:
+            hit = _rental_miner(tid, name)
+            if hit:
+                report_log(tid, "stopped: crypto mining is not allowed on Petabyte rentals "
+                                f"(process: {hit})")
+                try:
+                    _sp.run(["docker", "kill", name], capture_output=True, timeout=20)
+                except Exception:                        # noqa: BLE001 — cleanup below removes it
+                    pass
+                fail = "crypto_mining"
+                with _pb_vm_lock:
+                    if tid in _pb_vm_watch:
+                        _pb_vm_watch[tid]["fail"] = fail   # retried sweeps keep the cause
         if fail:                                # the agent gave up on it (e.g. its tunnel is lost)
             status, code = fail, 1
         else:
