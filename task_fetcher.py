@@ -280,6 +280,10 @@ def heartbeat_loop():
             _storage = template_storage.heartbeat_report(globals().get("_TUN_GW", ""))
             if _storage is not None:
                 _hb["template_storage"] = _storage
+            try:
+                _hb["workload"] = _workload_report()     # admin abuse view; None when idle
+            except Exception:                            # noqa: BLE001 — never breaks liveness
+                pass
             if _JOB_NET["ok"] is not None:           # can this host isolate a networked app?
                 _hb["job_network"] = dict(_JOB_NET)
             _hb["gateways"] = _gateway_report()       # per-rental gateway support + RTT to each
@@ -3344,7 +3348,49 @@ def _rental_miner(tid, name):
         r = subprocess.run(["docker", "top", name, "-eo", "args"], capture_output=True, text=True, timeout=10)
     except Exception:                                    # noqa: BLE001 — docker hiccup: next minute
         return None
-    return _miner_hit(r.stdout) if r.returncode == 0 else None
+    if r.returncode != 0:
+        return None
+    with _pb_vm_lock:
+        if tid in _pb_vm_watch:                          # the admin workload view (heartbeat)
+            _pb_vm_watch[tid]["procs"] = _proc_names(r.stdout)
+    return _miner_hit(r.stdout)
+
+
+def _proc_names(ps_args, limit=8):
+    """Program names only (argv[0] basename) — never arguments, which can carry the buyer's secrets."""
+    seen = []
+    for line in (ps_args or "").splitlines()[1:]:
+        parts = line.split()
+        base = os.path.basename(parts[0])[:40] if parts else ""
+        if base and base not in seen:
+            seen.append(base)
+    return seen[:limit]
+
+
+def _gpu_usage():
+    """Per-GPU utilization/power/VRAM/temperature from nvidia-smi, or None (no NVIDIA / no driver)."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,power.draw,memory.used,temperature.gpu",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
+    except Exception:                                    # noqa: BLE001
+        return None
+    gpus = []
+    for line in r.stdout.splitlines() if r.returncode == 0 else []:
+        f = [x.strip() for x in line.split(",")]
+        try:
+            gpus.append({"util": int(float(f[0])), "power_w": round(float(f[1])),
+                         "mem_mb": int(float(f[2])), "temp_c": int(float(f[3]))})
+        except (ValueError, IndexError):
+            continue
+    return gpus or None
+
+
+def _workload_report():
+    """What each live rental is running, for the admin workload view; None when nothing is rented."""
+    with _pb_vm_lock:
+        rentals = [{"task_id": tid, "procs": list(w.get("procs") or [])}
+                   for tid, w in _pb_vm_watch.items() if not w.get("reported") and not w.get("fail")]
+    return {"gpus": _gpu_usage(), "rentals": rentals} if rentals else None
 
 
 def _pb_vm_scan():

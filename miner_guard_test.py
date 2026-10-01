@@ -70,5 +70,18 @@ tf._pb_vm_scan()
 ok("checked at most once a minute per rental (no docker top inside the window)",
    not any(c[:2] == ["docker", "top"] for c in calls) and 8 in tf._pb_vm_watch)
 
+# ---- workload report for the admin abuse view: program names only, never arguments
+ok("process names are argv[0] basenames, unique, without arguments (which can hold secrets)",
+   tf._proc_names(PS + "/tmp/x/wildrig-multi --user WALLET.SECRET\n")
+   == ["tini", "python", "wildrig-multi"])
+tf._pb_vm_watch.clear()
+ok("no workload report while nothing is rented", tf._workload_report() is None)
+tf._pb_vm_watch[9] = {"name": "c9", "reported": False, "procs": ["python", "wildrig-multi"]}
+tf.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(returncode=0, stdout="100, 159.8, 3269, 69\n")
+_wl = tf._workload_report()
+ok("a live rental reports its processes and the GPU's util/power/VRAM/temp",
+   _wl == {"gpus": [{"util": 100, "power_w": 160, "mem_mb": 3269, "temp_c": 69}],
+           "rentals": [{"task_id": 9, "procs": ["python", "wildrig-multi"]}]})
+
 print(f"\n=== miner_guard: {len(FAILS)} failures ===")
 sys.exit(1 if FAILS else 0)
