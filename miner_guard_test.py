@@ -27,6 +27,12 @@ ok("a renamed binary pointing at a stratum pool is caught",
    tf._miner_hit(PS + "./job -o stratum+tcp://pool.example:3333 -u wallet\n"))
 ok("t-rex / lolminer / xmrig are caught",
    all(tf._miner_hit(PS + f"/root/{b} --a\n") for b in ("t-rex", "lolminer", "xmrig")))
+ok("the owner's reference list is enforced (Linux names and .exe under wine)",
+   all(tf._miner_hit(PS + f"/opt/m/{b} -a x\n") for b in (
+       "SRBMiner-MULTI", "cryptodredge", "cpuminer-avx2-sha-vaes", "urx-isotope-cpuminer-avx512",
+       "xmr-stak", "minerd", "TT-Miner", "VerthashMiner", "wildrig.exe", "lolMiner.exe")))
+ok("a bare program called 'miner' alone is not killed (too generic)",
+   tf._miner_hit(PS + "/app/miner --rows 10\n") is None)
 ok("a word that merely contains a miner name is not",
    tf._miner_hit(PS + "python train_rigel.py --excavator-data /data\n") is None)
 

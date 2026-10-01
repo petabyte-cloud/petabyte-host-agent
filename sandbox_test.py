@@ -542,9 +542,13 @@ ok("every buyer container caps /dev/shm (--shm-size) so it can't exhaust host me
    '"--shm-size"' in src("_isolation_flags"))
 ok("every buyer container caps file descriptors and processes (--ulimit nofile/nproc)",
    "nofile=" in src("_isolation_flags") and "nproc=" in src("_isolation_flags"))
-ok("every buyer job has a mandatory writable-layer disk quota (default 20 GiB)",
-   "storage-opt" in src("_isolation_flags")  # unconditional, in the base flags list
-   and "AGENT_JOB_DISK_GB" in inspect.getsource(tf._job_disk_limit))  # operator-overridable
+ok("every buyer job gets the writable-layer disk quota wherever Docker can enforce it",
+   "disk_quota.flags()" in src("_isolation_flags")
+   and "AGENT_JOB_DISK_GB" in inspect.getsource(tf.disk_quota.job_disk_limit))  # operator-overridable
+tf.disk_quota._supported = False                  # ext4/WSL host: the flag would make Docker reject the job
+ok("a host that can't enforce --storage-opt still runs buyer containers (no quota flag)",
+   "--storage-opt" not in tf._isolation_flags({}))
+tf.disk_quota._supported = True
 _iso = tf._isolation_flags({})
 ok("the shm/ulimit caps are ON by default (no task sizing needed)",
    "--shm-size" in _iso and any(f.startswith("nofile=") for f in _iso)

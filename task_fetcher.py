@@ -24,6 +24,7 @@ import time as _t
 import httpx
 import safe_fetch
 import gpu_runtime
+import disk_quota
 import template_storage
 
 import crypto
@@ -816,24 +817,6 @@ def _env_true(name: str) -> bool:
     return os.getenv(name, "false").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _job_disk_limit():
-    """Return the mandatory per-container writable-layer limit in Docker syntax.
-
-    Docker only enforces ``--storage-opt size`` on storage backends that support quotas.
-    Passing it on every buyer container makes unsupported backends reject the launch instead
-    of silently running an unbounded writable layer. Existing installs with a blank setting
-    use the safe default too.
-    """
-    raw = os.getenv("AGENT_JOB_DISK_GB", "").strip() or "20"
-    try:
-        size = int(raw, 10)
-    except (TypeError, ValueError):
-        raise RuntimeError("AGENT_JOB_DISK_GB must be an integer from 1 to 1024") from None
-    if not 1 <= size <= 1024:
-        raise RuntimeError("AGENT_JOB_DISK_GB must be an integer from 1 to 1024")
-    return f"{size}G"
-
-
 def _select_runtime(available_runtimes: str, is_gpu: bool):
     """Choose the OCI runtime for `--runtime`, or None for docker's default (runc).
 
@@ -907,9 +890,9 @@ def _isolation_flags(task):
     """
     import subprocess
     flags = ["--cap-drop", "ALL", "--pids-limit", str(task.get("pids") or 1024),
-             # The Docker daemon rejects this option when its backing store cannot enforce a
-             # per-container quota. Never omit it or fall back to an unlimited writable layer.
-             "--storage-opt", f"size={_job_disk_limit()}",
+             # Writable-layer quota wherever this host's Docker can enforce it (disk_quota.py);
+             # hosts that can't (ext4/WSL) would otherwise reject EVERY buyer container.
+             *disk_quota.flags(),
              # Bound host-side stdout/stderr storage independently of the container layer.
              "--log-driver", "local", "--log-opt", "max-size=10m",
              "--log-opt", "max-file=3"]
@@ -3330,10 +3313,14 @@ def _register_vm(task_id, name):
 # RTX 2060 behind an encoded pool on a bare AWS IP, invisible to the gateway's pool-domain denylist).
 # Detect it by WHAT RUNS in the rental: a known miner binary or a stratum pool URL on its command line.
 # ponytail: name/URL match only; a renamed binary with its pool in a config file slips through.
+# Names: the owner's mining-reference-lists (2026-10-01, 50 Windows executables -> Linux names, .exe
+# optional) plus earlier ones. Bare "miner" (GMiner's miner.exe) is left out on purpose: too generic
+# to kill a rental over; such a miner still trips the stratum-URL check.
 _MINER_RE = re.compile(
-    r"(?i)(?:^|[/\s])(?:wildrig\S*|t-?rex|lolminer|gminer|nbminer|bzminer|rigel|srbminer\S*|teamredminer"
-    r"|onezerominer|xmrig\S*|nanominer|phoenixminer|ethminer|kawpowminer|ccminer|cpuminer\S*|z-enemy"
-    r"|excavator|nheqminer|miniz|bminer)(?:\s|$)|stratum\d?\+(?:tcp|ssl|tls)://")
+    r"(?i)(?:^|[/\s])(?:wildrig\S*|xmrig\S*|srbminer\S*|t-?rex|teamredminer|lolminer|nbminer|bzminer|rigel"
+    r"|nanominer|phoenixminer|cryptodredge|bminer|tt-?miner|tbminer|ccminer|sgminer|ethminer|minerd"
+    r"|cpuminer\S*|urx-isotope-cpuminer\S*|cgminer|bfgminer|excavator|xmr-stak\S*|miniz|verthashminer"
+    r"|gminer|onezerominer|kawpowminer|z-enemy|nheqminer)(?:\.exe)?(?:\s|$)|stratum\d?\+(?:tcp|ssl|tls)://")
 _MINER_CHECK_S = 60
 
 
