@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -242,6 +243,25 @@ def _ensure_seal_keypair():
             logging.warning(f"sealed-workload keypair unavailable: {e}")
 
 
+def _note_egress_gateway(cfg):
+    """The API moved this node's buyer egress to another gateway (the one in its own country):
+    re-point wg-egress at it. The API only moves a node with no live rental, so no buyer
+    connection is cut."""
+    if not isinstance(cfg, dict):
+        return
+    pub, endpoint = cfg.get("PB_EGRESS_GATEWAY_PUBKEY"), cfg.get("PB_EGRESS_GATEWAY_ENDPOINT")
+    if not (isinstance(pub, str) and isinstance(endpoint, str)):
+        return
+    if (pub, endpoint) == (os.getenv("PB_EGRESS_GATEWAY_PUBKEY"), os.getenv("PB_EGRESS_GATEWAY_ENDPOINT")):
+        return
+    try:
+        import egress_vpn
+        if egress_vpn.switch_gateway(pub, endpoint):
+            logging.warning(f"buyer egress moved to gateway {cfg.get('id')} ({endpoint})")
+    except Exception as e:                              # noqa: BLE001 - keep the old peer
+        logging.warning(f"egress gateway switch failed: {e}")
+
+
 def heartbeat_loop():
     global _SEAL_AES
     while True:
@@ -261,6 +281,7 @@ def heartbeat_loop():
                 _hb["template_storage"] = _storage
             if _JOB_NET["ok"] is not None:           # can this host isolate a networked app?
                 _hb["job_network"] = dict(_JOB_NET)
+            _hb["gateways"] = _gateway_report()       # per-rental gateway support + RTT to each
             _bundle = _agent_bundle()
             if _bundle:                               # which signed agent bundle this node runs
                 _hb["agent_bundle"] = _bundle
@@ -291,6 +312,8 @@ def heartbeat_loop():
                     idle_mining.controller.revoke()
                 # Owner may have changed the selling window in the dashboard — adopt it live.
                 template_storage.set_catalog(_body.get("template_image_catalog"))
+                _note_gateways(_body.get("gateways"))
+                _note_egress_gateway(_body.get("egress_gateway"))
                 _note_agent_update(_body)       # server-requested signed self-update (job_loop)
                 _sc = _body.get("sell_schedule")
                 if _sc is not None:
@@ -526,7 +549,8 @@ def _post(path, payload):
 
 
 def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_generation=None,
-                        game_udp_host_port=None, service_bridge=False, service_udp_port=None) -> bool:
+                        game_udp_host_port=None, service_bridge=False, service_udp_port=None,
+                        gateway_id=None) -> bool:
     """P1-7: report node:port to the control plane so a template VM flips starting->running and
     the gateway can route buyers to it. ip_address is optional — the server falls back to the
     public source IP of this request. Retries a few times: right after /launch the VMRoute may not
@@ -545,6 +569,7 @@ def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_g
         if rental.get("vm_id") == vm_id:
             import execution_receipt
             body["lease_generation"] = execution_receipt.generation(tid)
+            gateway_id = gateway_id or rental.get("gw_id")
             if tid in _port_bridges:
                 body["service_bridge"] = True
                 if _port_bridges[tid]["bridge"].udp_port:
@@ -552,6 +577,7 @@ def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_g
             break
     if ip_address:
         body["ip_address"] = ip_address
+    body["gateway_id"] = gateway_id or _DEFAULT_GW_ID      # which gateway's loopback holds the port
     if game_udp_host_port is not None:
         body["game_udp_host_port"] = int(game_udp_host_port)
     delay = 2
@@ -1601,6 +1627,73 @@ _TUN_GW = os.getenv("PB_TUNNEL_GATEWAY", "").strip()          # e.g. pbtun@137.1
 _TUN_KEY = os.getenv("PB_TUNNEL_KEY", "/etc/petabyte/tunnel_key")
 _TUN_PORTS = os.getenv("PB_TUNNEL_PORTS", "20000-20050")
 _tunnels = {}                                                 # task_id -> (remoteport, Popen)
+# Multi-gateway: every live gateway, {id: "user@host"} (from /node/tunnel and each heartbeat). A
+# rental names the gateway its address resolves to (payload tunnel_gateway); its ssh -R must land on
+# THAT box, because the route the API stores is 127.0.0.1:<port> on it. "us" = _TUN_GW (default).
+_DEFAULT_GW_ID = "us"
+_TUN_GWS = {}
+_GW_TARGET_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}@[A-Za-z0-9.:\[\]-]{1,253}$")
+_GW_ID_RE = re.compile(r"^[a-z]{2,8}$")
+
+
+def _note_gateways(rows):
+    """Adopt the API's gateway list ({id, target}); malformed entries are ignored."""
+    if not isinstance(rows, list):
+        return
+    seen = {}
+    for g in rows[:16]:
+        if (isinstance(g, dict) and isinstance(g.get("id"), str) and _GW_ID_RE.match(g["id"])
+                and isinstance(g.get("target"), str) and _GW_TARGET_RE.match(g["target"])):
+            seen[g["id"]] = g["target"]
+    if seen:
+        _TUN_GWS.clear()
+        _TUN_GWS.update(seen)
+
+
+def _rental_gateway(task):
+    """(gateway id, ssh target) this rental's tunnel must reach. The default gateway is always our
+    own enrolled/hand-configured _TUN_GW; another one is the target the API named for it."""
+    g = task.get("tunnel_gateway") if isinstance(task, dict) else None
+    if isinstance(g, dict) and g.get("id") and g.get("id") != _DEFAULT_GW_ID:
+        gid, target = str(g.get("id")), str(g.get("target") or "") or _TUN_GWS.get(str(g.get("id")), "")
+        if _GW_ID_RE.match(gid) and _GW_TARGET_RE.match(target):
+            return gid, target
+        return gid, ""                                    # unknown/unusable: fails, never mis-routes
+    return _DEFAULT_GW_ID, None
+
+
+def _gateway_tcp_ms():
+    """TCP connect time from this node to each gateway's sshd, {id: ms} (the tunnel's own path)."""
+    out = {}
+    targets = dict(_TUN_GWS)
+    if _TUN_GW:
+        targets.setdefault(_DEFAULT_GW_ID, _TUN_GW)
+    for gid, target in list(targets.items())[:8]:
+        host = target.rsplit("@", 1)[-1].strip("[]")
+        try:
+            start = time.monotonic()
+            with socket.create_connection((host, 22), timeout=2):
+                out[gid] = round((time.monotonic() - start) * 1000, 1)
+        except OSError:
+            pass
+    return out
+
+
+_GW_PROBE = {"at": 0.0, "value": {}, "thread": None}
+
+
+def _gateway_report():
+    """The heartbeat's `gateways` field: proves per-rental gateway support; RTTs refresh in the
+    background every ~5 min so a slow probe never delays liveness."""
+    now = time.monotonic()
+    t = _GW_PROBE["thread"]
+    if now - _GW_PROBE["at"] > 300 and (t is None or not t.is_alive()):
+        def run():
+            _GW_PROBE["value"] = _gateway_tcp_ms()
+            _GW_PROBE["at"] = time.monotonic()
+        _GW_PROBE["thread"] = threading.Thread(target=run, daemon=True, name="pb-gw-probe")
+        _GW_PROBE["thread"].start()
+    return {"version": 1, "tcp_ms": dict(_GW_PROBE["value"])}
 _port_bridges = {}
 _PORT_BRIDGES_FILE = "/var/lib/petabyte-agent/port_bridges.json"
 _PORT_BRIDGES_LOCK = threading.RLock()
@@ -1781,7 +1874,7 @@ def _drain_ssh_stderr(p, up, last):
         pass
 
 
-def _open_reverse_tunnel(host_port, tid, prefer=None):
+def _open_reverse_tunnel(host_port, tid, prefer=None, gateway=None):
     """Dial OUT to the gateway, binding a gateway-loopback remoteport -> our 127.0.0.1:host_port.
     Returns the remoteport (int) or None. The ssh process is tracked so teardown can kill it.
     `prefer` (the rental's previous port) is tried first; ports other supervised rentals hold are
@@ -1799,6 +1892,10 @@ def _open_reverse_tunnel(host_port, tid, prefer=None):
         report_log(tid, f"reverse tunnel key {_TUN_KEY} is missing: this node cannot publish a "
                         "serving rental until the operator installs it")
         return None
+    target = _TUN_GW if gateway is None else gateway     # "" = a gateway we cannot name: refuse
+    if not target:
+        report_log(tid, "reverse tunnel: this rental's gateway is unknown to this node; not opening it")
+        return None
     held = {s.get("rp") for t, s in list(_tun_rentals.items()) if t != tid}
     ports = [x for x in _tun_port_range() if x not in held]
     if prefer in ports:
@@ -1810,7 +1907,7 @@ def _open_reverse_tunnel(host_port, tid, prefer=None):
                "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={_TUN_KNOWN_HOSTS}",
                "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=10",
                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "BatchMode=yes",
-               "-R", f"127.0.0.1:{rp}:127.0.0.1:{host_port}", _TUN_GW]
+               "-R", f"127.0.0.1:{rp}:127.0.0.1:{host_port}", target]
         p = _popen(cmd, capture_stderr=True)
         up, err = threading.Event(), [""]
         drain = threading.Thread(target=_drain_ssh_stderr, args=(p, up, err), daemon=True,
@@ -1824,7 +1921,8 @@ def _open_reverse_tunnel(host_port, tid, prefer=None):
             up.wait(0.5)
         if p.poll() is None:                                  # bound (or survived the wait)
             _tunnels[tid] = (rp, p)
-            report_log(tid, f"reverse tunnel up: gateway 127.0.0.1:{rp} -> vm (node opens no inbound port)")
+            report_log(tid, f"reverse tunnel up: gateway {target.rsplit('@', 1)[-1]} 127.0.0.1:{rp} -> vm "
+                            "(node opens no inbound port)")
             return rp
         drain.join(timeout=5)
         last = err[0]
@@ -1885,6 +1983,7 @@ def _ensure_tunnel_async():
                                json={"spec_id": int(SPEC_ID), "public_key": pub})
                 if r.status_code == 200:
                     gw, ports = r.json()["gateway"], r.json()["ports"]
+                    _note_gateways(r.json().get("gateways"))
                     if _tunnel_key_accepted(gw, int(ports.split("-")[0])):
                         _TUN_KEY, _TUN_PORTS = _TUN_STATE_KEY, ports
                         _TUN_GW = gw                          # set LAST: it is what enables serving
@@ -1965,11 +2064,13 @@ def _saved_tunnel_ports():
         return {}
 
 
-def _supervise_tunnel(tid, name, host_port, vm_id, rp=None, registered=False):
-    """Keep an interactive rental's reverse tunnel alive (see _check_tunnels). Idempotent."""
+def _supervise_tunnel(tid, name, host_port, vm_id, rp=None, registered=False, gw=(None, None)):
+    """Keep an interactive rental's reverse tunnel alive (see _check_tunnels). Idempotent.
+    `gw` is the rental's (gateway id, ssh target); (None, None) = the default gateway."""
     if tid in _tun_rentals:
         return
     _tun_rentals[tid] = {"name": name, "host_port": int(host_port), "vm_id": vm_id, "rp": rp,
+                         "gw_id": gw[0] or _DEFAULT_GW_ID, "gw_target": gw[1],
                          "reg": rp if registered else None, "down_since": None,
                          "next_try": 0.0, "delay": _TUN_RETRY_MIN_S}
     _save_tunnel_ports()
@@ -2020,7 +2121,7 @@ def _check_tunnels(now=None):
         if now < s["next_try"] or not _reverse_tunnel_enabled():
             continue                                          # backing off / not enrolled yet
         if not alive:
-            rp = _open_reverse_tunnel(s["host_port"], tid, prefer=s["rp"])
+            rp = _open_reverse_tunnel(s["host_port"], tid, prefer=s["rp"], gateway=s.get("gw_target"))
             if tid not in _tun_rentals:                       # torn down while we were dialing
                 _kill_reverse_tunnel(tid)
                 continue
@@ -2028,7 +2129,8 @@ def _check_tunnels(now=None):
                 s["rp"] = rp
                 _save_tunnel_ports()
             alive = bool(rp)
-        if alive and (not s["vm_id"] or _register_vm_tunnel(s["vm_id"], s["rp"], ip_address="127.0.0.1")):
+        if alive and (not s["vm_id"] or _register_vm_tunnel(s["vm_id"], s["rp"], ip_address="127.0.0.1",
+                                                            gateway_id=s.get("gw_id"))):
             s.update(reg=s["rp"], down_since=None, delay=_TUN_RETRY_MIN_S)
             report_log(tid, f"reverse tunnel restored: gateway 127.0.0.1:{s['rp']} (re-registered)")
             continue
@@ -2206,6 +2308,9 @@ def _run_template(task):
     cmd += _interactive_labels(task)           # only an interactive rental is a reap candidate
     if task.get("vm_id") and host_port:        # lets a restarted agent re-open + re-register its tunnel
         cmd += ["--label", f"pb.vm_id={task['vm_id']}", "--label", f"pb.host_port={host_port}"]
+        _lgw = _rental_gateway(task)
+        if _lgw[0] != _DEFAULT_GW_ID:            # ...to the SAME gateway its address resolves to
+            cmd += ["--label", f"pb.gateway={_lgw[0]}", "--label", f"pb.gateway_target={_lgw[1]}"]
     # Petabyte Spaces (persistent): restart the app in place on a crash/OOM — same container, same
     # host port, so the reverse tunnel stays valid. The watchdog already treats Docker's "restarting"
     # state as alive, so this needs no watchdog change; after 5 straight failures the container ends
@@ -2340,8 +2445,9 @@ def _run_template(task):
         report_progress(tid, 100, "running")
         _hp = host_port or port
         _node_ip = None
+        _gw = _rental_gateway(task)
         if _rev:
-            _rp = _open_reverse_tunnel(host_port, tid)
+            _rp = _open_reverse_tunnel(host_port, tid, gateway=_gw[1])
             if not _rp:
                 # Reverse tunnel is REQUIRED here — fail the rental rather than fall back to a
                 # public bind that would leak the seller's IP / port.
@@ -2366,14 +2472,15 @@ def _run_template(task):
                 vm_id, _hp, ip_address=(_node_ip if task.get("template") != "palworld" else None),
                 lease_generation=task.get("lease_generation", 0),
                 game_udp_host_port=game_udp_host_port, service_bridge=bool(_service_bridge),
-                service_udp_port=_service_bridge.udp_port if _service_bridge else None)
+                service_udp_port=_service_bridge.udp_port if _service_bridge else None,
+                gateway_id=_gw[0])
             if _registered:
                 report_log(tid, f"tunnel registered: vm {vm_id} -> {_node_ip or 'node'}:{_hp}")
             else:
                 report_log(tid, f"tunnel registration failed for vm {vm_id}; VM may stay 'starting'"
                                 + (" (retrying in the background)" if _rev else ""))
             if _rev:                                   # watch the ssh -R; re-open it if it drops
-                _supervise_tunnel(tid, name, host_port, vm_id, rp=_hp, registered=_registered)
+                _supervise_tunnel(tid, name, host_port, vm_id, rp=_hp, registered=_registered, gw=_gw)
         _set_ui(status="idle", task=None, ok=True)
     except Exception as e:                              # noqa: BLE001
         _why = _launch_failure_reason(e)
@@ -3302,9 +3409,11 @@ def _restore_vm_watch():
                 _register_vm(int(task_id), container)
                 hl = subprocess.run(["docker", "inspect", "-f",
                                      "|".join('{{index .Config.Labels "%s"}}' % k for k in
-                                              ("pb.health", "pb.health_port", "pb.vm_id", "pb.host_port", "pb.service_bridge", "pb.health_process")),
+                                              ("pb.health", "pb.health_port", "pb.vm_id", "pb.host_port", "pb.service_bridge", "pb.health_process",
+                                               "pb.gateway", "pb.gateway_target")),
                                      container], capture_output=True, text=True, timeout=10, check=False)
-                path, hp, vm_id, tun_hp, bridge_flag, health_process = ((hl.stdout or "").strip().split("|") + [""] * 6)[:6]
+                (path, hp, vm_id, tun_hp, bridge_flag, health_process, gw_id,
+                 gw_target) = ((hl.stdout or "").strip().split("|") + [""] * 8)[:8]
                 if bridge_flag == "1":
                     restored = _restore_port_bridge(int(task_id), container)
                     if restored is None:
@@ -3328,7 +3437,9 @@ def _restore_vm_watch():
                                           process=health_process or None)
                 if tun_hp.isdigit() and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", vm_id):
                     _supervise_tunnel(int(task_id), container, int(tun_hp), vm_id,
-                                      rp=saved.get(int(task_id)))
+                                      rp=saved.get(int(task_id)),
+                                      gw=(_rental_gateway({"tunnel_gateway": {"id": gw_id, "target": gw_target}})
+                                          if gw_id else (None, None)))
                 else:
                     logging.warning(f"rental {task_id}: no pb.vm_id/pb.host_port label (started by "
                                     "an older agent); its reverse tunnel cannot be restored")
@@ -3512,6 +3623,11 @@ def run_agent():
     # Telemetry first — degrade-safe: if the collector is unreachable the agent still runs.
     _tel.init(agent_id=SPEC_ID, seller_id=os.getenv("PROVIDER"))
     _tel.event(_tel.EVENTS.STARTUP, message="agent started", api_url=API_URL, spec_id=SPEC_ID)
+    try:                                   # the egress gateway the API last moved this node to
+        import egress_vpn
+        egress_vpn.load_gateway_override()
+    except Exception as e:                 # noqa: BLE001 - egress stays on agent.env's gateway
+        logging.warning(f"egress gateway override not applied: {e}")
     if _con:
         _con.banner(API_URL, SPEC_ID, os.getenv("PROVIDER"))
     else:

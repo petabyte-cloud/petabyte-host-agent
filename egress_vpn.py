@@ -268,3 +268,58 @@ def unroute_for_tid(tid) -> None:
             os.remove(p)
     except Exception:                                        # noqa: BLE001
         pass
+
+
+# ---- multi-gateway: which gateway buyer egress exits through ------------------------------------
+# The API moves a node's egress to the gateway in its own country (lumaris_api/gateways.py
+# egress_home) via the heartbeat reply. /etc is read-only to the agent unit, so the choice is kept
+# in its StateDirectory and re-applied at start-up, before the first job network is built.
+GATEWAY_OVERRIDE = os.getenv("PB_EGRESS_GATEWAY_STATE", "/var/lib/petabyte-agent/egress_gateway.json")
+_WG_KEY_RE = r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$"
+_ENDPOINT_RE = r"^[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$"
+
+
+def _valid_gateway(pubkey, endpoint) -> bool:
+    import re
+    return (isinstance(pubkey, str) and isinstance(endpoint, str)
+            and re.match(_WG_KEY_RE, pubkey) is not None and re.match(_ENDPOINT_RE, endpoint) is not None
+            and 0 < int(endpoint.rsplit(":", 1)[1]) < 65536)
+
+
+def load_gateway_override() -> None:
+    """Apply a previously chosen egress gateway to this process's env (no-op without one)."""
+    import json
+    try:
+        with open(GATEWAY_OVERRIDE) as f:
+            v = json.load(f)
+    except (OSError, ValueError):
+        return
+    if isinstance(v, dict) and _valid_gateway(v.get("pubkey"), v.get("endpoint")) and os.getenv("PB_EGRESS_ADDR"):
+        os.environ["PB_EGRESS_GATEWAY_PUBKEY"] = v["pubkey"]
+        os.environ["PB_EGRESS_GATEWAY_ENDPOINT"] = v["endpoint"]
+
+
+def switch_gateway(pubkey: str, endpoint: str) -> bool:
+    """Re-point wg-egress at another gateway, keeping the interface (and so every bridge's policy
+    route and fail-closed rule) in place: swap the one peer. Returns True when switched."""
+    import json
+    if not _valid_gateway(pubkey, endpoint) or not os.getenv("PB_EGRESS_ADDR"):
+        return False
+    old = os.getenv("PB_EGRESS_GATEWAY_PUBKEY")
+    os.environ["PB_EGRESS_GATEWAY_PUBKEY"] = pubkey
+    os.environ["PB_EGRESS_GATEWAY_ENDPOINT"] = endpoint
+    try:
+        os.makedirs(os.path.dirname(GATEWAY_OVERRIDE), exist_ok=True)
+        tmp = GATEWAY_OVERRIDE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"pubkey": pubkey, "endpoint": endpoint}, f)
+        os.replace(tmp, GATEWAY_OVERRIDE)
+    except OSError:
+        pass                                   # still switched for this run; re-sent each heartbeat
+    if _iface_up() and shutil.which("wg"):
+        if old and old != pubkey:
+            _run(["wg", "set", IFACE, "peer", old, "remove"], check=False)
+        _run(["wg", "set", IFACE, "peer", pubkey, "endpoint", endpoint, "allowed-ips", "0.0.0.0/0",
+              "persistent-keepalive", "25"])
+    ensure_tunnel()                            # rewrite the conf (and bring it up if it was down)
+    return True

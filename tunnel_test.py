@@ -216,7 +216,7 @@ ok("a str task id (orphan reap) still kills the int-keyed tunnel", _k.killed and
 tf._tunnels.clear()
 tf._tun_rentals.clear()
 _reg = []
-tf._register_vm_tunnel = lambda vm_id, port, ip_address=None, attempts=5: (
+tf._register_vm_tunnel = lambda vm_id, port, ip_address=None, attempts=5, gateway_id=None: (
     _reg.append((vm_id, port, ip_address)), True)[1]
 with tf._pb_vm_lock:
     tf._pb_vm_watch[5] = {"name": "c5", "reported": False}
