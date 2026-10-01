@@ -1,7 +1,8 @@
 """Seller-controlled image admission and an ownership ledger. Never prune shared Docker.
 
-Limits are admission checks, not filesystem quotas: Docker and other applications can
-write concurrently. Model/work volumes remain private to each rental.
+The agent separately applies Docker writable-layer quotas. Image budgets and named-volume checks
+here are admission/runtime guards, not filesystem quotas: Docker and other applications can write
+concurrently. Model/work volumes remain private to each rental.
 """
 import contextlib
 import hashlib

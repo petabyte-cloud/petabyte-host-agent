@@ -28,6 +28,17 @@ CELL_TIMEOUT = int(os.getenv("NB_CELL_TIMEOUT", "120"))     # per-cell (s)
 MAX_OUTPUT_BYTES = int(os.getenv("NB_MAX_OUTPUT", str(8 * 1024 * 1024)))  # 8 MB
 
 
+def _job_disk_limit():
+    raw = os.getenv("AGENT_JOB_DISK_GB", "").strip() or "20"
+    try:
+        size = int(raw, 10)
+    except (TypeError, ValueError):
+        raise RuntimeError("AGENT_JOB_DISK_GB must be an integer from 1 to 1024") from None
+    if not 1 <= size <= 1024:
+        raise RuntimeError("AGENT_JOB_DISK_GB must be an integer from 1 to 1024")
+    return f"{size}G"
+
+
 def timed(func):
     def wrapper(*args, **kwargs):
         start = time.time()
@@ -102,6 +113,9 @@ def run_notebook_code(code: Union[str, List[str], dict], cpu: int = 1, ram: int 
             "--security-opt", "no-new-privileges",
             "--read-only",                              # immutable rootfs
             "--tmpfs", "/tmp:size=256m",
+            "--storage-opt", f"size={_job_disk_limit()}",
+            "--log-driver", "local", "--log-opt", "max-size=10m",
+            "--log-opt", "max-file=3",
             "--pids-limit", "256",
             "--cpus", str(max(1, cpu)),
             "--memory", f"{max(1, ram)}g",

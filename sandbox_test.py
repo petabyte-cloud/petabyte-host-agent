@@ -542,14 +542,15 @@ ok("every buyer container caps /dev/shm (--shm-size) so it can't exhaust host me
    '"--shm-size"' in src("_isolation_flags"))
 ok("every buyer container caps file descriptors and processes (--ulimit nofile/nproc)",
    "nofile=" in src("_isolation_flags") and "nproc=" in src("_isolation_flags"))
-ok("an operator can bound the job's disk (AGENT_JOB_DISK_GB -> --storage-opt size=)",
-   "AGENT_JOB_DISK_GB" in src("_isolation_flags") and "storage-opt" in src("_isolation_flags"))
+ok("every buyer job has a mandatory writable-layer disk quota (default 20 GiB)",
+   "storage-opt" in src("_isolation_flags")  # unconditional, in the base flags list
+   and "AGENT_JOB_DISK_GB" in inspect.getsource(tf._job_disk_limit))  # operator-overridable
 _iso = tf._isolation_flags({})
 ok("the shm/ulimit caps are ON by default (no task sizing needed)",
    "--shm-size" in _iso and any(f.startswith("nofile=") for f in _iso)
    and any(f.startswith("nproc=") for f in _iso))
-ok("disk quota is OPT-IN (not added unless AGENT_JOB_DISK_GB is set — errors on ext4 otherwise)",
-   "--storage-opt" not in _iso)
+ok("disk quota defaults to 20 GiB when no operator value is set",
+   "--storage-opt" in _iso and "size=20G" in _iso)
 
 # ---------------------------------------------------------------- cross-tenant VRAM residue (P-2)
 ok("a GPU job wipes free VRAM BEFORE it runs (prev tenant's data can't be read)",

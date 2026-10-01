@@ -416,6 +416,10 @@ if [ "${KATA_OK:-0}" = "1" ]; then
   grep -q '^AGENT_RUNTIME=' "$ENVF" 2>/dev/null || echo 'AGENT_RUNTIME=kata' >> "$ENVF"
 fi
 
+# Buyer container writable layers always get a Docker storage quota. Blank settings in old
+# agent.env files are treated as 20 GiB by task_fetcher.py, so upgrading never opts a node out.
+grep -q '^AGENT_JOB_DISK_GB=' "$ENVF" 2>/dev/null || echo 'AGENT_JOB_DISK_GB=20' >> "$ENVF"
+
 # Idle mining. Default ON, seeding the payout address the server baked in (__PB_DOGE_ADD__ =
 # MINING_DOGE_ADDRESS). A DISTRIBUTION build (e.g. the agent bundled inside another installer)
 # forces it OFF by exporting PETABYTE_IDLE_MINING=false before running this script: the node then

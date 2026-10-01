@@ -790,6 +790,24 @@ def _env_true(name: str) -> bool:
     return os.getenv(name, "false").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _job_disk_limit():
+    """Return the mandatory per-container writable-layer limit in Docker syntax.
+
+    Docker only enforces ``--storage-opt size`` on storage backends that support quotas.
+    Passing it on every buyer container makes unsupported backends reject the launch instead
+    of silently running an unbounded writable layer. Existing installs with a blank setting
+    use the safe default too.
+    """
+    raw = os.getenv("AGENT_JOB_DISK_GB", "").strip() or "20"
+    try:
+        size = int(raw, 10)
+    except (TypeError, ValueError):
+        raise RuntimeError("AGENT_JOB_DISK_GB must be an integer from 1 to 1024") from None
+    if not 1 <= size <= 1024:
+        raise RuntimeError("AGENT_JOB_DISK_GB must be an integer from 1 to 1024")
+    return f"{size}G"
+
+
 def _select_runtime(available_runtimes: str, is_gpu: bool):
     """Choose the OCI runtime for `--runtime`, or None for docker's default (runc).
 
@@ -862,7 +880,13 @@ def _isolation_flags(task):
     mix; the default profile is byte-for-byte the pre-existing hardening.
     """
     import subprocess
-    flags = ["--cap-drop", "ALL", "--pids-limit", str(task.get("pids") or 1024)]
+    flags = ["--cap-drop", "ALL", "--pids-limit", str(task.get("pids") or 1024),
+             # The Docker daemon rejects this option when its backing store cannot enforce a
+             # per-container quota. Never omit it or fall back to an unlimited writable layer.
+             "--storage-opt", f"size={_job_disk_limit()}",
+             # Bound host-side stdout/stderr storage independently of the container layer.
+             "--log-driver", "local", "--log-opt", "max-size=10m",
+             "--log-opt", "max-file=3"]
     # The pinned Webtop image already grants its abc desktop user passwordless sudo.
     # NNP blocks the setuid transition, producing a broken terminal. Permit that
     # transition ONLY for the server-declared Fedora KDE template task. Root remains
@@ -907,14 +931,6 @@ def _isolation_flags(task):
     flags += ["--shm-size", str(task.get("shm_size") or "64m"),
               "--ulimit", f"nofile={int(task.get('nofile') or 4096)}",
               "--ulimit", f"nproc={int(task.get('nproc') or 2048)}"]
-    # Writable-layer disk quota (opt-in): the container's writable layer and the per-task volume
-    # are otherwise unbounded, so a buyer can fill the seller's disk and take the host + every
-    # co-tenant down. --storage-opt size=NNg needs an overlay2+pquota (xfs/btrfs) backing store, so
-    # it errors on ext4 and is applied ONLY when the operator sets AGENT_JOB_DISK_GB (they know
-    # their storage driver supports it). A bounded scratch is always provided via the read_only tmpfs.
-    _disk_gb = os.getenv("AGENT_JOB_DISK_GB")
-    if _disk_gb and str(_disk_gb).strip().isdigit():
-        flags += ["--storage-opt", f"size={int(_disk_gb)}G"]
     if task.get("read_only"):
         # Immutable rootfs + a writable scratch. The tmpfs counts against the RAM cap, so keep it
         # modest; HOME=/tmp routes user/CUDA/pip caches onto it instead of the read-only rootfs.
