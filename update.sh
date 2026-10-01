@@ -15,6 +15,8 @@ SUBDIR="${PETABYTE_AGENT_SUBDIR:-lumaris_agent}"
 APP=/opt/petabyte-agent
 SERVICE=petabyte-agent
 PUBKEY="${PETABYTE_RELEASE_PUBKEY:-/etc/petabyte/release_ed25519.pub}"
+STATE="${PETABYTE_AGENT_STATE:-/var/lib/petabyte-agent}"
+ENVF="${PETABYTE_AGENT_ENV:-/etc/petabyte/agent.env}"
 
 command -v rsync >/dev/null || { echo "rsync missing"; exit 0; }
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -33,9 +35,16 @@ verify_bundle() {  # verify_bundle <bundle> <sigfile> — 0 ok, 1 fail/unavailab
 # push root-run code to the whole fleet — exactly the threat the pinned signing key defends against.
 # If the signed bundle is unavailable or the signature does not verify, we skip/refuse the update.
 # The API URL was written to the agent env file at provision time.
-API_URL="$(grep -E '^PETABYTE_API_URL=' /etc/petabyte/agent.env 2>/dev/null | cut -d= -f2-)"
+API_URL="$(grep -E '^PETABYTE_API_URL=' "$ENVF" 2>/dev/null | cut -d= -f2-)"
 if [ -z "$API_URL" ]; then
-  echo "no PETABYTE_API_URL in /etc/petabyte/agent.env — cannot fetch a signed bundle; skipping update"
+  echo "no PETABYTE_API_URL in $ENVF — cannot fetch a signed bundle; skipping update"
+  exit 0
+fi
+# Cheap no-op tick: this runs every 6 h on every node, so fetch only the 64-byte signature first. If it
+# is the one we last verified and applied, the bundle has not changed: skip the full download. Nothing
+# is applied on this path, so it cannot weaken the signed-update guarantee.
+if curl -fsSL "$API_URL/agent.tar.gz.sig" -o "$TMP/current.sig" 2>/dev/null    && [ -s "$TMP/current.sig" ] && [ -s "$STATE/bundle.sha256" ] && cmp -s "$TMP/current.sig" "$STATE/bundle.sig"; then
+  echo "already up to date (signature unchanged)"
   exit 0
 fi
 if ! curl -fsSL "$API_URL/agent.tar.gz" -o "$TMP/agent.tar.gz" 2>/dev/null \
@@ -67,7 +76,8 @@ fi
 # The tree now matches this verified bundle (both branches): record which one, so the agent reports
 # it on its heartbeat and ops can see whether auto-update landed (/admin/nodes/agent-bundles).
 BUNDLE_SHA="$(sha256sum "$TMP/agent.tar.gz" | cut -d' ' -f1)"
-mkdir -p /var/lib/petabyte-agent && echo "$BUNDLE_SHA" > /var/lib/petabyte-agent/bundle.sha256
+mkdir -p "$STATE" && echo "$BUNDLE_SHA" > "$STATE/bundle.sha256"
+cp "$TMP/agent.tar.gz.sig" "$STATE/bundle.sig"     # lets the next tick skip the download when unchanged
 
 # Keep this host able to isolate buyers' apps, with no seller action: the SAME check+repair install.sh
 # runs (isolation.py), as root, at most once per signed bundle. It applies only repairs known to be

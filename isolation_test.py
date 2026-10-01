@@ -241,7 +241,7 @@ ok("update.sh runs the repair once per signed bundle, on BOTH the updated and up
    'isolation.py" repair --auto "$BUNDLE_SHA"' in up
    and up.index('isolation.py" repair --auto') > up.index('echo "already up to date"'))
 ok("update.sh records the verified bundle it applied (the agent reports it), after the signature check",
-   up.index("SECURITY: agent bundle signature did not verify") < up.index("> /var/lib/petabyte-agent/bundle.sha256")
+   up.index("SECURITY: agent bundle signature did not verify") < up.index('> "$STATE/bundle.sha256"')
    < up.index('isolation.py" repair --auto'))
 ok("install.sh records the bundle it installed, and forgets it for a git/local install",
    "rm -f /var/lib/petabyte-agent/bundle.sha256" in sh
