@@ -33,6 +33,7 @@ class Recovery(unittest.TestCase):
         self.key = Fernet.generate_key().decode()
         self.upload = None
         self.checkpoints = []
+        getattr(tf, "_BACKUP_NOTICES", {}).clear()
 
     def response(self, value, code=200):
         return httpx.Response(code, json=value, request=httpx.Request("POST", "http://localhost"))
@@ -73,6 +74,67 @@ class Recovery(unittest.TestCase):
              patch.object(tf, "report_log"):
             tf._backup_once(self.task, "blender-data")
         self.assertEqual(self.checkpoints, [])
+
+    def backup(self, put=None):
+        with patch.object(ws, "directory", return_value=str(self.source)), \
+             patch.object(tf.httpx, "post", side_effect=self.post), \
+             patch.object(tf.httpx, "put", side_effect=put or self.put), \
+             patch.object(tf, "_lease_payload", side_effect=lambda p: p), \
+             patch.object(tf.crypto, "sign_proof", return_value="signature"), \
+             patch.object(tf, "report_log") as log:
+            tf._backup_once(self.task, "jupyter-data")
+        return [c.args[1] for c in log.call_args_list]
+
+    def test_venv_and_model_no_longer_silently_stop_notebook_backups(self):
+        # Task 673: pip-installed torch + a downloaded model in the Jupyter work dir pushed the
+        # archive past 128 MiB; every later backup raised and was only logged on the host.
+        def sparse(rel, size):
+            path = self.source / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as f:
+                f.truncate(size)
+        sparse("venv/lib/python3.11/site-packages/torch/libtorch_cuda.so", 40 * 1024 ** 2)
+        sparse(".cache/huggingface/hub/model.safetensors", 40 * 1024 ** 2)
+        sparse("model.bin", 95 * 1024 ** 2)   # > the 90 MB budget
+        (self.source / "analysis.ipynb").write_bytes(b'{"cells": []}')
+        (self.source / "--checkpoint-action=exec=touch pwned").write_bytes(b"just a file")
+        lines = self.backup()
+        self.assertEqual(len(self.checkpoints), 1, lines)
+        self.assertLess(len(self.upload), 128 * 1024 ** 2)
+        self.assertTrue(any("model.bin" in l and "NOT protected" in l for l in lines), lines)
+        self.assertTrue(any("site-packages" in l and ".cache" in l for l in lines), lines)
+        with patch.object(ws, "directory", return_value=str(self.target)), \
+             patch.object(tf.httpx, "post", side_effect=self.post), \
+             patch.object(tf.safe_fetch, "get", side_effect=lambda *a, **k: httpx.Response(200, content=self.upload)), \
+             patch.object(tf, "report_log"):
+            self.assertTrue(tf._restore_volume("jupyter-data", "backups/1/42/snapshot", 42, self.task))
+        self.assertEqual((self.target / "analysis.ipynb").read_bytes(), b'{"cells": []}')
+        self.assertTrue((self.target / "scene.blend").exists())
+        self.assertTrue((self.target / "--checkpoint-action=exec=touch pwned").exists())
+        self.assertTrue((self.target / "venv/lib/python3.11").is_dir())
+        self.assertFalse((self.target / "venv/lib/python3.11/site-packages").exists())
+        self.assertFalse((self.target / ".cache").exists())
+        self.assertFalse((self.target / "model.bin").exists())
+        self.assertFalse(Path("pwned").exists())
+
+    def test_failed_backup_tells_the_buyer_once_then_resumed(self):
+        failing = lambda url, **kw: self.response({}, 503)
+        first, second = self.backup(failing), self.backup(failing)
+        self.assertEqual(self.checkpoints, [])
+        self.assertTrue(any("WORKSPACE BACKUP FAILED" in l for l in first), first)
+        self.assertFalse(any("localhost/upload" in l for l in first), first)  # no presigned URL
+        self.assertEqual(second, [])                                         # rate-limited
+        ok = self.backup()
+        self.assertEqual(len(self.checkpoints), 1)
+        self.assertIn("workspace backups resumed", ok)
+
+    def test_rejected_checkpoint_is_not_reported_as_a_backup(self):
+        post = self.post
+        self.post = lambda url, **kw: (self.response({}, 409) if url.endswith("/checkpoint")
+                                       else post(url, **kw))
+        lines = self.backup()
+        self.assertFalse(any(l.startswith("backup ->") for l in lines), lines)
+        self.assertTrue(any("WORKSPACE BACKUP FAILED" in l for l in lines), lines)
 
     def test_wrong_task_volume_is_refused(self):
         def docker(args, **kw):

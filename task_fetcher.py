@@ -703,6 +703,63 @@ def _restore_volume(volume, restore_ref, task_id, task=None):
         return False
 
 
+# Reproducible folders a checkpoint never spends its size budget on (matched by NAME at any
+# depth): reinstall with pip/npm or re-download after a restore. Without this, one `pip install
+# torch` in a Jupyter work dir pushed the archive past the restore limit and every later backup
+# failed (task 673).
+BACKUP_EXCLUDED_DIRS = ("site-packages", "dist-packages", "node_modules", "__pycache__", ".cache")
+# Fernet adds ~1/3 (base64): a 90 MiB tar encrypts to ~120 MiB, under the 128 MiB restore limit.
+_BACKUP_TAR_BUDGET = 90 * 1024 * 1024
+_BACKUP_NOTICES = {}        # (task_id, kind) -> monotonic ts last shown to the buyer
+
+
+def _backup_notice(tid, kind, message, every_s=1800):
+    """Tell the buyer (job log) and ops (agent log) about a backup problem: at once, then at most
+    every `every_s` per kind — never silently, never every 60 s."""
+    last = _BACKUP_NOTICES.get((tid, kind))
+    if last is not None and time.monotonic() - last < every_s:
+        return
+    _BACKUP_NOTICES[(tid, kind)] = time.monotonic()
+    logging.warning(f"task {tid}: {message}")
+    report_log(tid, message)
+
+
+def _human(n):
+    return f"{n / 1024 ** 3:.1f} GB" if n >= 1024 ** 3 else f"{n / 1024 ** 2:.1f} MB"
+
+
+def _backup_manifest(source, budget=_BACKUP_TAR_BUDGET):
+    """(paths, skipped) for a workspace checkpoint. Excluded folders are pruned; if the rest is
+    over budget the smallest files are kept first (notebooks, code, results) and the files that
+    don't fit are returned as skipped [(path, size)], largest first. Paths start with './' so a
+    buyer-named file like '--checkpoint-action=...' can never be read by tar as an option."""
+    dirs, files = [], []
+    for root, dnames, fnames in os.walk(source):        # never follows links out of the volume
+        rel = os.path.relpath(root, source)
+        dirs.append(rel)
+        for d in list(dnames):
+            if d in BACKUP_EXCLUDED_DIRS or os.path.islink(os.path.join(root, d)):
+                dnames.remove(d)                         # a dir symlink is archived as a link
+                if d not in BACKUP_EXCLUDED_DIRS:
+                    fnames.append(d)
+        for f in fnames:
+            try:
+                size = os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                continue                                 # vanished mid-walk
+            files.append((os.path.normpath(os.path.join(rel, f)), size))
+    used = 512 * len(dirs) + 1024                        # tar headers + end-of-archive
+    keep, skipped = set(), []
+    for path, size in sorted(files, key=lambda x: x[1]):
+        cost = 512 + -(-size // 512) * 512
+        if used + cost <= budget:
+            keep.add(path); used += cost
+        else:
+            skipped.append((path, size))
+    paths = dirs + [p for p, _ in files if p in keep]
+    return ["./" + p if p != "." else "." for p in paths], skipped[::-1]
+
+
 def _backup_once(task, volume):
     """Snapshot -> encrypt -> upload via a one-object pre-signed PUT -> sign checkpoint.
     The node holds NO standing object-storage credentials."""
@@ -712,9 +769,19 @@ def _backup_once(task, volume):
         from cryptography.fernet import Fernet
         import tempfile, workspace_snapshot
         source = workspace_snapshot.directory(task, volume)
+        paths, skipped = _backup_manifest(source)
         handle, local = tempfile.mkstemp(prefix=f"pb-backup-t{tid}-", suffix=".tar")
         os.close(handle)
-        subprocess.check_call(["tar", "-cf", local, "-C", source, "."])
+        with tempfile.NamedTemporaryFile("wb", prefix=f"pb-backup-t{tid}-", suffix=".list") as listing:
+            listing.write(b"\0".join(os.fsencode(p) for p in paths))
+            listing.flush()
+            # --ignore-failed-read: a file deleted since the walk (Jupyter's atomic save) is not
+            # fatal; exit 1 only means a file changed while read — fine for a periodic snapshot.
+            tar = subprocess.run(["tar", "-cf", local, "--no-recursion", "--ignore-failed-read",
+                                  "-C", source, "--verbatim-files-from", "--null", "-T", listing.name],
+                                 capture_output=True, timeout=600)
+        if tar.returncode > 1:
+            raise ValueError(f"tar failed: {tar.stderr.decode(errors='replace')[-200:]}")
         grant = httpx.post(f"{API_URL}/jobs/backup_url", headers=HEADERS, timeout=15,
                            json=_lease_payload({"task_id": tid,
                                  "filename": f"{volume}-{__import__('uuid').uuid4().hex}.tar.enc"}), trust_env=False)
@@ -728,12 +795,29 @@ def _backup_once(task, volume):
         uploaded.raise_for_status()
         h = hashlib.sha256(enc).hexdigest()             # hash of the uploaded bytes
         proof = {"task_id": tid, "output_hash": h[:16], "ts": int(_tt.time())}
-        _post("/jobs/checkpoint", {"task_id": tid, "snapshot_ref": grant["snapshot_ref"],
-                                   "size_bytes": len(enc), "content_hash": h,
-                                   "proof": proof, "signature": crypto.sign_proof(proof)})
+        # Not _post: that swallows a rejected checkpoint, and the buyer would read "backup ->"
+        # for a recovery point the server never recorded.
+        httpx.post(f"{API_URL}/jobs/checkpoint", headers=HEADERS, timeout=15, trust_env=False,
+                   json=_lease_payload({"task_id": tid, "snapshot_ref": grant["snapshot_ref"],
+                                        "size_bytes": len(enc), "content_hash": h, "proof": proof,
+                                        "signature": crypto.sign_proof(proof)})).raise_for_status()
         report_log(tid, f"backup -> {grant['snapshot_ref']} ({len(enc)} bytes, encrypted)")
+        if _BACKUP_NOTICES.pop((tid, "failed"), None) is not None:
+            report_log(tid, "workspace backups resumed")
+        _backup_notice(tid, "info", "workspace backups never include reproducible folders ("
+                       + ", ".join(BACKUP_EXCLUDED_DIRS) + "); reinstall/re-download them after a restore",
+                       every_s=float("inf"))
+        if skipped:
+            shown = ", ".join(f"{p} ({_human(s)})" for p, s in skipped[:5])
+            more = f" and {len(skipped) - 5} more" if len(skipped) > 5 else ""
+            _backup_notice(tid, "skipped", f"WARNING: {len(skipped)} file(s) do not fit the "
+                           f"{_BACKUP_TAR_BUDGET // 1024 ** 2} MB workspace backup and are NOT protected: "
+                           f"{shown}{more}. Download them or keep a copy elsewhere.")
     except Exception as e:                              # noqa: BLE001
-        logging.error(f"backup failed: {e}")
+        # Our own ValueErrors are buyer-safe; anything else may carry a presigned URL.
+        reason = str(e) if isinstance(e, ValueError) else type(e).__name__
+        _backup_notice(tid, "failed", f"WORKSPACE BACKUP FAILED ({reason}); changes since the "
+                       "last successful backup are NOT protected. Retrying every interval.")
     finally:
         if "local" in locals():
             try:
