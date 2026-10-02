@@ -275,6 +275,24 @@ ok("keepalive.sh titles its window, says keep-open in English AND Arabic, and ke
    "\\033]0;Petabyte node - keep open\\007" in ka and "keep this window open" in ka
    and "خلّ هذي النافذة مفتوحة" in ka and "while :; do" in ka and "manage.ps1" in ka)
 ok("keepalive.sh parses", subprocess.run(["bash", "-n", str(HERE / "keepalive.sh")]).returncode == 0)
+
+
+def _ka_status(docker_out):
+    """First status line keepalive.sh prints, with fake systemctl (agent active) + docker on PATH."""
+    with tempfile.TemporaryDirectory() as d:
+        for name, body in (("systemctl", "echo active"), ("docker", f"printf '{docker_out}'")):
+            p = os.path.join(d, name)
+            open(p, "w").write(f"#!/bin/sh\n{body}\n"); os.chmod(p, 0o755)
+        r = subprocess.run(["timeout", "3", "bash", str(HERE / "keepalive.sh")], capture_output=True,
+                           env={**os.environ, "PATH": d + ":" + os.environ.get("PATH", "")})
+        return r.stdout.decode("utf-8", "replace").rsplit("Status", 1)[-1]
+
+
+_rented, _idle = _ka_status("abc123\\n"), _ka_status("")
+ok("keepalive status says RENTED / earning (English + Arabic) while a rental container runs",
+   "RENTED - earning now" in _rented and "مؤجّر ويكسب الحين" in _rented, _rented)
+ok("keepalive status says online - waiting for rentals when nothing is rented",
+   "online - waiting for rentals" in _idle and "RENTED" not in _idle, _idle)
 mg = (HERE / "manage.ps1").read_text()
 ok("manage.ps1 with no action offers a menu whose default (Enter / 1) is Resume",
    '"" { "resume" } "1" { "resume" }' in mg and "1) Resume" in mg)

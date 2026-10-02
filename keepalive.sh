@@ -19,12 +19,18 @@ cat <<EOF
   and choose 1 (Resume).
 
 EOF
+rented() {
+  # A live buyer rental = a running container the agent labelled with the rental's VM id (or a
+  # legacy petabyte-vm-* VM). Local docker only: this window never calls the platform.
+  [ -n "$(timeout 10 docker ps -q --filter label=pb.vm_id 2>/dev/null)$(timeout 10 docker ps -q --filter name=petabyte-vm- 2>/dev/null)" ]
+}
 while :; do
   case "$(systemctl is-active petabyte-agent 2>/dev/null)" in
-    active) s="online - agent running" ;;
+    active) if rented; then s="RENTED - earning now / مؤجّر ويكسب الحين"
+            else s="online - waiting for rentals / متصل - ينتظر مستأجر"; fi ;;
     activating) s="starting..." ;;
     *) s="AGENT STOPPED - run the Resume command above" ;;
   esac
-  printf '\r  Status (%s): %-48s' "$(date +%H:%M)" "$s"
+  printf '\r  Status (%s): %-60s' "$(date +%H:%M)" "$s"
   sleep 30
 done
