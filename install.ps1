@@ -13,7 +13,11 @@
 #   3) Enables systemd inside the distro.
 #   4) Runs the standard Linux install.sh inside WSL (Docker sandbox, provision,
 #      attestation, petabyte-agent systemd service) — same code as Linux nodes.
-#   5) Registers a hidden Scheduled Task so the node comes online at logon.
+#   5) Registers a Scheduled Task so the node comes online at logon. Its window
+#      ("Petabyte node - keep open") is the node: closing it takes the GPU offline.
+#
+# Re-running this on a PC that already has a node repairs THAT node (same listing);
+# set $env:PETABYTE_NEW_NODE="1" to list it as a new node instead.
 #
 # GPU note: NVIDIA's Windows driver exposes CUDA to WSL2 automatically (no driver
 # install inside Linux). install.sh adds nvidia-container-toolkit so Docker jobs
@@ -23,25 +27,27 @@ $ErrorActionPreference = "Stop"
 
 
 # Ask immediately, but never make unattended installers wait for input.
-# Reuse the seller's previous choice; first install defaults to leaving power policy unchanged.
+# Keep-awake is ON by default (owner, 2026-10-02): a seller PC that idle-sleeps drops every rental, and the
+# old prompt defaulted to "no" whenever nobody was watching. Only an EXPLICIT earlier "no" is reused.
 $StateDir = Join-Path $env:ProgramData "Petabyte"
 $StateFile = Join-Path $StateDir "install-state.json"
 $prev = $null
 if (Test-Path $StateFile) { try { $prev = Get-Content $StateFile -Raw | ConvertFrom-Json } catch {} }
-$keepAwakeDefault = if ($prev -and $null -ne $prev.keepAwake) { [bool]$prev.keepAwake } else { $false }
+$keepAwakeDefault = if ($prev -and $prev.keepAwakeChosen -eq $true -and $null -ne $prev.keepAwake) { [bool]$prev.keepAwake } else { $true }
 $keepAwake = $keepAwakeDefault
+$keepAwakeChosen = [bool]($prev -and $prev.keepAwakeChosen -eq $true)
 $keepAwakeEnv = ([string]$env:PETABYTE_KEEP_AWAKE).Trim().ToLowerInvariant()
-if ($keepAwakeEnv -in @("true","1","yes","y")) { $keepAwake = $true }
-elseif ($keepAwakeEnv -in @("false","0","no","n")) { $keepAwake = $false }
+if ($keepAwakeEnv -in @("true","1","yes","y")) { $keepAwake = $true; $keepAwakeChosen = $true }
+elseif ($keepAwakeEnv -in @("false","0","no","n")) { $keepAwake = $false; $keepAwakeChosen = $true }
 else {
-    Write-Host "Do you want this PC to stay awake while the Petabyte seller agent is running? [y/N; 15s timeout]"
+    Write-Host "Keep this PC awake while the Petabyte seller agent runs, so rentals are not cut off? [Y/n; 15s timeout]"
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds(15)
         while ([DateTime]::UtcNow -lt $deadline) {
             if ([Console]::KeyAvailable) {
                 $key = [Console]::ReadKey($true).Key
-                if ($key -eq [ConsoleKey]::Y) { $keepAwake = $true; break }
-                if ($key -eq [ConsoleKey]::N) { $keepAwake = $false; break }
+                if ($key -eq [ConsoleKey]::Y) { $keepAwake = $true; $keepAwakeChosen = $true; break }
+                if ($key -eq [ConsoleKey]::N) { $keepAwake = $false; $keepAwakeChosen = $true; break }
                 if ($key -eq [ConsoleKey]::Enter) { break }
             }
             Start-Sleep -Milliseconds 100
@@ -52,8 +58,8 @@ else {
     }
 }
 $env:PETABYTE_KEEP_AWAKE = ([string]$keepAwake).ToLowerInvariant()
-if ($keepAwake) { Write-Host "Keep-awake enabled for the agent only." -ForegroundColor Cyan }
-else { Write-Host "Keep-awake disabled; existing Windows power settings are unchanged." -ForegroundColor Cyan }
+if ($keepAwake) { Write-Host "Keep-awake ON: this PC will not idle-sleep while the agent runs (the screen can still turn off; manual sleep and closing the lid still work). To turn it off, rerun with `$env:PETABYTE_KEEP_AWAKE='false'." -ForegroundColor Cyan }
+else { Write-Host "Keep-awake OFF: if Windows sleeps, your node goes offline and active rentals end." -ForegroundColor Yellow }
 # The agent's OWN distro. Buyers' apps need the NATIVE Docker Engine (each rental gets its own
 # firewalled network); a distro served by Docker Desktop's WSL integration (often the seller's own
 # Ubuntu) can't isolate them, and Docker Desktop must never be touched. So: a distro of our own.
@@ -108,7 +114,7 @@ if ($old -and (HasDistro $old)) {
 $distroPre = if ($prev -and $prev.distro -eq $Distro) { [bool]$prev.distroPreexisted } else { [bool](HasDistro $Distro) }
 if ($prev) { $wslPre = [bool]$prev.wslPreexisted }
 @{ wslPreexisted = [bool]$wslPre; distroPreexisted = $distroPre;
-   distro = $Distro; keepAwake = [bool]$keepAwake; installedAt = (Get-Date).ToString("o") } |
+   distro = $Distro; keepAwake = [bool]$keepAwake; keepAwakeChosen = [bool]$keepAwakeChosen; installedAt = (Get-Date).ToString("o") } |
    ConvertTo-Json | Set-Content $StateFile
 
 if (-not (HasDistro $Distro)) {
@@ -150,6 +156,20 @@ if ($migrate) {
         Fail "could not copy this node's registration out of $old; it keeps running there (batch jobs only)."
     }
     $keep = "export PETABYTE_KEEP_SPEC=1"
+} elseif ($env:PETABYTE_NEW_NODE -ne "1") {
+    # Re-running the installer on a PC that already has a node REPAIRS that node: same listing,
+    # same spec id (install.sh -> provision.py re-attests it with this key). Without this, every
+    # reinstall listed the PC again and the old listing stayed behind as an offline duplicate.
+    # PETABYTE_NEW_NODE=1 forces a fresh registration.
+    $existing = (wsl.exe -d $Distro -u root -- sh -c "sed -n 's/^PETABYTE_SPEC_ID=//p' /etc/petabyte/agent.env 2>/dev/null") -join ""
+    if ($existing.Trim()) {
+        Write-Host ""
+        Write-Host "This PC already has a Petabyte node (#$($existing.Trim())). Repairing it in place - it keeps the same listing." -ForegroundColor Cyan
+        Write-Host "Next time it is just offline, you don't need to reinstall - resume it instead:" -ForegroundColor Cyan
+        Write-Host "  irm $($env:PETABYTE_API_URL)/manage.ps1 | iex     (then choose 1 = Resume)" -ForegroundColor Cyan
+        Write-Host ""
+        $keep = "export PETABYTE_KEEP_SPEC=1"
+    }
 }
 
 # --- 3. run the standard Linux installer inside WSL -------------------------
@@ -180,7 +200,11 @@ if ($migrate) {   # only now: the node runs in $Distro. Nothing else in $old is 
 
 # --- 4. keep the node online: start WSL (and its systemd) at logon ----------
 Write-Host "==> registering auto-start task"
-$action  = New-ScheduledTaskAction -Execute "wsl.exe" -Argument "-d $Distro --exec sleep infinity"
+# Its window IS the node: it keeps WSL running, so closing it takes the GPU offline. On Windows 11
+# it opens as a Windows Terminal tab, so keepalive.sh titles it and says so instead of leaving a
+# blank `wsl.exe` tab that sellers close. Falls back to a bare keep-alive if the script is missing.
+$action  = New-ScheduledTaskAction -Execute "wsl.exe" `
+    -Argument "-d $Distro --exec /bin/sh -c `"bash /opt/petabyte-agent/keepalive.sh || exec sleep infinity`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden
 Register-ScheduledTask -TaskName "PetabyteNode" -Action $action -Trigger $trigger `
@@ -241,6 +265,9 @@ try {
 
 Write-Host ""
 Write-Host "node online (inside WSL2)." -ForegroundColor Green
+Write-Host "A window titled 'Petabyte node - keep open' is now running: that IS your node." -ForegroundColor Yellow
+Write-Host "Keep it open (minimise it is fine). Closing it takes your GPU offline. It reopens at every logon." -ForegroundColor Yellow
+Write-Host "Node offline later? Don't reinstall - resume: irm $($env:PETABYTE_API_URL)/manage.ps1 | iex  (choose 1 = Resume)" -ForegroundColor Yellow
 Write-Host "  status: wsl -d $Distro -u root -- systemctl status petabyte-agent"
 Write-Host "  logs:   wsl -d $Distro -u root -- journalctl -u petabyte-agent -f"
 Write-Host ""

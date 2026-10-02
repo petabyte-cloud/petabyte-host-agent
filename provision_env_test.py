@@ -79,5 +79,82 @@ ok("an explicit PETABYTE_AGENT_KEY still wins",
 ok("a node provisioned before this keeps its existing key (identity preserved)",
    (crypto.KEY_PATH == crypto._LEGACY_KEY) == os.path.exists(crypto._LEGACY_KEY))
 
+# ----------------------------------------------------------------- reinstall keeps the SAME spec
+# A seller re-running the Windows installer used to get a second listing (new spec id) and the old
+# one stayed behind offline. PETABYTE_KEEP_SPEC=1 re-attests the saved spec with the NEW key.
+class _R:
+    def __init__(self, status, body=None):
+        self.status_code, self._b, self.text = status, body or {}, ""
+
+    def json(self):
+        return self._b
+
+
+class _C:
+    calls = []
+    prove_status = 200
+
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def get(self, url, **k):
+        _C.calls.append(("GET", url, None))
+        return _R(200, {"suggested_price": 0.5})
+
+    def post(self, url, headers=None, json=None):
+        _C.calls.append(("POST", url, json))
+        if url == "/prove" and json["spec_id"] == 7:
+            return _R(_C.prove_status)
+        return _R(200, {"spec_id": 99}) if url == "/register_specs" else _R(200)
+
+
+def _run_provision(keep, prove_status=200):
+    with open(env, "w") as f:
+        f.write("PETABYTE_API_URL=https://x\nPETABYTE_API_KEY=old-key\nPETABYTE_SPEC_ID=7\n"
+                "PB_EGRESS_ADDR=10.9.0.2\nPRICE_PER_HOUR=0.9\n")
+    _C.calls, _C.prove_status = [], prove_status
+    os.environ.update(PETABYTE_API_URL="https://x", PETABYTE_API_KEY="new-key", AGENT_ENV=env,
+                      PETABYTE_KEEP_SPEC="1" if keep else "")
+    p = provision
+    saved = (p.httpx.Client, p.detect, p.verify_declared_gpu, p.crypto.sign_proof,
+             p.crypto.public_key_b64)
+    p.httpx.Client, p.detect = _C, (lambda: (8, 32, "RTX 4080", 1, 16))
+    p.verify_declared_gpu = lambda g, c: None
+    p.crypto.sign_proof, p.crypto.public_key_b64 = (lambda a: "sig"), (lambda: "pub")
+    try:
+        p.main()
+    finally:
+        (p.httpx.Client, p.detect, p.verify_declared_gpu, p.crypto.sign_proof,
+         p.crypto.public_key_b64) = saved
+    return provision._env_values(env), [c[1] for c in _C.calls if c[0] == "POST"]
+
+
+vals, posts = _run_provision(keep=True)
+ok("reinstall with PETABYTE_KEEP_SPEC=1 re-attests the saved spec and never registers a new one",
+   posts == ["/prove"] and vals["PETABYTE_SPEC_ID"] == "7")
+ok("the kept node switches to the NEW key (an old/expired key is replaced)",
+   vals["PETABYTE_API_KEY"] == "new-key")
+ok("the kept node keeps its egress address and operator settings",
+   vals.get("PB_EGRESS_ADDR") == "10.9.0.2" and vals.get("PRICE_PER_HOUR") == "0.9")
+vals, posts = _run_provision(keep=True, prove_status=404)
+ok("a saved spec that is not this account's (404) falls back to a fresh registration",
+   posts == ["/prove", "/register_specs", "/prove"] and vals["PETABYTE_SPEC_ID"] == "99")
+vals, posts = _run_provision(keep=False)
+ok("without PETABYTE_KEEP_SPEC a run registers a new spec exactly as before",
+   posts == ["/register_specs", "/prove"] and vals["PETABYTE_SPEC_ID"] == "99")
+try:
+    _run_provision(keep=True, prove_status=500)
+    ok("a server error while re-attesting stops the install instead of duplicating", False)
+except SystemExit:
+    ok("a server error while re-attesting stops the install instead of duplicating", True)
+for k in ("PETABYTE_API_URL", "PETABYTE_API_KEY", "AGENT_ENV", "PETABYTE_KEEP_SPEC"):
+    os.environ.pop(k, None)
+
 print(f"\n=== provision_env: {'0 failures' if _fail == 0 else str(_fail) + ' FAILED'} ===")
 raise SystemExit(1 if _fail else 0)

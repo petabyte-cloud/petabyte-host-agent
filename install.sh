@@ -388,18 +388,20 @@ if ! .venv/bin/python isolation.py selftest; then
   echo "!! ------------------------------------------------------------------------------------------"
 fi
 
-# PETABYTE_KEEP_SPEC=1 (the Windows installer moving an existing node into its own WSL distro):
-# keep the copied registration instead of listing this machine a second time.
-if [ "${PETABYTE_KEEP_SPEC:-}" = "1" ] && grep -q '^PETABYTE_SPEC_ID=.' "$ENVF" 2>/dev/null && [ -s "$KEYF" ]; then
+# PETABYTE_KEEP_SPEC=1 (the Windows installer re-running on, or moving, an existing node): keep the
+# saved registration instead of listing this machine a second time. provision.py re-attests that
+# spec with THIS key (so a fresh key replaces an old/expired one) and registers a new spec only if
+# the saved one is not this account's. Linux reruns stay opt-in: cloned images share agent.env.
+if [ "${PETABYTE_KEEP_SPEC:-}" = "1" ] && grep -q '^PETABYTE_SPEC_ID=.' "$ENVF" 2>/dev/null; then
   echo "==> keeping this node's existing registration ($(grep '^PETABYTE_SPEC_ID=' "$ENVF"))"
 else
   echo "==> registering + attesting this node"
-  PETABYTE_AGENT_KEY="$KEYF" AGENT_ENV="$ENVF" \
-    PETABYTE_API_URL="$PETABYTE_API_URL" PETABYTE_API_KEY="$PETABYTE_API_KEY" \
-    PRICE_PER_HOUR="${PRICE_PER_HOUR:-}" UNITS="${UNITS:-1}" GPU_MODEL="${GPU_MODEL:-}" \
-    PROVIDER="${PROVIDER:-}" \
-    .venv/bin/python provision.py
 fi
+PETABYTE_AGENT_KEY="$KEYF" AGENT_ENV="$ENVF" PETABYTE_KEEP_SPEC="${PETABYTE_KEEP_SPEC:-}" \
+  PETABYTE_API_URL="$PETABYTE_API_URL" PETABYTE_API_KEY="$PETABYTE_API_KEY" \
+  PRICE_PER_HOUR="${PRICE_PER_HOUR:-}" UNITS="${UNITS:-1}" GPU_MODEL="${GPU_MODEL:-}" \
+  PROVIDER="${PROVIDER:-}" \
+  .venv/bin/python provision.py
 
 # Persist the optional preference. New installs default off; reruns preserve their saved choice.
 if grep -q '^PETABYTE_KEEP_AWAKE=' "$ENVF" 2>/dev/null; then

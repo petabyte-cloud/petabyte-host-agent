@@ -26,10 +26,21 @@ import cli_ui
 
 # The four keys provisioning owns and rewrites; everything else in agent.env belongs to the
 # operator and survives (see _preserved_env_lines).
+# Egress VPN config the API assigns at registration (rewritten each provision).
+EGRESS_ENV_KEYS = ("PB_EGRESS_GATEWAY_PUBKEY", "PB_EGRESS_GATEWAY_ENDPOINT", "PB_EGRESS_ADDR")
 MANAGED_ENV_KEYS = ("PETABYTE_API_URL", "PETABYTE_API_KEY", "PETABYTE_SPEC_ID",
-                    "PETABYTE_AGENT_KEY",
-                    # Egress VPN config the API assigns at registration (rewritten each provision).
-                    "PB_EGRESS_GATEWAY_PUBKEY", "PB_EGRESS_GATEWAY_ENDPOINT", "PB_EGRESS_ADDR")
+                    "PETABYTE_AGENT_KEY") + EGRESS_ENV_KEYS
+
+
+def _env_values(env_path: str) -> dict:
+    """KEY=value pairs of an existing agent.env ({} when there is none)."""
+    try:
+        with open(env_path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return {}
+    return dict(line.strip().split("=", 1) for line in lines
+                if "=" in line and not line.strip().startswith("#"))
 
 
 def _preserved_env_lines(env_path: str) -> list[str]:
@@ -321,7 +332,34 @@ def main():
 
     h = {"X-API-KEY": KEY}
     provider = os.getenv("PROVIDER", socket.gethostname() or "petabyte-node")
+    key_path = os.getenv("PETABYTE_AGENT_KEY", crypto.KEY_PATH)
+    env_path = os.getenv("AGENT_ENV", "/etc/petabyte/agent.env")
+    saved = _env_values(env_path)
+    keep_id = saved.get("PETABYTE_SPEC_ID", "") if os.getenv("PETABYTE_KEEP_SPEC") == "1" else ""
+
+    def prove(c, spec_id):
+        att = {"cpu": cpu, "ram": ram, "gpu_model": gpu,
+               "nonce": base64.b64encode(os.urandom(9)).decode(), "ts": int(time.time())}
+        return c.post("/prove", headers=h, json={
+            "spec_id": spec_id, "attestation": att,
+            "signature": crypto.sign_proof(att), "pubkey": crypto.public_key_b64()})
+
     with httpx.Client(base_url=API, timeout=20) as c:
+        if keep_id.isdigit():
+            # Reinstall/repair of an existing node: re-attest the SAME spec with this key instead of
+            # listing the machine again. 404 = not this account's spec (or gone) -> register anew.
+            ui.step(f"Re-attesting existing spec #{keep_id} …")
+            pr = prove(c, int(keep_id))
+            if pr.status_code < 400:
+                ui.step(f"Kept existing spec #{keep_id} (same listing)", done=True)
+                _write_env(env_path, API, KEY, int(keep_id), key_path,
+                           {k: saved[k] for k in EGRESS_ENV_KEYS if saved.get(k)})
+                ui.blank()
+                ui.success("Node repaired and online", Spec=f"#{keep_id}", Env=env_path)
+                return
+            if pr.status_code != 404:
+                _fail("Attestation failed", detail=f"HTTP {pr.status_code}: {pr.text[:200]}")
+            ui.step(f"Spec #{keep_id} is not on this account; registering this machine as a new node")
         price, price_basis = resolve_price(c, gpu)
         # REPORTED confidential-computing capabilities (best-effort; never blocks registration).
         try:
@@ -361,23 +399,27 @@ def main():
         spec_id = _sj["spec_id"]
         # Egress-VPN config the API assigned (empty unless enabled server-side): written to agent.env
         # below so the agent tunnels buyer egress through the gateway on the next job.
-        egress_env = {k: _sj[k] for k in
-                      ("PB_EGRESS_GATEWAY_PUBKEY", "PB_EGRESS_GATEWAY_ENDPOINT", "PB_EGRESS_ADDR")
-                      if _sj.get(k)}
+        egress_env = {k: _sj[k] for k in EGRESS_ENV_KEYS if _sj.get(k)}
         ui.step(f"Registered spec #{spec_id}", done=True)
 
         ui.step("Attesting node identity (Ed25519) …")
-        att = {"cpu": cpu, "ram": ram, "gpu_model": gpu,
-               "nonce": base64.b64encode(os.urandom(9)).decode(), "ts": int(time.time())}
-        pr = c.post("/prove", headers=h, json={
-            "spec_id": spec_id, "attestation": att,
-            "signature": crypto.sign_proof(att), "pubkey": crypto.public_key_b64()})
+        pr = prove(c, spec_id)
         if pr.status_code >= 400:
             _fail("Attestation failed", detail=f"HTTP {pr.status_code}: {pr.text[:200]}")
         ui.step("Attestation accepted", done=True)
 
-    key_path = os.getenv("PETABYTE_AGENT_KEY", crypto.KEY_PATH)
-    env_path = os.getenv("AGENT_ENV", "/etc/petabyte/agent.env")
+    _write_env(env_path, API, KEY, spec_id, key_path, egress_env)
+    ui.blank()
+    ui.success("Node provisioned and online", **{
+        "Spec": f"#{spec_id}",
+        "GPU": (f"{gpu} x{gc}" if gpu else "CPU-only"),
+        "Price": f"${price:.2f}/hour ({price_basis})",
+        "Env": env_path,
+        "Next": "python main.py   (or start the petabyte-agent service)",
+    })
+
+
+def _write_env(env_path, API, KEY, spec_id, key_path, egress_env):
     os.makedirs(os.path.dirname(env_path), exist_ok=True)
     # agent.env holds the node's encrypted API key. Create it 0600 FROM THE START (O_CREAT with
     # mode) instead of open()-then-chmod, which leaves a brief window where the key file is
@@ -399,14 +441,6 @@ def main():
         if preserved:
             f.write("".join(line + "\n" for line in preserved))
     os.chmod(env_path, 0o600)   # belt-and-suspenders if the file pre-existed with looser perms
-    ui.blank()
-    ui.success("Node provisioned and online", **{
-        "Spec": f"#{spec_id}",
-        "GPU": (f"{gpu} x{gc}" if gpu else "CPU-only"),
-        "Price": f"${price:.2f}/hour ({price_basis})",
-        "Env": env_path,
-        "Next": "python main.py   (or start the petabyte-agent service)",
-    })
 
 
 if __name__ == "__main__":

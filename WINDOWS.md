@@ -27,7 +27,7 @@ command after**. The script then: creates the agent's own `Petabyte` WSL distro 
 Docker Desktop's WSL integration never serves it, and Docker Desktop is left as it is) →
 enables systemd → runs the
 standard `install.sh` inside WSL (Docker, provision, attest, service) → registers a
-hidden **Scheduled Task** so the node comes online at logon. The installer first asks whether Windows should stay awake while the seller agent is running (15-second timeout; no terminal/no answer safely defaults off). If opted in, a separate hidden task uses Windows' idle-sleep inhibitor only while the WSL `petabyte-agent` service is active. It leaves the display and manual sleep/lid controls alone. Set `$env:PETABYTE_KEEP_AWAKE="true"` or `"false"` to choose without prompting.
+hidden **Scheduled Task** so the node comes online at logon. Keep-awake is ON by default: the installer asks whether Windows should stay awake while the seller agent is running ([Y/n], 15-second timeout; no answer keeps it on). When on, a separate hidden task uses Windows' idle-sleep inhibitor only while the WSL `petabyte-agent` service is active. It leaves the display and manual sleep/lid controls alone. Set `$env:PETABYTE_KEEP_AWAKE="true"` or `"false"` to choose without prompting.
 
 ## Verify
 ```powershell

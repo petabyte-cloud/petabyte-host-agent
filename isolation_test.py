@@ -250,11 +250,35 @@ for script in ("install.sh", "update.sh"):
     rc = subprocess.run(["bash", "-n", str(HERE / script)]).returncode
     ok(f"{script} parses", rc == 0)
 ps = (HERE / "install.ps1").read_text()
+ok("install.ps1 keeps the PC awake by DEFAULT (no answer / Enter / no terminal = on)",
+   "else { $true }" in ps and "[Y/n; 15s timeout]" in ps and "[y/N" not in ps)
+ok("install.ps1 reuses only an EXPLICIT earlier keep-awake choice and records it",
+   "$prev.keepAwakeChosen -eq $true" in ps and "keepAwakeChosen = [bool]$keepAwakeChosen" in ps
+   and '"false","0","no","n")) { $keepAwake = $false; $keepAwakeChosen = $true }' in ps)
 ok("install.ps1 gives the agent its own distro, imported from a SHA-256-checked Ubuntu image",
    '$Distro = "Petabyte"' in ps and "wsl.exe --import" in ps and "Get-FileHash" in ps
    and "wsl.exe --install -d" not in ps)
 ok("install.ps1 moves an existing node only when Docker Desktop serves its distro, keeping its registration",
    '"docker-desktop|Docker Desktop"' in ps and "PETABYTE_KEEP_SPEC=1" in ps and "KeepOld" in ps)
+# Reinstall on a PC that already has a node = repair it (same listing), never a duplicate.
+ok("install.ps1 re-running on an existing node keeps its registration unless PETABYTE_NEW_NODE=1",
+   '$env:PETABYTE_NEW_NODE -ne "1"' in ps and "PETABYTE_SPEC_ID=" in ps
+   and ps.count('$keep = "export PETABYTE_KEEP_SPEC=1"') == 2 and "Repairing it in place" in ps)
+ok("install.sh hands PETABYTE_KEEP_SPEC to provision.py (which re-attests the kept spec)",
+   'PETABYTE_KEEP_SPEC="${PETABYTE_KEEP_SPEC:-}"' in sh and sh.count(".venv/bin/python provision.py") == 1)
+# The logon task's window IS the node: it must say so, not be a blank wsl.exe tab sellers close.
+ka = (HERE / "keepalive.sh").read_text()
+_task = 'bash /opt/petabyte-agent/keepalive.sh || exec sleep infinity'
+ok("the logon task runs keepalive.sh (bare keep-alive fallback), not a blank `sleep infinity`",
+   _task in ps and '--exec sleep infinity"' not in ps)
+ok("keepalive.sh titles its window, says keep-open in English AND Arabic, and keeps running",
+   "\\033]0;Petabyte node - keep open\\007" in ka and "keep this window open" in ka
+   and "خلّ هذي النافذة مفتوحة" in ka and "while :; do" in ka and "manage.ps1" in ka)
+ok("keepalive.sh parses", subprocess.run(["bash", "-n", str(HERE / "keepalive.sh")]).returncode == 0)
+mg = (HERE / "manage.ps1").read_text()
+ok("manage.ps1 with no action offers a menu whose default (Enter / 1) is Resume",
+   '"" { "resume" } "1" { "resume" }' in mg and "1) Resume" in mg)
+ok("manage.ps1 resume moves an older install's blank-window task onto keepalive.sh", _task in mg)
 
 print(f"\n{'ALL PASS' if _fail == 0 else f'{_fail} FAILED'}")
 sys.exit(1 if _fail else 0)

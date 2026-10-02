@@ -24,10 +24,10 @@ systemctl status petabyte-agent
 journalctl -u petabyte-agent -f
 ```
 
-Optional env: `PETABYTE_KEEP_AWAKE=true|false` opts into keeping the machine awake while the seller agent runs (default off; a 15-second prompt is skipped safely without a terminal), `UNITS` (identical rentable units, default 1), `MAX_HOURS` (24),
+Optional env: `PETABYTE_KEEP_AWAKE=true|false` keeps the machine awake while the seller agent runs (default ON; `false` opts out; the 15-second prompt defaults to on), `UNITS` (identical rentable units, default 1), `MAX_HOURS` (24),
 `GPU_MODEL`/`GPU_COUNT`/`VRAM_GB` (manual override when `nvidia-smi` isn't present).
 
-Keep-awake only blocks idle system sleep while the agent is running; it does not keep the display on or override manual sleep/lid actions. On first install, no response, Enter, or an invalid response leaves it off.
+Keep-awake only blocks idle system sleep while the agent is running; it does not keep the display on or override manual sleep/lid actions. On install, no response or Enter leaves it ON; only an explicit `n` (or `PETABYTE_KEEP_AWAKE=false`) turns it off, and that explicit choice is remembered.
 
 Security: the agent's signing key lives only at `/etc/petabyte/agent_ed25519.key`
 and is the same identity used for attestation and signed job results.

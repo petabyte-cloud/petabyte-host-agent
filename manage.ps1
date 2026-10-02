@@ -1,5 +1,7 @@
 # Petabyte node manager — pause, resume, uninstall, status.
-# Run elevated. Either pass -Action, or set $env:PETABYTE_ACTION (for `irm ... | iex`).
+# Run elevated. Node offline? Resume it (no need to reinstall):
+#   irm https://petabyte.market/manage.ps1 | iex        -> choose 1 (Resume)
+# Or pass -Action, or set $env:PETABYTE_ACTION (for unattended `irm ... | iex`):
 #   $env:PETABYTE_ACTION="pause"; irm https://petabyte.market/manage.ps1 | iex
 #
 # uninstall reverts cleanly: it stops + removes the agent and the auto-start task,
@@ -8,7 +10,17 @@
 # before Petabyte. It never nukes a distro/WSL the user already had.
 
 param([ValidateSet("pause","resume","uninstall","status")][string]$Action = $env:PETABYTE_ACTION)
-if (-not $Action) { $Action = "status" }
+if (-not $Action) {
+    Write-Host "Petabyte node manager" -ForegroundColor Cyan
+    Write-Host "  1) Resume    - node offline? bring it back online (no reinstall needed)"
+    Write-Host "  2) Pause     - stop hosting for now; stays installed"
+    Write-Host "  3) Status"
+    Write-Host "  4) Uninstall"
+    $pick = $null
+    try { $pick = Read-Host "Choose 1-4 [1]" } catch {}   # no console (automation): show status
+    $Action = switch ("$pick".Trim()) { "" { "resume" } "1" { "resume" } "2" { "pause" } "4" { "uninstall" } default { "status" } }
+    if ($null -eq $pick) { $Action = "status" }
+}
 $ErrorActionPreference = "Stop"
 
 $StateDir  = Join-Path $env:ProgramData "Petabyte"
@@ -42,6 +54,11 @@ switch ($Action) {
 
   "resume" {
     Write-Host "Resuming Petabyte node..."
+    # Older installs launched a blank `wsl.exe` window; switch them to the one that says what it is.
+    if ((Agent "test -f /opt/petabyte-agent/keepalive.sh && echo yes") -match "yes") {
+        try { Set-ScheduledTask -TaskName $Task -Action (New-ScheduledTaskAction -Execute "wsl.exe" `
+            -Argument "-d $Distro --exec /bin/sh -c `"bash /opt/petabyte-agent/keepalive.sh || exec sleep infinity`"") | Out-Null } catch {}
+    }
     try { Enable-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue | Out-Null } catch {}
     try { Start-ScheduledTask -TaskName $Task } catch {}
     if ($state.keepAwake) {
@@ -51,6 +68,7 @@ switch ($Action) {
     Start-Sleep -Seconds 3
     Agent "systemctl start petabyte-agent"
     Write-Host "Resumed — node coming back online." -ForegroundColor Green
+    Write-Host "Keep the 'Petabyte node' window open (minimised is fine): closing it takes your GPU offline." -ForegroundColor Yellow
   }
 
   "status" {
