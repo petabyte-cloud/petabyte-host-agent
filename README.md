@@ -8,8 +8,8 @@ The agent payload comes from the verified, signed bundle served at
 `https://petabyte.market/agent.tar.gz`. This README, the license and the verification public
 key are mirror metadata; they may be added or updated separately from that bundle.
 
-- **Release:** `811db9173d58ce9a18442e4a0bb507166484a530`
-- **Bundle SHA-256:** `a22ee7cf308ff4affa6fe52f5d8e269d248e2649d78578851a65462fdfd48c68`
+- **Release:** `fbb7475c638f3fd0bf09890f1304395f84445cb6`
+- **Bundle SHA-256:** `66299e9ddb4074ec8dc472b974db04b7cf2f8f6bc5329e345bb066e8c058a920`
 
 Hosts never install or update from this repository. The installer pins our release public key
 (`release_ed25519.pub`, also in this repo), and the updater (`update.sh`) refuses any bundle whose
@@ -18,16 +18,23 @@ what runs on a host.
 
 ## Check that this is really what hosts run
 
+Run from any empty folder. The repository and the live bundle go in separate folders, so the
+final diff compares only the agent code.
+
 ```bash
+git clone https://github.com/petabyte-cloud/petabyte-host-agent.git
+mkdir live && cd live
 curl -O https://petabyte.market/agent.tar.gz
 curl -O https://petabyte.market/agent.tar.gz.sig
-# 1. the bundle is signed by Petabyte's release key
-openssl pkeyutl -verify -pubin -inkey release_ed25519.pub -rawin -in agent.tar.gz -sigfile agent.tar.gz.sig
-# 2. it is the bundle this commit was made from (a newer release changes the hash — see the git log)
+# 1. the bundle is signed by Petabyte's release key -> "Signature Verified Successfully"
+openssl pkeyutl -verify -pubin -inkey ../petabyte-host-agent/release_ed25519.pub -rawin -in agent.tar.gz -sigfile agent.tar.gz.sig
+# 2. it is the bundle the latest release commit was made from -> both lines show the same hash
+#    (a release between your clone and your download changes it: clone again)
 sha256sum agent.tar.gz
-# 3. the files are identical to this repository
+git -C ../petabyte-host-agent log -1 --format=%s
+# 3. the files are identical to the repository -> "IDENTICAL"
 tar -xzf agent.tar.gz
-diff -r --exclude=.git --exclude=README.md --exclude=LICENSE --exclude=release_ed25519.pub lumaris_agent/ ./
+diff -r --exclude=.git --exclude=README.md --exclude=LICENSE --exclude=release_ed25519.pub lumaris_agent/ ../petabyte-host-agent/ && echo IDENTICAL
 ```
 
 Each release is a commit tagged `release-<sha>`, so the history shows what changed between

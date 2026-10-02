@@ -360,6 +360,12 @@ def heartbeat_loop():
                         _handle_preempt(_p)
                 except Exception as _pe:             # noqa: BLE001 — never break a heartbeat over preempt
                     logging.debug(f"preempt handling skipped: {_pe}")
+                # BUYER IMAGE SNAPSHOT (image_snapshot.py): bake each requested id once, off-thread.
+                try:
+                    for _s in (_body.get("snapshots") or []):
+                        _handle_snapshot(_s)
+                except Exception as _se:             # noqa: BLE001
+                    logging.debug(f"snapshot handling skipped: {_se}")
                 # SIGNED SUPPORT FIX (fixes.py): queue it for the root runner, which verifies it;
                 # then report anything the runner finished. Never breaks a heartbeat.
                 try:
@@ -862,6 +868,26 @@ def _handle_preempt(entry):
     finally:
         if live.get("stop"):
             live["stop"].set()                            # halt the periodic backup loop
+
+
+_SNAPSHOTS_HANDLED = set()
+
+
+def _snapshot_post(path, payload):
+    return httpx.post(f"{API_URL}{path}", headers=HEADERS, json=_lease_payload(payload),
+                      timeout=30, trust_env=False)
+
+
+def _handle_snapshot(entry):
+    """The server re-sends a pending snapshot every beat until our first part-URL call: bake each
+    id once per agent process (a restart before that call simply bakes it again)."""
+    sid = entry.get("id") if isinstance(entry, dict) else None
+    if not sid or sid in _SNAPSHOTS_HANDLED:
+        return
+    _SNAPSHOTS_HANDLED.add(sid)
+    import image_snapshot
+    threading.Thread(target=image_snapshot.bake, args=(entry, _snapshot_post, report_log),
+                     daemon=True, name=f"pb-snapshot-{sid}").start()
 
 
 def _egress_flags(task):
@@ -2449,9 +2475,14 @@ def _run_template(task):
         _template_env[task["model_env"]] = model
     try:
         try:
-            outcome = template_storage.prepare(image, tid,
-                cached_only=bool(params.get("cached_image_only", False)),
-                timeout=params.get("max_startup_seconds", 900))
+            if task.get("snapshot"):              # the buyer's own baked image, verified before load
+                import image_snapshot
+                image = image_snapshot.load(task["snapshot"], tid)
+                outcome = "loaded from your snapshot (sha256 and image id verified)"
+            else:
+                outcome = template_storage.prepare(image, tid,
+                    cached_only=bool(params.get("cached_image_only", False)),
+                    timeout=params.get("max_startup_seconds", 900))
             report_log(tid, "Docker image " + outcome + "; model/work files are private to this rental")
             cmd += _template_env_flags(task, _template_env)
             cmd += [image]
