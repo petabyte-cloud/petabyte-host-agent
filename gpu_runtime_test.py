@@ -49,6 +49,27 @@ ok("cpu -> no gpu args", gr.docker_gpu_args() == [])
 ok("cpu -> not has_gpu", not gr.has_gpu())
 ok("cpu -> no reset cmd", gr.gpu_reset_cmd() is None)
 
+# ---- WSL2: nvidia-smi lives in /usr/lib/wsl/lib, absent from the systemd service PATH (spec 253/265) ----
+import stat  # noqa: E402
+import tempfile  # noqa: E402
+os.environ.pop("GPU_VENDOR", None)
+_wsl = tempfile.mkdtemp(prefix="pb-wsl-lib-")
+_smi = os.path.join(_wsl, "nvidia-smi")
+with open(_smi, "w") as _f:
+    _f.write("#!/bin/sh\nexit 0\n")
+os.chmod(_smi, os.stat(_smi).st_mode | stat.S_IEXEC)
+_saved_path = os.environ.get("PATH", "")
+os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"      # what a systemd unit gets
+gr.ensure_wsl_path(_wsl)
+gr.vendor.cache_clear()
+ok("WSL node: ensure_wsl_path makes nvidia-smi visible -> vendor nvidia", gr.vendor() == "nvidia")
+ok("WSL node: ...so GPU containers get --gpus all again", gr.docker_gpu_args() == ["--gpus", "all"])
+gr.ensure_wsl_path(_wsl)
+ok("ensure_wsl_path is idempotent (no duplicate PATH entries)", os.environ["PATH"].split(os.pathsep).count(_wsl) == 1)
+gr.ensure_wsl_path("/nonexistent/wsl/lib")
+ok("a host without the WSL dir keeps its PATH unchanged", "/nonexistent/wsl/lib" not in os.environ["PATH"])
+os.environ["PATH"] = _saved_path
+
 os.environ.pop("GPU_VENDOR", None)
 gr.vendor.cache_clear()
 print("\n=== gpu_runtime: " + ("0 failures" if _fail == 0 else str(_fail) + " FAILED") + " ===")

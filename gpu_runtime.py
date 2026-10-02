@@ -15,6 +15,23 @@ import os
 import shutil
 
 
+# WSL2 ships nvidia-smi and libcuda in /usr/lib/wsl/lib, which is on an interactive shell's PATH but NOT
+# on the agent's systemd service PATH. Without it vendor() said "cpu" on every Windows node: no
+# `--gpus all`, the mandatory VRAM wipe "failed" instantly and every GPU rental was refused (prod spec
+# 253/265, RTX 4080 on WSL2, 2026-10-02). Appending it to the PROCESS env fixes detection and every
+# child (nvidia-smi, docker probes, diagnostics) at once; on non-WSL hosts the dir doesn't exist.
+WSL_LIB = "/usr/lib/wsl/lib"
+
+
+def ensure_wsl_path(wsl_lib=WSL_LIB):
+    path = os.environ.get("PATH", "")
+    if os.path.isdir(wsl_lib) and wsl_lib not in path.split(os.pathsep):
+        os.environ["PATH"] = path + os.pathsep + wsl_lib if path else wsl_lib
+
+
+ensure_wsl_path()
+
+
 def _has(cmd):
     return shutil.which(cmd) is not None
 
