@@ -130,6 +130,57 @@ _done.wait(5)
 ok("the pull runs off the job loop (its own thread), so other jobs are not blocked",
    _ran_on and _ran_on[0] is not threading.main_thread())
 
+# ------------------------------------------------------------------ unattended startup script
+_logs.clear()
+_watched = threading.Event()
+_real_watch = tf._watch_startup_script
+tf._watch_startup_script = lambda tid, name, workdir: _watched.set() if tid == 35 else None
+_script = "#!/bin/bash\necho TOPSECRET-token > out.txt\n"
+with patch("shutil.which", return_value="/usr/bin/docker"), \
+     patch("subprocess.run", return_value=Mock(returncode=0, stdout="cid35\n", stderr="")) as _run:
+    tf._run_template(dict(_task, task_id=35, template="pytorch", cache="/home/jovyan/work",
+                          params={"startup_script": _script}))
+_execs = [c for c in _run.call_args_list if c.args and list(c.args[0][:2]) == ["docker", "exec"]]
+ok("the script is written into the rental's own container over stdin",
+   any(c.args[0][2] == "-i" and c.kwargs.get("input") == _script for c in _execs))
+ok("then started detached inside that container, logging to the workspace's startup.log",
+   any(c.args[0][2] == "-d" and "/home/jovyan/work" in c.args[0][-1]
+       and "startup.log" in c.args[0][-1] and "startup.exitcode" in c.args[0][-1] for c in _execs))
+ok("the script never appears in an argv or a log line",
+   not any("TOPSECRET" in str(c.args) for c in _run.call_args_list)
+   and not any("TOPSECRET" in m for m in _logs))
+ok("the buyer's log says where the output goes", any("startup.log" in m for m in _logs))
+ok("its exit is watched off the job loop", _watched.wait(5))
+tf._watch_startup_script = _real_watch
+
+with tf._pb_vm_lock:
+    tf._pb_vm_watch[36] = {"name": "pb-pytorch-1", "reported": False}
+_logs.clear()
+_posts.clear()
+with patch("subprocess.run", side_effect=[
+        Mock(returncode=1, stdout="", stderr="cat: startup.exitcode: No such file"),
+        Mock(returncode=0, stdout="3\n", stderr="")]) as _run:
+    tf._watch_startup_script(36, "pb-pytorch-1", "/home/jovyan/work")
+ok("the exit code is read inside the container once the script finishes",
+   _run.call_args.args[0] == ["docker", "exec", "pb-pytorch-1", "cat",
+                              "/home/jovyan/work/startup.exitcode"])
+ok("and reported once to the server (timeline + optional auto-stop)",
+   _posts == [("/jobs/startup_done", {"task_id": 36, "exit_code": 3})])
+ok("and logged for the buyer", any("exited with code 3" in m for m in _logs))
+with tf._pb_vm_lock:
+    tf._pb_vm_watch.pop(36)
+_posts.clear()
+with patch("subprocess.run") as _run:
+    tf._watch_startup_script(36, "pb-pytorch-1", "/home/jovyan/work")
+ok("nothing is probed or reported for a rental that already ended", not _run.called and not _posts)
+
+_logs.clear()
+with patch("subprocess.run", side_effect=subprocess.CalledProcessError(
+        1, ["docker", "exec"], "", "sh: can't create .pb-startup.sh: Read-only file system")):
+    tf._start_startup_script(37, "pb-pytorch-2", "/work", "echo hi")
+ok("a script that cannot start says why and leaves the rental up",
+   any(m.startswith("startup script could not start") and "Read-only" in m for m in _logs))
+
 print()
 print("=== template launch: " + ("0 failures" if _fail == 0 else str(_fail) + " FAILED") + " ===")
 raise SystemExit(1 if _fail else 0)

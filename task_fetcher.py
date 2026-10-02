@@ -610,21 +610,35 @@ def _register_vm_tunnel(vm_id, tunnel_port, ip_address=None, attempts=5, lease_g
     return False
 
 
-def _inject_ssh_key(container_name, ssh_pubkey) -> None:
+# Started inside a `custom` image launched with ssh (task ssh_start): the image's OWN sshd, publickey
+# only — no password or keyboard-interactive (PAM) login whatever the image's sshd_config says. sshd
+# daemonizes and stays in the container's namespaces under its cap set; nothing touches the host.
+_SSHD_START = ('if [ ! -x /usr/sbin/sshd ]; then exit 3; fi; ssh-keygen -A >/dev/null 2>&1; '
+               'mkdir -p /run/sshd && /usr/sbin/sshd -o AuthenticationMethods=publickey '
+               '-o PasswordAuthentication=no -o PermitRootLogin=prohibit-password')
+
+
+def _inject_ssh_key(container_name, ssh_pubkey, start_sshd=False):
     """Best-effort: drop the buyer's SSH public key into the container's authorized_keys so an
-    sshd template accepts `ssh root@<id>.<zone>`. A no-op for templates without sshd (most serving
-    templates expose an HTTP port, not port 22) and never fatal — mirrors the notebook prefetch."""
+    sshd template accepts `ssh root@<id>.<zone>`; with start_sshd also start the image's own sshd.
+    A no-op for templates without sshd (most serving templates expose an HTTP port, not port 22)
+    and never fatal — mirrors the notebook prefetch. Returns the exec's exit code (None if not run):
+    3 = the image has no /usr/sbin/sshd."""
     if not ssh_pubkey:
-        return
+        return None
     import subprocess
     try:
         script = ('mkdir -p /root/.ssh && chmod 700 /root/.ssh && '
                   'printf "%s\\n" "$PB_KEY" >> /root/.ssh/authorized_keys && '
                   'chmod 600 /root/.ssh/authorized_keys')
-        subprocess.run(["docker", "exec", "-e", f"PB_KEY={ssh_pubkey}", container_name,
-                        "sh", "-c", script], capture_output=True, timeout=30, check=False)
+        if start_sshd:
+            script += " && " + _SSHD_START
+        # -u 0: authorized_keys is root's and sshd must start as root, whatever USER the image sets.
+        return subprocess.run(["docker", "exec", "-u", "0", "-e", f"PB_KEY={ssh_pubkey}", container_name,
+                               "sh", "-c", script], capture_output=True, timeout=30, check=False).returncode
     except Exception as e:                              # noqa: BLE001
         logging.info(f"ssh key inject skipped for {container_name}: {e}")
+        return None
 
 
 def _post_result_ack(payload) -> bool:
@@ -1074,6 +1088,7 @@ def _isolation_flags(task):
     return flags
 
 
+import nb_fetch  # noqa: E402
 from nb_fetch import prefetch_notebook as _prefetch_notebook
 
 
@@ -2291,6 +2306,38 @@ def _start_storage_guard(tid, name, volume):
     threading.Thread(target=guard, daemon=True, name=f"pb-storage-{tid}").start()
 
 
+def _start_startup_script(tid, name, workdir, script):
+    """Best-effort: a script that cannot start leaves the rental itself up and says why."""
+    try:
+        nb_fetch.start_startup_script(name, workdir, script)
+    except Exception as e:  # noqa: BLE001
+        report_log(tid, "startup script could not start: " + _launch_failure_reason(e))
+        return
+    report_log(tid, f"startup script started; output -> {workdir}/{nb_fetch.STARTUP_LOG}")
+    threading.Thread(target=_watch_startup_script, args=(tid, name, workdir), daemon=True,
+                     name=f"pb-startup-{tid}").start()
+
+
+def _watch_startup_script(tid, name, workdir, every_s=15):
+    """Report the exit code once: the buyer's timeline records it and the server stops the rental
+    if the buyer asked. ponytail: an agent restart drops this watcher (the script keeps running, the
+    exit is then not reported and no auto-stop happens: the buyer keeps the window they paid for);
+    restore it in _restore_vm_watch if that matters."""
+    while True:
+        time.sleep(every_s)
+        with _pb_vm_lock:
+            if tid not in _pb_vm_watch:
+                return                                 # the rental ended first
+        try:
+            code = nb_fetch.startup_exit_code(name, workdir)
+        except Exception:  # noqa: BLE001 — a failed probe is not an exit
+            continue
+        if code is not None:
+            report_log(tid, f"startup script exited with code {code}")
+            _post("/jobs/startup_done", {"task_id": tid, "exit_code": min(code, 255)})
+            return
+
+
 def _run_template(task):
     """Launch a one-click stack (Ollama/vLLM/ComfyUI/game server/...) and report it."""
     if task.get("port") and not _reverse_tunnel_enabled():
@@ -2533,6 +2580,8 @@ def _run_template(task):
                 _prefetch_notebook(name, task.get("cache") or "/home/jovyan/work", nb_url)
             except Exception as _e:  # noqa: BLE001 — prefetch is best-effort
                 report_log(tid, "notebook prefetch skipped: download or container write rejected")
+        if params.get("startup_script"):
+            _start_startup_script(tid, name, task.get("cache") or "/tmp", params["startup_script"])
         if task.get("template") == "finetune" and not _wait_for_template_port(_health_port, name):
             report_log(tid, "Axolotl JupyterLab did not open its service port; failing the rental")
             try:
@@ -2569,7 +2618,10 @@ def _run_template(task):
         # (best-effort SSH-key inject first; a no-op for templates without sshd).
         vm_id = task.get("vm_id")
         if vm_id and port:
-            _inject_ssh_key(name, task.get("ssh_pubkey"))
+            _ssh_start = task.get("template") == "custom" and task.get("ssh_start") is True
+            if _inject_ssh_key(name, task.get("ssh_pubkey"), start_sshd=_ssh_start) == 3:
+                report_log(tid, "SSH was requested but this image has no /usr/sbin/sshd: add "
+                                "openssh-server to the image (the rental's other ports still run)")
             _registered = _register_vm_tunnel(
                 vm_id, _hp, ip_address=(_node_ip if task.get("template") != "palworld" else None),
                 lease_generation=task.get("lease_generation", 0),
@@ -3536,6 +3588,8 @@ def _pb_vm_scan():
             except Exception:
                 continue  # docker hiccup — try again next sweep
             if r.returncode != 0:
+                if "No such" not in (r.stderr or ""):
+                    continue                        # daemon down (host shutting down), not gone
                 status, code = "gone", 1            # container was removed entirely
             else:
                 parts = (r.stdout.strip().split(":") + ["1"])
@@ -3585,6 +3639,61 @@ def _pb_vm_watchdog():
         time.sleep(interval)
 
 
+def _boot_time():
+    """This host's boot time (epoch seconds) from /proc/stat, or None."""
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _restart_host_stopped(container, task_id):
+    """Start a rental container again if the HOST stopped it, not the buyer's app.
+
+    A seller rebooting mid-rental stops every container: Docker records exit 255 when its daemon
+    died under a running container, otherwise the stop signal's code with FinishedAt before this
+    boot. Booking 320 (2026-10-02): the watchdog then reported container_exited_exit_255 as a job
+    failure and deleted the container AND its workspace volume, though the rental was still paid.
+    `docker start` brings back the same container — writable layer, volume and host port binding
+    intact — so the buyer's machine resumes. One attempt only: if it exits again, the watchdog
+    reports it as before. Returns True when it was restarted."""
+    try:
+        r = subprocess.run(["docker", "inspect", "-f",
+                            "{{.State.Status}}|{{.State.ExitCode}}|{{.State.FinishedAt}}|"
+                            "{{.HostConfig.NetworkMode}}", container],
+                           capture_output=True, text=True, timeout=10, check=False)
+        status, code, finished, net = ((r.stdout or "").strip().split("|") + [""] * 4)[:4]
+        if r.returncode or status != "exited":
+            return False
+        boot = _boot_time()
+        try:
+            from datetime import datetime, timezone
+            fin = datetime.strptime(finished[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            fin = None
+        if code != "255" and not (boot and fin and fin < boot):
+            return False                         # it stopped while this boot was up: a real exit
+        if net == f"pb-net-t{task_id}":
+            # The reboot wiped the job bridge's firewall/egress rules; re-apply them before the
+            # container can run again, and leave it stopped (watchdog reports it) if that fails.
+            import network_policy
+            network_policy.ensure(int(task_id))
+        ok = subprocess.run(["docker", "start", container], capture_output=True,
+                            timeout=60, check=False).returncode == 0
+    except Exception as e:                       # noqa: BLE001 — the watchdog handles it as before
+        logging.warning(f"rental {task_id}: could not restart after host stop: {e}")
+        return False
+    if ok:
+        report_log(int(task_id), f"host restarted; rental container {container} started again "
+                                 "with its workspace intact")
+    return ok
+
+
 def _restore_vm_watch():
     """Reattach the watchdog to labelled rentals whose assignment survived an agent restart, and
     re-open their reverse tunnels: the ssh -R dies with the agent (every auto-update), which used to
@@ -3601,6 +3710,7 @@ def _restore_vm_watch():
         for container in result.stdout.split():
             task_id = _container_label_task(container)
             if task_id and task_id.isdigit() and execution_receipt.knows(int(task_id)):
+                _restart_host_stopped(container, task_id)    # before the watchdog can see "exited"
                 _register_vm(int(task_id), container)
                 hl = subprocess.run(["docker", "inspect", "-f",
                                      "|".join('{{index .Config.Labels "%s"}}' % k for k in

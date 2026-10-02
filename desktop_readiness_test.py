@@ -67,6 +67,7 @@ class DesktopReadiness(unittest.TestCase):
              patch.object(tf, "_container_label_task", return_value="43"), \
              patch.object(execution_receipt, "knows", return_value=True), \
              patch.object(tf, "_register_vm"), patch.object(tf, "_supervise_tunnel"), \
+             patch.object(tf, "_restart_host_stopped"), \
              patch.object(tf, "_start_ready_poll") as poll:
             tf._restore_vm_watch()
         poll.assert_called_once_with(43, "owned-container", 18000, "/", process="minecraft")

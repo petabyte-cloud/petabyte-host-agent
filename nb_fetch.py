@@ -1,4 +1,5 @@
-"""nb_fetch.py — pure helpers for the Colab-style /run notebook prefetch.
+"""nb_fetch.py — pure helpers for the Colab-style /run notebook prefetch and the buyer's
+unattended startup script (both write into the running container over docker-exec stdin).
 
 Kept separate from task_fetcher so it imports without the agent's heavy dependencies.
 The existing safe_fetch downloader pins public destinations and bounds redirects/bytes/time.
@@ -38,3 +39,32 @@ def prefetch_notebook(container: str, cache_dir: str, url: str):
     response.raise_for_status()
     subprocess.run(notebook_write_argv(container, cache_dir, url), input=response.content,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True)
+
+
+# Unattended startup script (template_params.startup_script, e.g. a scheduled rental).
+STARTUP_LOG = "startup.log"
+STARTUP_EXIT = "startup.exitcode"
+
+
+def start_startup_script(container: str, workdir: str, script: str):
+    """Run the buyer's script INSIDE their container, detached. `docker exec` inherits the
+    container's own user, capabilities, network and egress policy, so the script can do nothing
+    the template itself could not. It travels on stdin (never argv, env or an agent log); output
+    goes to <workdir>/startup.log and the exit code to <workdir>/startup.exitcode."""
+    q = shlex.quote(workdir)
+    subprocess.run(["docker", "exec", "-i", container, "sh", "-c",
+                    f"mkdir -p -- {q} && cd -- {q} && umask 077 && cat > .pb-startup.sh"],
+                   input=script, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                   timeout=30, check=True)
+    runner = (f"cd -- {q} || exit 1; if command -v bash >/dev/null 2>&1; then bash .pb-startup.sh;"
+              f" else sh .pb-startup.sh; fi > {STARTUP_LOG} 2>&1 < /dev/null; echo $? > {STARTUP_EXIT}")
+    subprocess.run(["docker", "exec", "-d", container, "sh", "-c", runner], text=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30, check=True)
+
+
+def startup_exit_code(container: str, workdir: str):
+    """The script's exit code once it has finished, else None."""
+    r = subprocess.run(["docker", "exec", container, "cat", workdir.rstrip("/") + "/" + STARTUP_EXIT],
+                       capture_output=True, text=True, timeout=30, check=False)
+    out = r.stdout.strip()
+    return int(out) if r.returncode == 0 and out.isdigit() else None
