@@ -19,22 +19,23 @@ os.environ.setdefault("PETABYTE_SPEC_ID", "1")
 import task_fetcher as tf  # noqa: E402
 import execution_receipt as _er  # noqa: E402
 
-PS = "ARGS\n/usr/bin/tini -- start-notebook.py\n/opt/conda/bin/python /opt/conda/bin/jupyter-lab\n"
+# Real `docker top <c> -eo pid,args` output: a header, then PID + command line.
+PS = "PID   COMMAND\n2165  /usr/bin/tini -- start-notebook.py\n2201  /opt/conda/bin/python /opt/conda/bin/jupyter-lab\n"
 ok("a normal Jupyter rental is not a miner", tf._miner_hit(PS) is None)
 ok("WildRig (the 2026-10-01 case) is caught",
-   tf._miner_hit(PS + "/tmp/wildrig_unpack/wildrig-multi --algo kawpow --url 166.117.41.217:9000\n"))
+   tf._miner_hit(PS + "9999  /tmp/wildrig_unpack/wildrig-multi --algo kawpow --url 166.117.41.217:9000\n"))
 ok("a renamed binary pointing at a stratum pool is caught",
-   tf._miner_hit(PS + "./job -o stratum+tcp://pool.example:3333 -u wallet\n"))
+   tf._miner_hit(PS + "9999  ./job -o stratum+tcp://pool.example:3333 -u wallet\n"))
 ok("t-rex / lolminer / xmrig are caught",
-   all(tf._miner_hit(PS + f"/root/{b} --a\n") for b in ("t-rex", "lolminer", "xmrig")))
+   all(tf._miner_hit(PS + f"9999  /root/{b} --a\n") for b in ("t-rex", "lolminer", "xmrig")))
 ok("the owner's reference list is enforced (Linux names and .exe under wine)",
-   all(tf._miner_hit(PS + f"/opt/m/{b} -a x\n") for b in (
+   all(tf._miner_hit(PS + f"9999  /opt/m/{b} -a x\n") for b in (
        "SRBMiner-MULTI", "cryptodredge", "cpuminer-avx2-sha-vaes", "urx-isotope-cpuminer-avx512",
        "xmr-stak", "minerd", "TT-Miner", "VerthashMiner", "wildrig.exe", "lolMiner.exe")))
 ok("a bare program called 'miner' alone is not killed (too generic)",
-   tf._miner_hit(PS + "/app/miner --rows 10\n") is None)
+   tf._miner_hit(PS + "9999  /app/miner --rows 10\n") is None)
 ok("a word that merely contains a miner name is not",
-   tf._miner_hit(PS + "python train_rigel.py --excavator-data /data\n") is None)
+   tf._miner_hit(PS + "9999  python train_rigel.py --excavator-data /data\n") is None)
 
 # One watchdog sweep: the live rental is running a miner -> killed, reported, torn down.
 calls, posted, cleaned, logs = [], [], [], []
@@ -43,7 +44,7 @@ calls, posted, cleaned, logs = [], [], [], []
 def _run(cmd, **kw):
     calls.append(cmd)
     if cmd[:2] == ["docker", "top"]:
-        return types.SimpleNamespace(returncode=0, stdout=PS + "/tmp/wildrig_unpack/wildrig-multi --algo x\n")
+        return types.SimpleNamespace(returncode=0, stdout=PS + "9999  /tmp/wildrig_unpack/wildrig-multi --algo x\n")
     return types.SimpleNamespace(returncode=0, stdout="")
 
 
@@ -57,6 +58,8 @@ _er.forget = lambda tid: None
 tf._pb_vm_watch[7] = {"name": "c7", "reported": False}
 tf._pb_vm_scan()
 ok("the miner's container is killed", ["docker", "kill", "c7"] in calls)
+ok("docker top asks for the pid column (without it dockerd errors and the check never runs)",
+   ["docker", "top", "c7", "-eo", "pid,args"] in calls)
 ok("reported failed with failure_cause=crypto_mining",
    len(posted) == 1 and posted[0]["status"] == "failed" and posted[0]["failure_cause"] == "crypto_mining")
 ok("the evidence (process line) is in the job log", any("wildrig-multi" in l for l in logs))
@@ -72,7 +75,7 @@ ok("checked at most once a minute per rental (no docker top inside the window)",
 
 # ---- workload report for the admin abuse view: program names only, never arguments
 ok("process names are argv[0] basenames, unique, without arguments (which can hold secrets)",
-   tf._proc_names(PS + "/tmp/x/wildrig-multi --user WALLET.SECRET\n")
+   tf._proc_names(PS + "9999  /tmp/x/wildrig-multi --user WALLET.SECRET\n")
    == ["tini", "python", "wildrig-multi"])
 tf._pb_vm_watch.clear()
 ok("no workload report while nothing is rented", tf._workload_report() is None)

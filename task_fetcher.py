@@ -3502,11 +3502,16 @@ _MINER_RE = re.compile(
 _MINER_CHECK_S = 60
 
 
-def _miner_hit(ps_args):
-    """The first process line (from `docker top <c> -eo args`) that is a crypto miner, else None."""
-    for line in (ps_args or "").splitlines()[1:]:   # skip the ARGS/COMMAND header
-        if _MINER_RE.search(line.strip()):
-            return line.strip()[:200]
+def _ps_args(ps_out):
+    """Command lines from `docker top <c> -eo pid,args`: header skipped, PID column dropped."""
+    return [p[1].strip() for p in (ln.split(None, 1) for ln in (ps_out or "").splitlines()[1:]) if len(p) == 2]
+
+
+def _miner_hit(ps_out):
+    """The first process command line that is a crypto miner, else None."""
+    for line in _ps_args(ps_out):
+        if _MINER_RE.search(line):
+            return line[:200]
     return None
 
 
@@ -3519,7 +3524,9 @@ def _rental_miner(tid, name):
             return None
         w["miner_checked"] = now
     try:
-        r = subprocess.run(["docker", "top", name, "-eo", "args"], capture_output=True, text=True, timeout=10)
+        # The pid column is required: without it dockerd answers "Couldn't find PID field in ps output"
+        # and the check silently never ran (2026-10-01..03, a miner pinned a 2060 for hours unseen).
+        r = subprocess.run(["docker", "top", name, "-eo", "pid,args"], capture_output=True, text=True, timeout=10)
     except Exception:                                    # noqa: BLE001 — docker hiccup: next minute
         return None
     if r.returncode != 0:
@@ -3530,12 +3537,11 @@ def _rental_miner(tid, name):
     return _miner_hit(r.stdout)
 
 
-def _proc_names(ps_args, limit=8):
+def _proc_names(ps_out, limit=8):
     """Program names only (argv[0] basename) — never arguments, which can carry the buyer's secrets."""
     seen = []
-    for line in (ps_args or "").splitlines()[1:]:
-        parts = line.split()
-        base = os.path.basename(parts[0])[:40] if parts else ""
+    for line in _ps_args(ps_out):
+        base = os.path.basename(line.split()[0])[:40] if line.split() else ""
         if base and base not in seen:
             seen.append(base)
     return seen[:limit]
