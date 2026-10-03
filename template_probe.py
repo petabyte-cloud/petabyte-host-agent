@@ -148,7 +148,10 @@ def run(challenge, runner, prepare, isolation_flags, gpu_flags, task_id):
     except Exception as exc:
         reason = str(exc).lower()
         _RUNNING.clear()
-        failure = "CACHE_POLICY" if "budget" in reason or "reserve" in reason else "IMAGE_UNAVAILABLE"
+        # A pull that runs past its bound is a slow link (spec 267, 2026-10-03: the layers were still
+        # arriving), not a missing image; the server retries TIMEOUT without penalizing the seller.
+        failure = ("TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired)
+                   else "CACHE_POLICY" if "budget" in reason or "reserve" in reason else "IMAGE_UNAVAILABLE")
         _report_failure(challenge["template"], task_id, "prepare", failure, exc)
         return dict(answer, failure=failure)
     try:

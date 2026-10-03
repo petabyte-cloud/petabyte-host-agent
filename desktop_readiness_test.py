@@ -196,5 +196,30 @@ class DesktopReadiness(unittest.TestCase):
                 self.assertIsNone(tf._restore_port_bridge(41, "owned"))
                 self.assertFalse(inspect.called)
 
+    def test_bridge_restore_after_restart_finds_container_by_id(self):
+        # Journal written at launch with the container NAME; after a reboot / agent restart the
+        # watchdog restore passes the ID from `docker ps -q`. Same container -> bridge restored.
+        cid = "104879d58133" + "f" * 52
+        ports = {"22/tcp": [{"HostIp": "127.0.0.1", "HostPort": "45001"}]}
+        def inspect_as(name):
+            return SimpleNamespace(stdout=json.dumps([{"Id": cid, "Name": "/" + name, "NetworkSettings": {"Ports": ports}}]))
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "bridge.json"
+            path.write_text(json.dumps({"41": dict(container="pb-tpl-41", generation=4, token="a" * 64,
+                endpoints=[dict(container_port=22, protocol="tcp", host_port=45001)])}))
+            path.chmod(0o600)
+            bridge = SimpleNamespace(port=19001)
+            with patch.object(tf, "_PORT_BRIDGES_FILE", str(path)), \
+                 patch.object(execution_receipt, "knows", return_value=True), \
+                 patch.object(execution_receipt, "generation", return_value=4), \
+                 patch.object(tf, "_start_service_bridge", return_value=bridge) as start:
+                with patch.object(tf.subprocess, "run", return_value=inspect_as("pb-tpl-41")):
+                    self.assertEqual(tf._restore_port_bridge(41, cid[:12]), 19001)
+                start.assert_called_once()
+                tf._port_bridges.pop(41, None)
+                # a DIFFERENT container under that id/name is never given this rental's bridge
+                with patch.object(tf.subprocess, "run", return_value=inspect_as("someone-else")):
+                    self.assertIsNone(tf._restore_port_bridge(41, "deadbeef0000"))
+
 if __name__ == "__main__":
     unittest.main()

@@ -1883,12 +1883,19 @@ def _restore_port_bridge(tid, name):
             return None
         with open(_PORT_BRIDGES_FILE) as handle:
             config = json.load(handle).get(str(tid))
-        if (not config or config["container"] != name or not execution_receipt.knows(tid)
+        if (not config or not execution_receipt.knows(tid)
                 or config["generation"] != execution_receipt.generation(tid)):
             return None
         info = subprocess.run(["docker", "inspect", name], capture_output=True,
                               text=True, timeout=10, check=True)
-        actual = json.loads(info.stdout)[0]["NetworkSettings"]["Ports"]
+        data = json.loads(info.stdout)[0]
+        # The journal records the container NAME (pb-...); after an agent restart or host reboot
+        # _restore_vm_watch finds it by ID (docker ps -q). Same container if either matches; the
+        # mismatch failed every SSH/public-port rental on each agent restart (2026-10-03 reboot test).
+        if config["container"] not in {name, data.get("Id"), (data.get("Id") or "")[:12],
+                                       (data.get("Name") or "").lstrip("/")}:
+            return None
+        actual = data["NetworkSettings"]["Ports"]
         for endpoint in config["endpoints"]:
             expected = {"HostIp": "127.0.0.1", "HostPort": str(endpoint["host_port"])}
             if expected not in (actual.get(f"{endpoint['container_port']}/{endpoint['protocol']}") or []):

@@ -66,7 +66,8 @@ class AgentTests(unittest.TestCase):
         def timeout(*a,**kw):raise subprocess.TimeoutExpired('docker pull',120,
                                                                output=b'layer 1 downloading',stderr=b'network stalled')
         answer=self.run_probe(None,timeout)
-        self.assertEqual(answer['failure'],'IMAGE_UNAVAILABLE')
+        self.assertEqual(answer['failure'],'TIMEOUT')   # slow pull: retried, never 'image unavailable'
+        self.assertIn('prepare TIMEOUT',self.reports.call_args.args[0])
         self.assertIn('network stalled',self.reports.call_args.kwargs['evidence'])
     def test_invalid_inputs_never_prepare_an_image(self):
         for key,value in [('image','anything:latest'),('nonce','wrong'),('template','custom'),('env',{'DOCKER_HOST':'evil'})]:
