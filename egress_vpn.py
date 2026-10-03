@@ -24,15 +24,23 @@ peer on the gateway, exactly like the buyer-WireGuard peer push):
   PB_EGRESS_GATEWAY_ENDPOINT  host:port of the gateway wg-egress listener
   PB_EGRESS_ADDR              this node's tunnel address, e.g. 10.9.0.7/32
   PB_EGRESS_MTU               tunnel MTU (default 1420)  -> clamp MSS = MTU-40
+  PB_EGRESS_DIRECT_HOSTS      comma-separated in-country object-storage hostnames (*.aliyuncs.com)
+                              reached DIRECTLY, not via the tunnel (normally pushed by the API in
+                              the heartbeat reply from EGRESS_DIRECT_STORAGE_HOSTS). Empty = off.
 Absent config -> disabled (a no-op), so existing nodes are unaffected until enrolled.
 """
 from __future__ import annotations
 
 import ipaddress
 import os
+import re
+import shlex
 import shutil
+import socket
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 
 IFACE = "wg-egress"
 TABLE = "51821"                       # dedicated route table id for buyer internet egress
@@ -190,14 +198,153 @@ def bridge_commands(subnet: str, wan: str, *, table: str = TABLE, mss: int | Non
     return cmds
 
 
+# ---- direct in-country object storage (bypasses the tunnel) -------------------------------------
+# Client audio/data to the platform's in-country bucket (Saudi: Alibaba OSS me-central-1) should
+# not be relayed (and billed) through the gateway. Only the exact resolved /32s of allowlisted
+# storage hostnames bypass; everything else stays tunnelled and fail-closed.
+DIRECT_ENV = "PB_EGRESS_DIRECT_HOSTS"
+DIRECT_COMMENT = "pb-egress-direct"
+MAX_DIRECT_HOSTS, MAX_DIRECT_IPS = 8, 32
+DIRECT_REFRESH_S = 300
+# Enforced HERE (not only on the API): a bad push can never open a bypass to an arbitrary host.
+_DIRECT_HOST_RE = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+aliyuncs\.com")
+_LOCK = threading.RLock()            # heartbeat refresh vs job-start route_bridge (xtables lock)
+_direct_at = 0.0
+# One shared, fixed-size resolver pool + at most one lookup in flight per host: a hung getaddrinfo
+# can't be cancelled, so a timed-out one is re-awaited by the next refresh, never re-submitted.
+_DNS_POOL = ThreadPoolExecutor(max_workers=MAX_DIRECT_HOSTS, thread_name_prefix="pb-egress-dns")
+_DNS_LOCK = threading.Lock()
+_dns_inflight: dict = {}
+
+
+def direct_hosts(raw: str | None = None) -> list[str]:
+    """The validated direct-storage hostnames (bad entries dropped, capped)."""
+    hosts = []
+    for h in (os.getenv(DIRECT_ENV, "") if raw is None else raw).split(","):
+        h = h.strip().lower().rstrip(".")
+        if len(h) <= 253 and _DIRECT_HOST_RE.fullmatch(h) and h not in hosts:
+            hosts.append(h)
+    return hosts[:MAX_DIRECT_HOSTS]
+
+
+def _public_v4(ip: str) -> bool:
+    """A DNS answer may only become a bypass if it is a plain public unicast IPv4 address: never
+    private/loopback/link-local (169.254.169.254 metadata)/CGNAT/multicast/reserved."""
+    try:
+        a = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    return (a.is_global and not (a.is_multicast or a.is_reserved)
+            and not any(a in ipaddress.ip_network(n) for n in LOCAL_NETS))
+
+
+def direct_ips(hosts: list[str] | None = None, timeout: float = 5.0) -> list[str]:
+    """A records of the direct hosts (public IPv4 only, capped). DNS failure = no bypass."""
+    hosts = direct_hosts() if hosts is None else hosts
+    if not hosts:
+        return []
+    with _DNS_LOCK:
+        for h in hosts:
+            if h not in _dns_inflight or _dns_inflight[h].done():
+                _dns_inflight[h] = _DNS_POOL.submit(socket.getaddrinfo, h, 443, socket.AF_INET,
+                                                    socket.SOCK_STREAM)
+        futs = [_dns_inflight[h] for h in hosts]
+    done, _ = wait(futs, timeout=timeout)                 # a hung resolver never stalls a launch
+    ips = []
+    for f in futs:
+        if f in done and f.exception() is None:
+            for info in f.result():
+                ip = info[4][0]
+                if _public_v4(ip) and ip not in ips:
+                    ips.append(ip)
+    return ips[:MAX_DIRECT_IPS]
+
+
+def direct_commands(subnet: str, wan: str, ips) -> list[list[str]]:
+    """Per storage IP: ACCEPT bridge->IP out the WAN (inserted above the fail-closed DROP), then
+    keep that exact /32 in the main table. Docker's own per-bridge MASQUERADE NATs it out the NIC.
+    Pure, like bridge_commands. ACCEPT first so a half-applied pair never blackholes."""
+    ipaddress.ip_network(subnet, strict=False)
+    cmds = []
+    for ip in ips:
+        if not _public_v4(ip):
+            raise ValueError("direct storage address must be public IPv4")
+        cmds += [["iptables", "-I", "DOCKER-USER", "1", "-s", subnet, "-d", ip + "/32", "-o", wan,
+                  "-m", "comment", "--comment", DIRECT_COMMENT, "-j", "ACCEPT"],
+                 ["ip", "rule", "add", "from", subnet, "to", ip, "lookup", "main", "priority", "90"]]
+    return cmds
+
+
+def _direct_rules(subnet: str) -> dict:
+    """{ip: iptables -S rule} of this bridge's current direct-storage ACCEPTs. Raises when the chain
+    can't be listed: a failed listing must never read as "no bypass installed"."""
+    out = _run(["iptables", "-S", "DOCKER-USER"]).stdout or ""
+    found = {}
+    for line in out.splitlines():
+        a = shlex.split(line)
+        if ("--comment" in a and a[a.index("--comment") + 1] == DIRECT_COMMENT
+                and "-s" in a and a[a.index("-s") + 1] == subnet and "-d" in a):
+            found[a[a.index("-d") + 1].split("/")[0]] = a
+    return found
+
+
+def sync_direct(subnet: str, wan: str | None = None, ips=None) -> None:
+    """Make this bridge's direct-storage bypass match `ips` (default: resolve now). Stale IPs are
+    removed ACCEPT-first, so their traffic falls back to the tunnel, never to an open WAN. Raises if
+    the bypass rules can't be listed or a stale ACCEPT can't be removed."""
+    with _LOCK:
+        ips = direct_ips() if ips is None else ips
+        for ip, rule in _direct_rules(subnet).items():
+            if ip not in ips:
+                _run(["iptables", "-D", *rule[1:]])
+                subprocess.run(["ip", "rule", "del", "from", subnet, "to", ip, "lookup", "main",
+                                "priority", "90"], capture_output=True)
+        wan = wan or _wan_iface()
+        if ips and wan:
+            _apply(direct_commands(subnet, wan, ips))
+
+
+def _recorded_subnets() -> list[str]:
+    try:
+        names = [n for n in os.listdir(STATE_DIR) if n[:1] == "t" and n[1:].isdigit()]
+        return [s for s in (open(os.path.join(STATE_DIR, n)).read().strip() for n in names) if s]
+    except OSError:
+        return []
+
+
+def note_direct_hosts(raw) -> None:
+    """Heartbeat hook: adopt the API's host list and re-sync live bridges when it changed, or at
+    most every DIRECT_REFRESH_S (storage A records rotate). A failed sync raises and is retried on
+    the next heartbeat."""
+    global _direct_at
+    if not isinstance(raw, str):
+        return
+    if raw != os.getenv(DIRECT_ENV, ""):
+        os.environ[DIRECT_ENV] = raw
+        _direct_at = 0.0                                 # changed: re-sync now
+    if not enabled() or time.time() - _direct_at <= DIRECT_REFRESH_S:
+        return
+    ips = direct_ips() if _recorded_subnets() else []    # resolve outside the lock
+    with _LOCK:                                          # re-list: a bridge may have gone meanwhile
+        for sub in _recorded_subnets():
+            sync_direct(sub, ips=ips)
+    _direct_at = time.time()                             # only once every live bridge is in sync
+
+
 def route_bridge(subnet: str, wan: str | None = None) -> None:
-    """Apply bridge_commands idempotently (each rule checked before add)."""
+    """Apply bridge_commands idempotently (each rule checked before add), then sync the
+    direct-storage bypass. With PB_EGRESS_DIRECT_HOSTS empty that adds nothing (no DNS) but still
+    removes any bypass left on this subnet, e.g. by an agent that restarted without cleaning up."""
     wan = wan or _wan_iface()
     if not wan:
         raise RuntimeError("no WAN interface for egress fail-closed rule")
-    for cmd in bridge_commands(subnet, wan):
-        if cmd[:2] == ["ip", "rule"]:
-            check = ["ip", "rule"] + (["del"] if False else [])  # ip rule has no -C; dedup below
+    with _LOCK:
+        _apply(bridge_commands(subnet, wan))
+        sync_direct(subnet, wan)
+
+
+def _apply(cmds) -> None:
+    for cmd in cmds:
         # idempotency: skip if an equivalent rule already exists
         if cmd[0] == "iptables":
             probe = list(cmd)
@@ -217,6 +364,12 @@ def route_bridge(subnet: str, wan: str | None = None) -> None:
 def unroute_bridge(subnet: str, wan: str | None = None) -> None:
     """Remove this bridge's egress rules (best-effort; leaves the shared tunnel up)."""
     wan = wan or _wan_iface()
+    try:
+        stale = _direct_rules(subnet).values()
+    except Exception:                                        # noqa: BLE001 - the rest must still go
+        stale = ()
+    for rule in stale:                                             # direct-storage ACCEPTs
+        subprocess.run(["iptables", "-D", *rule[1:]], capture_output=True)
     while subprocess.run(["ip", "rule", "del", "from", subnet],
                          capture_output=True).returncode == 0:
         pass
@@ -261,11 +414,12 @@ def record(tid, subnet) -> None:
 def unroute_for_tid(tid) -> None:
     try:
         p = _state_path(tid)
-        if os.path.exists(p):
-            sub = open(p).read().strip()
-            if sub:
-                unroute_bridge(sub)
-            os.remove(p)
+        with _LOCK:                          # a heartbeat re-sync must not re-add rules mid-teardown
+            if os.path.exists(p):
+                sub = open(p).read().strip()
+                if sub:
+                    unroute_bridge(sub)
+                os.remove(p)
     except Exception:                                        # noqa: BLE001
         pass
 

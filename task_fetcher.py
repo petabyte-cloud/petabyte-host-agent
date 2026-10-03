@@ -250,6 +250,12 @@ def _note_egress_gateway(cfg):
     connection is cut."""
     if not isinstance(cfg, dict):
         return
+    if "PB_EGRESS_DIRECT_HOSTS" in cfg:                  # in-country storage reached directly
+        try:
+            import egress_vpn
+            egress_vpn.note_direct_hosts(cfg["PB_EGRESS_DIRECT_HOSTS"])
+        except Exception as e:                          # noqa: BLE001 - no bypass; tunnel still works
+            logging.warning(f"direct-storage egress sync failed: {e}")
     pub, endpoint = cfg.get("PB_EGRESS_GATEWAY_PUBKEY"), cfg.get("PB_EGRESS_GATEWAY_ENDPOINT")
     if not (isinstance(pub, str) and isinstance(endpoint, str)):
         return
