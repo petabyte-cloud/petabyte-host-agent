@@ -11,9 +11,14 @@ from pathlib import Path
 _SESSION = str(uuid.uuid4())
 
 
+# Fixed absolute paths only (never a PATH lookup). WSL2 ships nvidia-smi in /usr/lib/wsl/lib, so a
+# WSL node used to report no inventory at all, and with it no GPU UUID (2026-10-04).
+_NVIDIA_SMI = ("/usr/bin/nvidia-smi", "/usr/lib/wsl/lib/nvidia-smi")
+
+
 def _collect_nvidia():
     try:
-        command = "/usr/bin/nvidia-smi" if os.name != "nt" else str(
+        command = next((p for p in _NVIDIA_SMI if os.path.exists(p)), _NVIDIA_SMI[0]) if os.name != "nt" else str(
             Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe")
         output = subprocess.run([command, "--query-gpu=uuid,name,memory.total,pci.bus_id,pci.device_id,driver_version",  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args -- fixed nvidia-smi path (list form, no shell); args are literal constants, no remote/buyer input
                                  "--format=csv,noheader,nounits"], capture_output=True, text=True,
