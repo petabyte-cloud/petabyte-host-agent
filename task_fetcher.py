@@ -285,6 +285,8 @@ def heartbeat_loop():
                 pass  # optional support metadata never breaks liveness
             _storage = template_storage.heartbeat_report(globals().get("_TUN_GW", ""))
             if _storage is not None:
+                if _SEAL_PUB:                            # can unseal rental secrets into /run/secrets
+                    _storage["secrets_version"] = 1
                 _hb["template_storage"] = _storage
             try:
                 _hb["workload"] = _workload_report()     # admin abuse view; None when idle
@@ -2351,6 +2353,33 @@ def _watch_startup_script(tid, name, workdir, every_s=15):
             return
 
 
+def _unseal_secrets(task):
+    """The rental's secrets, unsealed in RAM with this node's key. Errors never carry a value."""
+    for _ in range(2 * HEARTBEAT_S):       # a just-restarted agent gets its key on the next heartbeat
+        if _SEAL_AES is not None:
+            break
+        time.sleep(1)
+    if _seal is None or _SEAL_AES is None:
+        raise RuntimeError("rental secrets refused: this node has no seal key yet")
+    try:
+        data = json.loads(_seal.unseal(_SEAL_AES, task["secrets_sealed"], aad=str(task["task_id"]).encode()))
+    except Exception:  # noqa: BLE001
+        raise RuntimeError("rental secrets could not be unsealed on this node") from None
+    if not isinstance(data, dict) or not all(
+            isinstance(k, str) and nb_fetch.SECRET_NAME.fullmatch(k) and isinstance(v, str)
+            for k, v in data.items()):
+        raise RuntimeError("rental secrets payload is malformed")
+    return data
+
+
+def _deliver_secrets(tid, name, secrets):
+    try:
+        nb_fetch.write_secrets(name, secrets)
+    except Exception:  # noqa: BLE001 — docker's stderr could echo nothing useful; keep it value-free
+        raise RuntimeError("rental secrets could not be written to /run/secrets") from None
+    report_log(tid, f"{len(secrets)} secret(s) delivered to {nb_fetch.SECRETS_DIR} (in-memory tmpfs)")
+
+
 def _run_template(task):
     """Launch a one-click stack (Ollama/vLLM/ComfyUI/game server/...) and report it."""
     if task.get("port") and not _reverse_tunnel_enabled():
@@ -2533,8 +2562,12 @@ def _run_template(task):
     _template_env = dict(task.get("env") or {})
     if task.get("model_env") and model:
         _template_env[task["model_env"]] = model
+    _secrets = None
     try:
         try:
+            if task.get("secrets_sealed"):        # fail the launch (refunded) rather than run without
+                _secrets = _unseal_secrets(task)
+                cmd += list(nb_fetch.SECRETS_TMPFS)
             if task.get("snapshot"):              # the buyer's own baked image, verified before load
                 import image_snapshot
                 image = image_snapshot.load(task["snapshot"], tid)
@@ -2562,6 +2595,9 @@ def _run_template(task):
             cid = run.stdout.strip()
         finally:
             _remove_env_file(task)
+        if _secrets is not None:                  # before the startup script, which may read them
+            _deliver_secrets(tid, name, _secrets)
+            _secrets = None
         _register_vm(tid, name)  # watchdog: detect if this container dies
         if _service_bridge:
             _persist_port_bridges()  # a restart must never rebind a different rental's service
@@ -3504,7 +3540,7 @@ _MINER_RE = re.compile(
     r"(?i)(?:^|[/\s])(?:wildrig\S*|xmrig\S*|srbminer\S*|t-?rex|teamredminer|lolminer|nbminer|bzminer|rigel"
     r"|nanominer|phoenixminer|cryptodredge|bminer|tt-?miner|tbminer|ccminer|sgminer|ethminer|minerd"
     r"|cpuminer\S*|urx-isotope-cpuminer\S*|cgminer|bfgminer|excavator|xmr-stak\S*|miniz|verthashminer"
-    r"|gminer|onezerominer|kawpowminer|z-enemy|nheqminer)(?:\.exe)?(?:\s|$)|stratum\d?\+(?:tcp|ssl|tls)://")
+    r"|gminer|onezerominer|kawpowminer|z-enemy|nheqminer|peakminer\S*)(?:\.exe)?(?:\s|$)|stratum\d?\+(?:tcp|ssl|tls)://")
 _MINER_CHECK_S = 60
 
 

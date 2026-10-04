@@ -181,6 +181,99 @@ with patch("subprocess.run", side_effect=subprocess.CalledProcessError(
 ok("a script that cannot start says why and leaves the rental up",
    any(m.startswith("startup script could not start") and "Read-only" in m for m in _logs))
 
+# ------------------------------------------------------------------ sealed rental secrets
+import json
+
+import workload_seal as _ws
+
+_aes = _ws.new_aes_key()
+_SECRET = "AGE-SECRET-KEY-1-NEVER-IN-ARGV"
+_TOKEN = "prt_eyJ-rental-storage-token"
+_sealed = _ws.seal(_aes, json.dumps({"AUDIO_KEY": _SECRET, "PETABYTE_STORAGE_TOKEN": _TOKEN}).encode(),
+                   aad=b"40")
+tf._SEAL_AES = _aes
+_logs.clear()
+_results.clear()
+_order = []
+tf._watch_startup_script = lambda tid, name, workdir: None
+
+
+_env_files = []
+
+
+def _fake_run(argv, **kw):
+    if argv[:2] == ["docker", "run"] and "--env-file" in argv:   # read it before the agent deletes it
+        with open(argv[argv.index("--env-file") + 1]) as fh:
+            _env_files.append(fh.read())
+    _order.append(("script" if ".pb-startup.sh" in str(argv) else
+                   "secret" if "/run/secrets/" in str(argv[-1]) else "other", argv, kw))
+    return Mock(returncode=0, stdout="cid40\n", stderr="")
+
+
+with patch("shutil.which", return_value="/usr/bin/docker"), patch("subprocess.run", side_effect=_fake_run):
+    tf._run_template(dict(_task, task_id=40, template="pytorch", cache="/home/jovyan/work",
+                          secrets_sealed=_sealed, env={"MODEL_SIZE": "large"},
+                          params={"startup_script": "cat /run/secrets/AUDIO_KEY >/dev/null"}))
+_docker_run = next(a for k, a, _ in _order if a[:2] == ["docker", "run"])
+# mode=1777 (sticky, like /tmp) is explicit and deliberate: docker exec runs as the image's own user
+# (root or e.g. jovyan), which must be able to create its 0400 files there; a root-owned 0700 dir
+# would lock a non-root image's startup script out of its own secrets.
+ok("secrets: the container gets an in-memory tmpfs at /run/secrets with explicit options",
+   "--tmpfs" in _docker_run
+   and _docker_run[_docker_run.index("--tmpfs") + 1]
+   == "/run/secrets:rw,noexec,nosuid,nodev,size=1m,mode=1777")
+ok("secrets: no value reaches the docker argv or any -e flag",
+   not any(_SECRET in str(a) or _TOKEN in str(a) for _, a, _ in _order) and "-e" not in _docker_run)
+ok("secrets: the --env-file holds the plain env only, never a secret or the token",
+   len(_env_files) == 1 and "MODEL_SIZE=large" in _env_files[0]
+   and _SECRET not in _env_files[0] and _TOKEN not in _env_files[0])
+_writes = [(a, kw) for k, a, kw in _order if k == "secret"]
+ok("secrets: each one is written with docker exec -i, the value on stdin, umask 277 (0400)",
+   len(_writes) == 2 and all(a[:3] == ["docker", "exec", "-i"] and "umask 277" in a[-1] for a, _ in _writes)
+   and {kw.get("input") for _, kw in _writes} == {_SECRET.encode(), _TOKEN.encode()})
+ok("secrets: the storage token lands as /run/secrets/PETABYTE_STORAGE_TOKEN",
+   any(a[-1].endswith("/run/secrets/PETABYTE_STORAGE_TOKEN") for a, _ in _writes))
+_kinds = [k for k, _, _ in _order]
+ok("secrets: written BEFORE the startup script runs",
+   "script" in _kinds and max(i for i, k in enumerate(_kinds) if k == "secret") < _kinds.index("script"))
+ok("secrets: never in an agent log line; the log says where they went",
+   not any(_SECRET in m or _TOKEN in m for m in _logs) and any("/run/secrets" in m for m in _logs))
+
+# Fail closed: a blob sealed for another task, or a write that fails, fails the launch (refunded).
+_logs.clear()
+_results.clear()
+with patch("shutil.which", return_value="/usr/bin/docker"), \
+     patch("subprocess.run", return_value=Mock(returncode=0, stdout="cid41\n", stderr="")) as _run:
+    tf._run_template(dict(_task, task_id=41, template="pytorch", secrets_sealed=_sealed, params={}))
+ok("secrets: a blob bound to another task id is refused before any container starts",
+   not any(c.args[0][:2] == ["docker", "run"] for c in _run.call_args_list)
+   and _results and _results[-1]["status"] == "failed" and "unsealed" in _results[-1]["result"])
+_logs.clear()
+_results.clear()
+
+
+def _write_fails(argv, **kw):
+    if "/run/secrets/" in str(argv[-1]):
+        raise subprocess.CalledProcessError(1, argv, "", "sh: can't create: " + _SECRET)
+    return Mock(returncode=0, stdout="cid42\n", stderr="")
+
+
+_sealed42 = _ws.seal(_aes, json.dumps({"AUDIO_KEY": _SECRET}).encode(), aad=b"42")
+with patch("shutil.which", return_value="/usr/bin/docker"), patch("subprocess.run", side_effect=_write_fails):
+    tf._run_template(dict(_task, task_id=42, template="pytorch", secrets_sealed=_sealed42, params={}))
+ok("secrets: a failed write fails the launch with a value-free reason",
+   _results and _results[-1]["status"] == "failed" and "/run/secrets" in _results[-1]["result"]
+   and not any(_SECRET in str(x) for x in _results + _logs))
+tf._SEAL_AES = None
+tf.HEARTBEAT_S = 0
+_results.clear()
+with patch("shutil.which", return_value="/usr/bin/docker"), \
+     patch("subprocess.run", return_value=Mock(returncode=0, stdout="cid43\n", stderr="")) as _run:
+    tf._run_template(dict(_task, task_id=43, template="pytorch", secrets_sealed=_sealed, params={}))
+ok("secrets: no seal key on the node -> launch refused, no container",
+   not any(c.args[0][:2] == ["docker", "run"] for c in _run.call_args_list)
+   and _results and "no seal key" in _results[-1]["result"])
+
 print()
 print("=== template launch: " + ("0 failures" if _fail == 0 else str(_fail) + " FAILED") + " ===")
 raise SystemExit(1 if _fail else 0)

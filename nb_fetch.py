@@ -41,6 +41,26 @@ def prefetch_notebook(container: str, cache_dir: str, url: str):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True)
 
 
+# Rental secrets (template_params.secrets): unsealed in the agent's RAM, written into a tmpfs inside
+# the buyer's container — never docker env/argv, an agent log or the seller's disk. Mode 1777 like
+# /tmp: the container's OWN user (root, or e.g. jovyan) writes each file 0400 over docker exec; a
+# root-owned 0700 dir would lock a non-root image's startup script out of its own secrets.
+SECRETS_DIR = "/run/secrets"
+SECRETS_TMPFS = ("--tmpfs", SECRETS_DIR + ":rw,noexec,nosuid,nodev,size=1m,mode=1777")
+SECRET_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def write_secrets(container: str, secrets: dict):
+    """One `docker exec -i` per secret, the value on stdin (same pattern as the startup script)."""
+    for name, value in secrets.items():
+        if not SECRET_NAME.fullmatch(name):
+            raise ValueError("invalid secret name")
+        subprocess.run(["docker", "exec", "-i", container, "sh", "-c",
+                        f"umask 277 && cat > {SECRETS_DIR}/{name}"],
+                       input=value.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=15, check=True)
+
+
 # Unattended startup script (template_params.startup_script, e.g. a scheduled rental).
 STARTUP_LOG = "startup.log"
 STARTUP_EXIT = "startup.exitcode"

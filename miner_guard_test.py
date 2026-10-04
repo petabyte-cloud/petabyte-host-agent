@@ -28,6 +28,8 @@ ok("a renamed binary pointing at a stratum pool is caught",
    tf._miner_hit(PS + "9999  ./job -o stratum+tcp://pool.example:3333 -u wallet\n"))
 ok("t-rex / lolminer / xmrig are caught",
    all(tf._miner_hit(PS + f"9999  /root/{b} --a\n") for b in ("t-rex", "lolminer", "xmrig")))
+ok("peakminer is caught by NAME even without a stratum URL on the args (2026-10-04 case)",
+   tf._miner_hit(PS + "9999  ./peakminer --coin pearl -o prl.kryptex.network:7048 -u prl1wallet\n"))
 ok("the owner's reference list is enforced (Linux names and .exe under wine)",
    all(tf._miner_hit(PS + f"9999  /opt/m/{b} -a x\n") for b in (
        "SRBMiner-MULTI", "cryptodredge", "cpuminer-avx2-sha-vaes", "urx-isotope-cpuminer-avx512",
