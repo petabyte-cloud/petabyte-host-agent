@@ -565,7 +565,8 @@ ok("VRAM wipe tries nvidia-smi --gpu-reset then a cached CUDA memset image",
 ok("the VRAM memset overwrites free device memory with zeros",
    "torch.zeros" in tf._VRAM_WIPE_PY and "mem_get_info" in tf._VRAM_WIPE_PY)
 ok("VRAM wipe only uses a LOCALLY-CACHED image (no multi-GB pull on the hot path)",
-   '"image", "inspect"' in inspect.getsource(tf._cuda_wipe_image))
+   "_cached_cuda_images" in inspect.getsource(tf._cuda_wipe_image)
+   and '"image", "inspect"' in inspect.getsource(tf._cached_cuda_images))
 ok("VRAM wipe never raises (best-effort, time-bounded)",
    "except Exception" in _wipe_src and "VRAM_WIPE_TIMEOUT_S" in _wipe_src)
 

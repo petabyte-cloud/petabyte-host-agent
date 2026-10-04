@@ -1113,21 +1113,28 @@ _VRAM_WIPE_PY = (
     "print('pb-vram-wiped', torch.cuda.device_count())\n")
 
 
-def _cuda_wipe_image():
-    """Pick a locally-CACHED CUDA-capable image to run the VRAM memset, so wiping never triggers a
-    multi-GB pull on the teardown/claim hot path. Returns None if none is cached (caller then just
-    logs a recommendation rather than stalling)."""
+def _cached_cuda_images():
+    """The locally-CACHED CUDA-capable images, in wipe_image_candidates order (never pulls)."""
     import subprocess
+    found = []
     for img in gpu_runtime.wipe_image_candidates():
         if not img:
             continue
         try:
             if subprocess.run(["docker", "image", "inspect", img],
                               capture_output=True, timeout=10).returncode == 0:
-                return img
-        except Exception:                                # noqa: BLE001
-            return None
-    return None
+                found.append(img)
+        except Exception:                                # noqa: BLE001 - check the next candidate
+            continue
+    return found
+
+
+def _cuda_wipe_image():
+    """Pick a locally-CACHED CUDA-capable image to run the VRAM memset, so wiping never triggers a
+    multi-GB pull on the teardown/claim hot path. Returns None if none is cached (caller then just
+    logs a recommendation rather than stalling)."""
+    found = _cached_cuda_images()
+    return found[0] if found else None
 
 
 def _wipe_gpu_vram(tid=None):
@@ -2722,21 +2729,60 @@ def _measure_fp16_tflops(n=None):
     Runs in a SHORT-LIVED child process: in-process, torch's CUDA context (~1.5 GB with the cuBLAS
     workspace) stayed resident for the agent's whole life — VRAM a buyer pays for, and a live
     compute client that makes `nvidia-smi --gpu-reset` (the preferred VRAM wipe) impossible.
-    (Reported by a seller from nvidia-smi, 2026-09-23.) The context dies with the child."""
-    import subprocess, sys
+    (Reported by a seller from nvidia-smi, 2026-09-23.) The context dies with the child.
+
+    NVIDIA: the child is a container of the locally CACHED CUDA image the VRAM wipe already needs,
+    so a host torch is no longer required (install.sh skipped its 2.8 GB download from 2026-10-04),
+    and a newer torch's CUDA build never has to match the host driver. Host torch stays the fallback
+    (and the AMD path); once the image has worked, an old install's host torch is removed. That
+    leaves no host fallback by design: an image that cannot run GPU containers also fails the
+    mandatory VRAM wipe, so the node refuses every GPU job until its image works again anyway."""
+    import shutil, subprocess, sys
     try:
         n = int(n or os.getenv("BENCH_MATMUL_N", "8192"))
         iters = int(os.getenv("BENCH_MATMUL_ITERS", "30"))
-        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args -- fixed Python source, integer-only argv, no shell.
-        p = subprocess.run([sys.executable, "-c", _FP16_BENCH_PY, str(n), str(iters)],
-                           capture_output=True, text=True, timeout=600)
-        dt = float((p.stdout or "").strip().splitlines()[-1]) if p.returncode == 0 else 0.0
+        args = ["-c", _FP16_BENCH_PY, str(n), str(iters)]
+        imgs = (_cached_cuda_images() if gpu_runtime.vendor() != "amd" and shutil.which("docker") else [])
+        runs = [["docker", "run", "--rm", "--pull", "never", *gpu_runtime.docker_gpu_args(), "--network",
+                 "none", "--label", "pb.kind=fp16-bench", img, "python", *args] for img in imgs]
+        runs.append([sys.executable, *args])                 # host torch (AMD, or no usable image)
+        dt = 0.0
+        for cmd in runs:
+            try:
+                # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args -- fixed Python source, integer-only argv, a locally cached image, no shell.
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                dt = float(p.stdout.strip().splitlines()[-1]) if p.returncode == 0 and p.stdout.strip() else 0.0
+            except Exception:                                # noqa: BLE001 - try the next way to run it
+                dt = 0.0
+            if dt > 0:
+                if cmd[0] == "docker":
+                    _drop_host_torch()
+                break
         if dt <= 0:
             return None
         flops = 2.0 * (n ** 3) * iters          # 2*N^3 per matmul
         return (round(flops / dt / 1e12, 1), n, round(dt / iters, 6))   # (TFLOPS, N, s/matmul)
     except Exception:                            # noqa: BLE001 — never crash the agent
         return None
+
+
+def _drop_host_torch():
+    """After a benchmark ran in the cached image: uninstall the host torch an older install.sh put in
+    this venv (torch, triton, nvidia-* CUDA wheels: several GB of a seller's disk). Checks what is
+    installed each time (cheap; benchmarks are rare), so a reinstalled torch goes too and a failed
+    uninstall is simply retried. Nothing else on the host imports it; the wipe, runtime check and
+    diagnostics run in images."""
+    import importlib.metadata as md
+    import subprocess, sys
+    try:
+        names = {(d.metadata["Name"] or "") for d in md.distributions()}
+        pkgs = sorted(n for n in names if n.lower() in ("torch", "triton")
+                      or (n.lower().startswith("nvidia-") and n.lower() != "nvidia-ml-py"))
+        if pkgs and subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", *pkgs],
+                                   capture_output=True, timeout=600).returncode == 0:
+            logging.info(f"removed host torch ({len(pkgs)} packages): the benchmark runs in the cached image")
+    except Exception:                            # noqa: BLE001 — disk cleanup is best-effort
+        pass
 
 
 # Timed FP16 GEMM; prints the elapsed seconds for `iters` matmuls (0 when there is no CUDA).

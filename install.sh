@@ -355,28 +355,31 @@ cd "$APP"
 python3 -m venv .venv
 .venv/bin/pip install -q -U pip
 .venv/bin/pip install -q -r requirements.txt
-# On a GPU node the FP16 authenticity benchmark (task_fetcher._measure_fp16_tflops) needs torch to
-# run the seeded GEMM proof; without it the benchmark returns 0, the node never becomes
-# hardware-verified, and it is silently NEVER listed. torch is intentionally out of requirements.txt
-# (CPU-only agents don't need a ~2 GB CUDA wheel), so install it here only when a GPU is present.
-if command -v nvidia-smi >/dev/null 2>&1; then
-  echo "==> installing torch for the GPU authenticity benchmark (GPU node)"
-  .venv/bin/pip install -q torch numpy || echo "WARN: torch install failed; node will register but stay UNVERIFIED until torch is present"
-elif command -v rocminfo >/dev/null 2>&1 || command -v rocm-smi >/dev/null 2>&1; then
-  echo "==> installing ROCm torch for the GPU authenticity benchmark (AMD node)"
-  .venv/bin/pip install -q --index-url https://download.pytorch.org/whl/rocm6.2 torch numpy || echo "WARN: rocm torch install failed; node stays UNVERIFIED until torch is present"
-fi
-
 # VRAM-wipe image. The agent REFUSES every GPU job unless it can first zero the previous tenant's
 # VRAM, and the wipe only runs from a LOCALLY cached CUDA image (it never pulls mid-job) — so a
 # fresh node used to refuse 100% of GPU rentals. Cache it now (one-time, ~3-4 GB). Blackwell
 # cards (compute capability >= 10: RTX 50-series, B200) need the CUDA 12.8 build.
+_wipe_ok=0
 if command -v nvidia-smi >/dev/null 2>&1 && [ "${AGENT_ALLOW_UNVERIFIED_VRAM:-false}" != "true" ]; then
   _cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | cut -d. -f1 || true)
   if [ "${_cc:-0}" -ge 10 ] 2>/dev/null; then _wipe=pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
   else _wipe=pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime; fi
   echo "==> caching the VRAM-wipe image $_wipe (one-time; GPU jobs are refused without it)"
-  .venv/bin/python template_storage.py prepare "$_wipe" >/dev/null || echo "WARN: could not cache $_wipe; GPU jobs will be refused until: docker pull $_wipe"
+  if .venv/bin/python template_storage.py prepare "$_wipe" >/dev/null; then _wipe_ok=1
+  else echo "WARN: could not cache $_wipe; GPU jobs will be refused until: docker pull $_wipe"; fi
+fi
+
+# The FP16 authenticity benchmark (task_fetcher._measure_fp16_tflops) needs torch; without it the
+# node never becomes hardware-verified. On NVIDIA it runs INSIDE the image cached above, which
+# already carries torch + CUDA, so the host needs no second copy (2.8 GB download, 2026-10-04).
+# Host torch only where that image is unavailable: AMD, a node that skips the wipe image, or a
+# failed pull. torch is intentionally out of requirements.txt (CPU-only agents never need it).
+if command -v nvidia-smi >/dev/null 2>&1 && [ "$_wipe_ok" != 1 ]; then
+  echo "==> installing torch for the GPU authenticity benchmark (no cached CUDA image)"
+  .venv/bin/pip install -q torch numpy || echo "WARN: torch install failed; node will register but stay UNVERIFIED until torch is present"
+elif ! command -v nvidia-smi >/dev/null 2>&1 && { command -v rocminfo >/dev/null 2>&1 || command -v rocm-smi >/dev/null 2>&1; }; then
+  echo "==> installing ROCm torch for the GPU authenticity benchmark (AMD node)"
+  .venv/bin/pip install -q --index-url https://download.pytorch.org/whl/rocm6.2 torch numpy || echo "WARN: rocm torch install failed; node stays UNVERIFIED until torch is present"
 fi
 
 # Prove it BEFORE listing: build and remove a real per-rental network, exactly as a rental would.
