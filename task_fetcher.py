@@ -1102,13 +1102,19 @@ from nb_fetch import prefetch_notebook as _prefetch_notebook
 
 
 _VRAM_WIPE_PY = (
-    "import torch\n"
+    "import sys, torch\n"
     "for d in range(torch.cuda.device_count()):\n"
     "    torch.cuda.set_device(d)\n"
     "    free,_ = torch.cuda.mem_get_info()\n"
     "    n = int(free*0.92)\n"
     "    if n > 0:\n"
     "        buf = torch.zeros(n, dtype=torch.uint8, device='cuda')  # overwrite free VRAM with 0s\n"
+    "        # Verify the device actually holds zeros before we claim 'verified clear'. A silent\n"
+    "        # no-op (failed alloc, wrong device, driver quirk) would otherwise exit 0 and be\n"
+    "        # trusted. count_nonzero is an on-device reduction over the whole buffer (cheap, no\n"
+    "        # multi-GB host copy), so this checks every wiped byte, not a sample.\n"
+    "        if int(torch.count_nonzero(buf).item()) != 0:\n"
+    "            print('pb-vram-verify-failed', d); sys.exit(3)\n"
     "        del buf\n"
     "    torch.cuda.synchronize(); torch.cuda.empty_cache()\n"
     "print('pb-vram-wiped', torch.cuda.device_count())\n")
