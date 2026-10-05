@@ -8,8 +8,8 @@ The agent payload comes from the verified, signed bundle served at
 `https://petabyte.market/agent.tar.gz`. This README, the license and the verification public
 key are mirror metadata; they may be added or updated separately from that bundle.
 
-- **Release:** `016ef04c457a208848797129ebd5ebfcd2939270`
-- **Bundle SHA-256:** `5d8d1f664be43b85e946486a6ea22cc957fc8a44267d1d87e65a8fe6080751a8`
+- **Release:** `1d3b38025f41a29b73e437371ca664c065d571c6`
+- **Bundle SHA-256:** `9501de1eed2f2fd06354886e0f4feedfc84c71c5b065f05b7db74685a58aad1e`
 
 Hosts never install or update from this repository. The installer pins our release public key
 (`release_ed25519.pub`, also in this repo), and the updater (`update.sh`) refuses any bundle whose

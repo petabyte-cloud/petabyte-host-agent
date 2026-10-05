@@ -152,7 +152,10 @@ def run(challenge, runner, prepare, isolation_flags, gpu_flags, task_id):
         # arriving), not a missing image; the server retries TIMEOUT without penalizing the seller.
         failure = ("TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired)
                    else "CACHE_POLICY" if "budget" in reason or "reserve" in reason else "IMAGE_UNAVAILABLE")
-        _report_failure(challenge["template"], task_id, "prepare", failure, exc)
+        # A TIMEOUT here means "still downloading": the pull keeps going (template_storage._pull) and
+        # the server retries, so it is not a node fault to email about (spec 269 sent 9 in 9 hours).
+        if failure != "TIMEOUT":
+            _report_failure(challenge["template"], task_id, "prepare", failure, exc)
         return dict(answer, failure=failure)
     try:
         # One permitted container variable for the catalog TensorFlow CUDA library path.

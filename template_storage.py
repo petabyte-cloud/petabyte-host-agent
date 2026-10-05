@@ -26,6 +26,44 @@ def docker(*args, timeout=30):
                           timeout=timeout, check=True).stdout.strip()
 
 
+_PULLS = {}   # image -> docker pull that outlived its caller's wait. Only touched under locked().
+
+
+def _reap_pulls():
+    """Close background pulls that SUCCEEDED (no zombie or open log per image). A failed one stays
+    until its image is asked for again, so that caller gets the real Docker error instead of a
+    fresh pull that hides it behind more timeouts. Called under locked()."""
+    for image, proc in list(_PULLS.items()):
+        if proc.poll() == 0:
+            _PULLS.pop(image, None)
+            proc.pb_log.close()
+
+
+def _pull(image, timeout):
+    """`docker pull` that is NOT killed when the caller stops waiting. Docker cancels a pull whose
+    client goes away and discards the half-downloaded layer, so on a link that needs longer than one
+    wait for the biggest layer the image could never arrive: spec 269 (RTX 3090) timed out every
+    hourly 120 s template probe on 2026-10-04/05. The pull keeps going after TimeoutExpired; the next
+    prepare joins it (or finds the image). Output goes to a file, so a full pipe never stalls it.
+    Must run under locked() (prepare does), which serialises _PULLS."""
+    import tempfile
+    proc = _PULLS.get(image)
+    if proc is None:                                # a finished one is consumed below: its result
+        log = tempfile.TemporaryFile()
+        proc = subprocess.Popen(["docker", "pull", "--", image], stdout=log, stderr=subprocess.STDOUT)
+        proc.pb_log = log
+        _PULLS[image] = proc
+    rc = proc.wait(timeout=timeout)                 # TimeoutExpired: still downloading, left running
+    _PULLS.pop(image, None)
+    try:
+        proc.pb_log.seek(0)
+        out = proc.pb_log.read().decode("utf-8", errors="replace")[-4000:]
+    finally:
+        proc.pb_log.close()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, ["docker", "pull", image], output=out)
+
+
 @contextlib.contextmanager
 def locked():
     import fcntl
@@ -94,6 +132,7 @@ def collect(state, *, all_owned=False):
 def prepare(image, task_id, *, cached_only=False, timeout=900):
     """Return cached/downloaded; caller must run with --pull=never after this check."""
     with locked():
+        _reap_pulls()
         state = read()
         collect(state)
         save(state)
@@ -101,19 +140,26 @@ def prepare(image, task_id, *, cached_only=False, timeout=900):
             raise RuntimeError("Seller free disk reserve prevents launch")
         existing = inspect(image)
         outcome = "cached"
+        pending = state.setdefault("pending", {})   # image -> image IDs present before its pull began
         if existing is None:
             if cached_only:
                 raise RuntimeError("Buyer selected cached image only; image is not cached")
             budget, reserve = policy()
             if budget == 0 or free_bytes() < reserve:
                 raise RuntimeError("Seller image budget/free disk reserve prevents download")
-            # Check ALL pre-existing IDs, not just this tag. Another tag can share an image.
-            before = set(docker("image", "ls", "-aq", "--no-trunc").splitlines())
-            docker("pull", image, timeout=max(1, min(int(timeout), 3600)))
+            # Check ALL pre-existing IDs, not just this tag. Another tag can share an image. A pull an
+            # earlier call left running keeps that call's snapshot, so ownership is still exact.
+            if image not in pending:
+                pending[image] = sorted(docker("image", "ls", "-aq", "--no-trunc").splitlines())
+                save(state)
+            _pull(image, timeout=max(1, min(int(timeout), 3600)))   # TimeoutExpired: keeps downloading
             existing = inspect(image)
             if existing is None:
                 raise RuntimeError("Downloaded image is unavailable")
+        if image in pending:                        # pulled now, or by a pull an earlier call left running
+            before = set(pending.pop(image))
             image_id = existing["Id"]
+            budget, reserve = policy()
             if image_id not in before:
                 state["images"][image_id] = {"ref": image, "bytes": int(existing["Size"]),
                                               "used_at": time.time(), "task_id": task_id}

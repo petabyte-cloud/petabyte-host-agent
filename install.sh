@@ -39,8 +39,6 @@ case "$_KEEP_AWAKE" in true|false) ;; *) _KEEP_AWAKE="$_KEEP_AWAKE_DEFAULT" ;; e
 
 : "${PETABYTE_API_URL:?set PETABYTE_API_URL}"
 : "${PETABYTE_API_KEY:?set PETABYTE_API_KEY (create one on the /install page)}"
-REPO="${PETABYTE_REPO:-https://github.com/petabyte-cloud/petabyte.git}"
-SUBDIR="${PETABYTE_AGENT_SUBDIR:-lumaris_agent}"
 APP=/opt/petabyte-agent
 ENVF=/etc/petabyte/agent.env
 KEYF=/etc/petabyte/agent_ed25519.key
@@ -49,7 +47,7 @@ mkdir -p /etc/petabyte  # BUGFIX: create before egress-firewall block writes int
 echo "==> installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y python3 python3-venv git curl ca-certificates rsync wireguard-tools
+apt-get install -y python3 python3-venv curl ca-certificates rsync wireguard-tools
 
 echo "==> fetching agent"
 mkdir -p "$APP" /var/lib/petabyte-agent
@@ -60,17 +58,18 @@ if [ -f "./task_fetcher.py" ]; then
   cp -r ./* "$APP"/                          # running from inside lumaris_agent/ locally
 else
   TMP=$(mktemp -d)
-  # Preferred: fetch the agent bundle from OUR server (no GitHub needed => works when the
-  # repo is private, and no host ever holds a git credential).
-  if curl -fsSL "$PETABYTE_API_URL/agent.tar.gz" -o "$TMP/agent.tar.gz" 2>/dev/null \
-     && tar -xzf "$TMP/agent.tar.gz" -C "$TMP" 2>/dev/null && [ -d "$TMP/lumaris_agent" ]; then
+  # The agent bundle comes from OUR server only. A `git clone` fallback used to follow, but the repo
+  # is private (a seller's clone could never succeed), it bypassed the served bundle, and it made
+  # every node install git (2026-10-04).
+  if curl -fsSL "$PETABYTE_API_URL/agent.tar.gz" -o "$TMP/agent.tar.gz" \
+     && tar -xzf "$TMP/agent.tar.gz" -C "$TMP" && [ -d "$TMP/lumaris_agent" ]; then
     cp -r "$TMP/lumaris_agent/." "$APP"/
     sha256sum "$TMP/agent.tar.gz" | cut -d' ' -f1 > /var/lib/petabyte-agent/bundle.sha256
   else
-    # Fallback: clone the repo (needs access if the repo is private).
-    echo "==> agent bundle unavailable, falling back to git clone"
-    git clone --depth 1 "$REPO" "$TMP/repo"
-    cp -r "$TMP/repo/$SUBDIR/." "$APP"/
+    echo "!! could not download, unpack or validate the agent bundle from $PETABYTE_API_URL/agent.tar.gz" >&2
+    echo "!! (connection, or the server sent a bad bundle). Re-run the installer; if it keeps failing, contact support." >&2
+    rm -rf "$TMP"
+    exit 1
   fi
   rm -rf "$TMP"
 fi

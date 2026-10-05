@@ -277,6 +277,7 @@ def heartbeat_loop():
             import hardware_evidence
             _hb = {"spec_id": int(SPEC_ID), "hardware_evidence": hardware_evidence.collect(),
                    "selling_now": _advertise_selling_now(),  # JIT also waits for tunnel enrollment
+                   "gpu_busy": _gpu_busy_report(),           # why it is not offered (busy-GPU guard)
                    "remote_fixes": _fixes.enabled()}  # owner allowed signed support fixes
             try:
                 import diagnostics
@@ -1964,7 +1965,67 @@ def _advertise_selling_now():
     """
     scheduled = _selling_now()
     return scheduled and (not os.getenv("PROVIDER", "").startswith("pb-jit-")
-                          or _reverse_tunnel_enabled())
+                          or _reverse_tunnel_enabled()) and not _gpu_busy_elsewhere()
+
+
+# Busy-GPU guard (owner 2026-10-05). A GPU already loaded by something that is not ours (a miner on
+# the host, the seller's own work) is not offered: a renter would get a fraction of the card, and a
+# seller could rent it to a second account of theirs while it mines. Spec 269 held 100 %/300 W/3.4 GB
+# for 8 h with no process or container visible to the agent. Sampled once a minute, only while
+# nothing of ours runs; GPU_BUSY_SAMPLES readings in a row flip the state either way.
+GPU_BUSY_UTIL = int(os.getenv("GPU_BUSY_UTIL_PCT", "50"))
+GPU_BUSY_MEM_MB = int(os.getenv("GPU_BUSY_MEM_MB", "2048"))
+GPU_BUSY_SAMPLES = 3
+_GPU_BUSY = {"busy": False, "since": None, "last": 0.0, "window": [], "detail": None}
+
+
+def _ours_running():
+    """Any container of ours (rental, probe, wipe, benchmark, idle miner) running, or Docker unsure."""
+    try:
+        r = subprocess.run(["docker", "ps", "--format", "{{.Labels}}"], capture_output=True, text=True,
+                           timeout=10)
+    except Exception:                                    # noqa: BLE001 — unsure: no new evidence
+        return True
+    return r.returncode != 0 or any("pb." in line or "market.petabyte" in line
+                                    for line in r.stdout.splitlines())
+
+
+def _gpu_busy_elsewhere(now=None):
+    st = _GPU_BUSY
+    now = time.time() if now is None else now
+    if now - st["last"] < 60:
+        return st["busy"]
+    st["last"] = now
+    if not gpu_runtime.has_gpu() or _rental_live() or _JOB_RUNNING.is_set() or _ours_running():
+        st["window"].clear()                             # our own load proves nothing either way
+        return st["busy"]
+    usage = _gpu_usage()
+    if not usage:                                        # nvidia-smi failed (stalls under load): no evidence
+        st["window"].clear()
+        return st["busy"]
+    hits = [g for g in usage
+            if (g.get("util") or 0) >= GPU_BUSY_UTIL or (g.get("mem_mb") or 0) >= GPU_BUSY_MEM_MB]
+    st["window"] = (st["window"] + [bool(hits)])[-GPU_BUSY_SAMPLES:]
+    if len(st["window"]) == GPU_BUSY_SAMPLES:
+        if all(st["window"]) and not st["busy"]:
+            st.update(busy=True, since=int(now), detail=hits[0])
+            logging.warning("GPU busy with something outside Petabyte (%s): not offered to buyers", hits[0])
+            if _con:
+                _con.line("busy", "GPU is busy with another program: not offered until it is idle")
+        elif not any(st["window"]) and st["busy"]:
+            st.update(busy=False, since=None, detail=None)
+            logging.info("GPU idle again: offered to buyers")
+    return st["busy"]
+
+
+def _gpu_busy_report():
+    """Heartbeat field while the guard holds the node off sale, so the seller is told why."""
+    st = _GPU_BUSY
+    if not st["busy"]:
+        return None
+    d = st["detail"] or {}
+    return {"since": st["since"], "util": d.get("util"), "mem_mb": d.get("mem_mb"),
+            "power_w": d.get("power_w")}
 
 
 def _TUN_PORT_BUSY(stderr_line: str) -> bool:
