@@ -163,16 +163,6 @@ def handle_cli(argv) -> bool:
                            "disk_reserve_bytes": int(template_storage.policy()[1])}
         print(json.dumps(state, indent=2))
         return True
-    if args and args[0] == "mining":
-        try:
-            import idle_mining
-        except ImportError:  # this file is shared with desktop-app, which ships no miner
-            raise SystemExit("Idle mining is only available in the seller agent install.") from None
-        action = args[1] if len(args) > 1 else "status"
-        if action not in ("status", "enable", "disable"):
-            raise SystemExit("Usage: python main.py mining [status|enable|disable]")
-        idle_mining.control(action)
-        return True
     if any(a in ("-h", "--help", "help") for a in args):
         cli_ui.out.line(_help())
         return True

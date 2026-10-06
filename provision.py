@@ -425,7 +425,7 @@ def _write_env(env_path, API, KEY, spec_id, key_path, egress_env):
     # mode) instead of open()-then-chmod, which leaves a brief window where the key file is
     # world/group-readable at the default umask.
     # O_TRUNC rewrites the file, so anything the operator put here — PRICE_PER_HOUR,
-    # PB_TUNNEL_GATEWAY, AGENT_ALLOW_UNVERIFIED_VRAM, idle-mining addresses — used to be silently
+    # PB_TUNNEL_GATEWAY, AGENT_ALLOW_UNVERIFIED_VRAM — used to be silently
     # deleted on every re-provision. The agent then came back up missing settings the operator
     # believed were set, which is the worst kind of failure: quiet and blamed on something else.
     # Carry over every line we do not own.

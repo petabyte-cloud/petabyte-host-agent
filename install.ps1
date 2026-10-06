@@ -182,7 +182,6 @@ $sh = @(
     "export PETABYTE_KEEP_AWAKE='$($env:PETABYTE_KEEP_AWAKE)'",
     "export PRICE_PER_HOUR='$(if ($env:PRICE_PER_HOUR) { $env:PRICE_PER_HOUR } else { '' })'",
     "export PETABYTE_SELL_SCHEDULE='$(if ($env:PETABYTE_SELL_SCHEDULE) { $env:PETABYTE_SELL_SCHEDULE } else { 'always' })'",
-    "export PETABYTE_IDLE_MINING='$(if ($env:PETABYTE_IDLE_MINING) { $env:PETABYTE_IDLE_MINING } else { 'true' })'",
     "export UNITS='$(if ($env:UNITS) { $env:UNITS } else { '1' })'",
     "export GPU_MODEL='$($env:GPU_MODEL)'",
     "export PETABYTE_KATA='$(if ($env:PETABYTE_KATA) { $env:PETABYTE_KATA } else { '' })'",

@@ -424,22 +424,8 @@ fi
 # agent.env files are treated as 20 GiB by task_fetcher.py, so upgrading never opts a node out.
 grep -q '^AGENT_JOB_DISK_GB=' "$ENVF" 2>/dev/null || echo 'AGENT_JOB_DISK_GB=20' >> "$ENVF"
 
-# Idle mining. Default ON, seeding the payout address the server baked in (__PB_DOGE_ADD__ =
-# MINING_DOGE_ADDRESS). A DISTRIBUTION build (e.g. the agent bundled inside another installer)
-# forces it OFF by exporting PETABYTE_IDLE_MINING=false before running this script: the node then
-# seeds PETABYTE_IDLE_MINING=false and NO payout address at all, so it can never mine. Always
-# yields to paid work; toggle any time with: petabyte agent mining disable
-_mine="${PETABYTE_IDLE_MINING:-true}"
-# An explicit opt-out must also override settings left by an older installation.
-if [ "$_mine" = "false" ]; then
-  sed -i '/^PETABYTE_IDLE_MINING=/d; /^DOGE_ADD=/d' "$ENVF"
-fi
-_doge=__PB_DOGE_ADD__
-[ "$_mine" = "true" ] || _doge=""        # mining off => never seed a mining payout address
-for setting in "PETABYTE_IDLE_MINING=$_mine" "DOGE_ADD=$_doge"; do
-  key=${setting%%=*}
-  grep -q "^${key}=" "$ENVF" || printf '%s\n' "$setting" >> "$ENVF"
-done
+# Idle mining was removed (2026-10-06): drop the settings an older install left behind.
+sed -i '/^PETABYTE_IDLE_MINING=/d; /^DOGE_ADD=/d' "$ENVF" 2>/dev/null || true
 
 # Selling schedule: the node-local hours this machine offers its GPU for sale. The /install page
 # bakes the seller's pick into this env (default 09:00-17:00); a bare install defaults to always-on
@@ -448,15 +434,6 @@ done
 grep -q "^PETABYTE_SELL_SCHEDULE=" "$ENVF" || \
   printf 'PETABYTE_SELL_SCHEDULE=%s\n' "${PETABYTE_SELL_SCHEDULE:-always}" >> "$ENVF"
 
-if [ "$_mine" = "false" ]; then
-  echo "==> idle mining is OFF"
-elif grep -q "^DOGE_ADD=." "$ENVF"; then
-  echo "==> idle mining is ON by default, paying the payout address configured for this node"
-  echo "    in $ENVF (build the GPU miner image to start). Disable: petabyte agent mining disable"
-else
-  echo "==> idle mining is ON by default (inert until you set DOGE_ADD in $ENVF and build the"
-  echo "    GPU miner image); it pays only YOUR wallet. Disable: petabyte agent mining disable"
-fi
 
 echo "==> starting service"
 cp "$APP/petabyte-agent.service" /etc/systemd/system/petabyte-agent.service

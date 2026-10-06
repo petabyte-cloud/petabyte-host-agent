@@ -29,10 +29,8 @@ import template_storage
 
 import crypto
 import agent_scratch
-import idle_mining
 import inference_worker
 import fixes as _fixes
-import mining_income
 try:
     import workload_seal as _seal      # sealed-workload crypto (opt-in; unwrap+unseal in RAM only)
 except Exception:                       # noqa: BLE001 — older bundles may not ship it
@@ -301,15 +299,11 @@ def heartbeat_loop():
             _bundle = _agent_bundle()
             if _bundle:                               # which signed agent bundle this node runs
                 _hb["agent_bundle"] = _bundle
-            if os.getenv("PETABYTE_MINING_FLOOR") == "true":
-                _hb["mining_floor_enabled"] = True
-                _hb["mining_income"] = mining_income.heartbeat_report()
             if _SEAL_PUB:
                 _hb["seal_pubkey"] = _SEAL_PUB           # opt-in: let the platform wrap our AES key
             _caps = _confidential_caps()
             if _caps:
                 _hb["confidential"] = _caps                       # REPORTED caps (server stores as reported)
-            _mining_ticket = idle_mining.controller.ticket()
             _infer_ticket = inference_worker.controller.ticket()
             _inf = inference_worker.controller.report()
             if _inf is not None:
@@ -326,11 +320,6 @@ def heartbeat_loop():
                 try:
                     with _pb_vm_lock:
                         _live = any(not v.get("reported") for v in _pb_vm_watch.values())
-                    idle_mining.controller.heartbeat(_mining_ticket, _body.get("idle_mining"), live=_live)
-                except Exception as exc:
-                    logging.warning("Idle mining paused: %s", exc)
-                    idle_mining.controller.revoke()
-                try:
                     inference_worker.controller.heartbeat(_infer_ticket, _body.get("inference_worker"),
                                                           live=_live)
                 except Exception as exc:                 # noqa: BLE001 — never breaks liveness
@@ -2023,13 +2012,15 @@ _GPU_BUSY = {"busy": False, "since": None, "last": 0.0, "window": [], "detail": 
 
 
 def _ours_running():
-    """Any container of ours (rental, probe, wipe, benchmark, idle miner) running, or Docker unsure."""
+    """Any container of ours (rental, probe, wipe, benchmark, inference) running, or Docker unsure.
+    A miner is never ours (idle mining was removed 2026-10-06), even one carrying our old label: its
+    GPU load counts as busy-elsewhere, so the node is held off sale."""
     try:
         r = subprocess.run(["docker", "ps", "--format", "{{.Labels}}"], capture_output=True, text=True,
                            timeout=10)
     except Exception:                                    # noqa: BLE001 — unsure: no new evidence
         return True
-    return r.returncode != 0 or any("pb." in line or "market.petabyte" in line
+    return r.returncode != 0 or any(("pb." in line or "market.petabyte" in line) and "idle-miner" not in line
                                     for line in r.stdout.splitlines())
 
 
@@ -3973,7 +3964,6 @@ def job_loop():
     _restore_vm_watch()
     while True:
         try:
-            idle_mining.controller.polling()
             with _CLAIM_LOCK:
                 _fix_pending = _fixes.pending()
                 if not _fix_pending:
@@ -4005,12 +3995,6 @@ def job_loop():
                         _con.line("skip", f"outside selling hours — declined #{task.get('task_id')}")
                     continue
                 inference_worker.controller.before_work()   # a rental always gets the GPU first
-                try:
-                    idle_mining.controller.before_work()
-                except Exception:
-                    _post("/jobs/result", _signed_result(task["task_id"], status="failed",
-                                                        failure_cause="idle_miner_stop_failed"))
-                    continue
                 if (task.get("compute_mode", "STANDARD") == "CONFIDENTIAL"
                         or task.get("attestation_required") or task.get("required_gpu_confidential")
                         or task.get("required_cpu_tee")):
@@ -4089,36 +4073,22 @@ def job_loop():
         finally:
             _CURRENT_TASK["id"] = None
             _JOB_RUNNING.clear()
-            idle_mining.controller.after_work()
             inference_worker.controller.after_work()
         time.sleep(POLL_S)
 
 
-def _prepare_idle_mining_gpu(device):
-    """Reuse the cached VRAM overwrite on one device; never reset a seller's GPU."""
+def _remove_legacy_miner():
+    """Idle mining is gone (2026-10-06). An agent updated from a version that had it may still
+    hold its miner container: remove only those labelled containers, once, at startup."""
     import subprocess
-    image = _cuda_wipe_image()
-    if not image:
-        return False
     try:
-        active = subprocess.run(
-            ["nvidia-smi", "-i", device, "--query-compute-apps=pid", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=3, check=False,
-        )
-        # The agent holds its OWN resident CUDA context (attestation/capability probe); the
-        # gate is meant to detect a BUYER's compute job, so exclude our own pid.
-        others = [pp for pp in active.stdout.split()
-                  if pp.strip() and pp.strip() != str(os.getpid())]
-        if active.returncode or others:
-            return False
-        result = _run_docker(
-            ["docker", "run", "--rm", "--pull=never", "--gpus", f"device={device}",
-             "--network=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-             image, "python", "-c", _VRAM_WIPE_PY], timeout=45,
-        )
-        return result.returncode == 0
-    except Exception:  # noqa: BLE001 -- mining never bypasses failed memory preparation
-        return False
+        ids = subprocess.run(["docker", "ps", "-aq", "--filter", "label=market.petabyte.idle-miner=1"],
+                             capture_output=True, text=True, timeout=15, check=False).stdout.split()
+        for cid in ids:
+            if re.fullmatch(r"[0-9a-f]{12,64}", cid):
+                subprocess.run(["docker", "rm", "-f", cid], capture_output=True, timeout=30, check=False)
+    except Exception:                                    # noqa: BLE001 — never block startup
+        pass
 
 
 def _ensure_wipe_image_async():
@@ -4171,7 +4141,7 @@ def run_agent():
             _bg()
         except Exception:                                # noqa: BLE001 — never block startup
             _TUN_SETTLED.set()
-    idle_mining.controller.prepare_gpu = _prepare_idle_mining_gpu
+    _remove_legacy_miner()
     # The inference worker publishes through this node's own reverse tunnel (default gateway).
     inference_worker.controller.attach(
         open_tunnel=lambda port: _open_reverse_tunnel(port, "inference"),
@@ -4181,8 +4151,7 @@ def run_agent():
         inference_worker.stop_container()        # a server left behind by a previous agent run
     except Exception:                            # noqa: BLE001 — never block startup
         pass
-    mining_income.start()
-    _restore_vm_watch()  # recover detached rentals before any mining permit is considered
+    _restore_vm_watch()  # recover detached rentals before the first heartbeat offers this node
     try:
         _gpu_startup_selftest()          # before the first heartbeat can offer this node
     except Exception:                    # noqa: BLE001 — never block startup

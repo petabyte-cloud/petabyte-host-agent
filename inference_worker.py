@@ -148,8 +148,7 @@ class Controller:
         self.open_tunnel, self.close_tunnel, self.tunnel_alive = open_tunnel, close_tunnel, tunnel_alive
 
     def enabled(self):
-        """On by default; PETABYTE_INFERENCE_WORKER=false vetoes it. PETABYTE_IDLE_MINING is not a
-        signal here: the installer writes it =true on every node, so it says nothing about the owner."""
+        """On by default; PETABYTE_INFERENCE_WORKER=false vetoes it."""
         return os.getenv("PETABYTE_INFERENCE_WORKER", "true").strip().lower() != "false"
 
     def ticket(self):
