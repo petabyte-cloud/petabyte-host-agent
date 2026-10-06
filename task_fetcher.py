@@ -297,6 +297,7 @@ def heartbeat_loop():
             if _JOB_NET["ok"] is not None:           # can this host isolate a networked app?
                 _hb["job_network"] = dict(_JOB_NET)
             _hb["gateways"] = _gateway_report()       # per-rental gateway support + RTT to each
+            _hb["live_tasks"] = _live_task_ids()     # lets the server end tasks this node lost
             _bundle = _agent_bundle()
             if _bundle:                               # which signed agent bundle this node runs
                 _hb["agent_bundle"] = _bundle
@@ -3665,8 +3666,20 @@ def _signed_result(tid, status="completed", result=None, content_hash=None, fail
 # failure path (note_job_failed / free reservation / void hold; settle on exit 0).
 import threading as _pb_thr
 _pb_vm_watch = {}                 # task_id -> {"name": str, "reported": bool}
+_CURRENT_TASK = {"id": None}      # the job job_loop is executing right now
 _pb_vm_lock = _pb_thr.Lock()
 _pb_vm_started = {"on": False}
+
+
+def _live_task_ids():
+    """Every task this agent runs right now: the job in hand plus watched rentals (the only work
+    that outlives job_loop's call). The server fails a claimed task missing from this list after a
+    grace (db.reap_unreported_tasks), so it must never under-report."""
+    with _pb_vm_lock:
+        ids = {int(t) for t in _pb_vm_watch}
+    if _CURRENT_TASK["id"] is not None:
+        ids.add(int(_CURRENT_TASK["id"]))
+    return sorted(ids)
 
 
 def _register_vm(task_id, name):
@@ -3979,6 +3992,7 @@ def job_loop():
                 pass                 # no job available right now
             elif r.status_code == 200:
                 task = r.json()
+                _CURRENT_TASK["id"] = task.get("task_id")
                 import execution_receipt
                 execution_receipt.remember(task)
                 # Honour the seller's selling window: outside it, or if this job would over-run the
@@ -4073,6 +4087,7 @@ def job_loop():
         except Exception as e:                          # noqa: BLE001
             logging.error(f"job poll error: {e}")
         finally:
+            _CURRENT_TASK["id"] = None
             _JOB_RUNNING.clear()
             idle_mining.controller.after_work()
             inference_worker.controller.after_work()
