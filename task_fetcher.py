@@ -1997,7 +1997,22 @@ def _advertise_selling_now():
     """
     scheduled = _selling_now()
     return scheduled and (not os.getenv("PROVIDER", "").startswith("pb-jit-")
-                          or _reverse_tunnel_enabled()) and not _gpu_busy_elsewhere()
+                          or _reverse_tunnel_enabled()) and not _gpu_busy_elsewhere() and _wipe_ready()
+
+
+_WIPE_READY = {"ok": False}
+
+
+def _wipe_ready():
+    """Can this node run the mandatory VRAM wipe a rental starts with? Not while its wipe image is
+    still downloading after an install or an auto-update: offering the GPU then made every claimed
+    job refuse itself, and two refusals quarantined the node for 6 h (spec 246, 2026-10-06). Nodes
+    that skip the wipe (AGENT_ALLOW_UNVERIFIED_VRAM) and AMD nodes are unchanged."""
+    if (_WIPE_READY["ok"] or os.getenv("AGENT_ALLOW_UNVERIFIED_VRAM", "false").lower() == "true"
+            or not gpu_runtime.has_gpu() or gpu_runtime.vendor() == "amd"):
+        return True
+    _WIPE_READY["ok"] = bool(_cuda_wipe_image())          # once cached, it stays cached
+    return _WIPE_READY["ok"]
 
 
 # Busy-GPU guard (owner 2026-10-05). A GPU already loaded by something that is not ours (a miner on
