@@ -30,6 +30,7 @@ import template_storage
 import crypto
 import agent_scratch
 import idle_mining
+import inference_worker
 import fixes as _fixes
 import mining_income
 try:
@@ -308,6 +309,10 @@ def heartbeat_loop():
             if _caps:
                 _hb["confidential"] = _caps                       # REPORTED caps (server stores as reported)
             _mining_ticket = idle_mining.controller.ticket()
+            _infer_ticket = inference_worker.controller.ticket()
+            _inf = inference_worker.controller.report()
+            if _inf is not None:
+                _hb["inference"] = _inf                  # community inference pool worker state
             r = httpx.post(f"{API_URL}/heartbeat", json=_hb, headers=HEADERS, timeout=10, trust_env=False)
             if r.status_code == 200:
                 _body = r.json()
@@ -324,6 +329,11 @@ def heartbeat_loop():
                 except Exception as exc:
                     logging.warning("Idle mining paused: %s", exc)
                     idle_mining.controller.revoke()
+                try:
+                    inference_worker.controller.heartbeat(_infer_ticket, _body.get("inference_worker"),
+                                                          live=_live)
+                except Exception as exc:                 # noqa: BLE001 — never breaks liveness
+                    logging.warning("Inference worker paused: %s", exc)
                 # Owner may have changed the selling window in the dashboard — adopt it live.
                 template_storage.set_catalog(_body.get("template_image_catalog"))
                 _note_gateways(_body.get("gateways"))
@@ -402,9 +412,10 @@ def heartbeat_loop():
 def _submit_signed(tid, output_hash, result=None, status="completed"):
     import execution_receipt
     proof = execution_receipt.make(tid, status=status, result=result, output_hash=output_hash)
-    httpx.post(f"{API_URL}/jobs/result", headers=HEADERS, timeout=15, json={
-        "task_id": tid, "result": result, "status": status,
-        "proof": proof, "signature": crypto.sign_proof(proof)}, trust_env=False)
+    payload = {"task_id": tid, "result": result, "status": status,
+               "proof": proof, "signature": crypto.sign_proof(proof)}
+    if not _post_result_ack_retry(payload):
+        raise RuntimeError(f"/jobs/result was not acknowledged for task {tid}")
 
 
 def _run_notebook(task):
@@ -1103,21 +1114,35 @@ from nb_fetch import prefetch_notebook as _prefetch_notebook
 
 _VRAM_WIPE_PY = (
     "import sys, torch\n"
+    "CHUNK = 128 * 1024 * 1024       # 128 MiB blocks\n"
+    "HEADROOM = 512 * 1024 * 1024    # always leave this free for the display/compositor + this\n"
+    "                                # process's own CUDA context. A single 92%-of-free alloc OOM'd\n"
+    "                                # a 6 GB card that also drives a monitor and falsely benched it;\n"
+    "                                # chunked allocation wipes the same free region without one\n"
+    "                                # giant contiguous block, and tolerates free VRAM fluctuating.\n"
+    "wiped = 0\n"
     "for d in range(torch.cuda.device_count()):\n"
     "    torch.cuda.set_device(d)\n"
-    "    free,_ = torch.cuda.mem_get_info()\n"
-    "    n = int(free*0.92)\n"
-    "    if n > 0:\n"
-    "        buf = torch.zeros(n, dtype=torch.uint8, device='cuda')  # overwrite free VRAM with 0s\n"
+    "    bufs = []  # held until the end so all free VRAM is overwritten SIMULTANEOUSLY (same\n"
+    "               # coverage as the old single buffer; freeing between chunks could leave residue)\n"
+    "    while True:\n"
+    "        free, _ = torch.cuda.mem_get_info()\n"
+    "        if free <= CHUNK + HEADROOM:\n"
+    "            break\n"
+    "        try:\n"
+    "            buf = torch.zeros(CHUNK, dtype=torch.uint8, device='cuda')  # overwrite free VRAM with 0s\n"
+    "        except RuntimeError:        # OOM/fragmentation: we've taken what we safely can\n"
+    "            break\n"
     "        # Verify the device actually holds zeros before we claim 'verified clear'. A silent\n"
     "        # no-op (failed alloc, wrong device, driver quirk) would otherwise exit 0 and be\n"
     "        # trusted. count_nonzero is an on-device reduction over the whole buffer (cheap, no\n"
     "        # multi-GB host copy), so this checks every wiped byte, not a sample.\n"
     "        if int(torch.count_nonzero(buf).item()) != 0:\n"
     "            print('pb-vram-verify-failed', d); sys.exit(3)\n"
-    "        del buf\n"
+    "        bufs.append(buf); wiped += CHUNK\n"
+    "    del bufs\n"
     "    torch.cuda.synchronize(); torch.cuda.empty_cache()\n"
-    "print('pb-vram-wiped', torch.cuda.device_count())\n")
+    "print('pb-vram-wiped', torch.cuda.device_count(), wiped)\n")
 
 
 def _cached_cuda_images():
@@ -1167,14 +1192,25 @@ def _wipe_gpu_vram(tid=None):
         logging.info("VRAM wipe skipped: no cached CUDA image (set VRAM_WIPE_IMAGE or enable MIG); "
                      "residual VRAM from the prior tenant is NOT cleared on this node")
         return False
-    try:
-        result = subprocess.run(["docker", "run", "--rm", *gpu_runtime.docker_gpu_args(), "--network", "none",
-                        "--label", (f"pb.task={tid}" if tid else "pb.kind=vram-wipe"),
-                        img, "python", "-c", _VRAM_WIPE_PY],
-                       capture_output=True, timeout=int(os.getenv("VRAM_WIPE_TIMEOUT_S", "180")))
-        return result.returncode == 0
-    except Exception:                                    # noqa: BLE001 — the CALLER decides fail-open vs closed
-        return False
+    # Run the memset, retrying ONCE on a non-verification failure. The container self-test can
+    # fire within a second of an agent (auto-update) restart; a single transient docker/driver
+    # hiccup used to bench a healthy node for 10 min. A verify failure (exit 3) is deterministic —
+    # the VRAM really wasn't clean — so it is NOT retried and fails closed immediately.
+    for attempt in range(2):
+        try:
+            result = subprocess.run(["docker", "run", "--rm", *gpu_runtime.docker_gpu_args(), "--network", "none",
+                            "--label", (f"pb.task={tid}" if tid else "pb.kind=vram-wipe"),
+                            img, "python", "-c", _VRAM_WIPE_PY],
+                           capture_output=True, timeout=int(os.getenv("VRAM_WIPE_TIMEOUT_S", "180")))
+            if result.returncode == 0:
+                return True
+            if result.returncode == 3:                   # verification failed — deterministic, fail closed
+                return False
+        except Exception:                                # noqa: BLE001 — the CALLER decides fail-open vs closed
+            pass
+        if attempt == 0:
+            time.sleep(2)                                # let a transient startup/driver hiccup clear
+    return False
 
 
 def _refuse_unclean_vram(task):
@@ -3954,6 +3990,7 @@ def job_loop():
                     if _con:
                         _con.line("skip", f"outside selling hours — declined #{task.get('task_id')}")
                     continue
+                inference_worker.controller.before_work()   # a rental always gets the GPU first
                 try:
                     idle_mining.controller.before_work()
                 except Exception:
@@ -4038,6 +4075,7 @@ def job_loop():
         finally:
             _JOB_RUNNING.clear()
             idle_mining.controller.after_work()
+            inference_worker.controller.after_work()
         time.sleep(POLL_S)
 
 
@@ -4119,6 +4157,15 @@ def run_agent():
         except Exception:                                # noqa: BLE001 — never block startup
             _TUN_SETTLED.set()
     idle_mining.controller.prepare_gpu = _prepare_idle_mining_gpu
+    # The inference worker publishes through this node's own reverse tunnel (default gateway).
+    inference_worker.controller.attach(
+        open_tunnel=lambda port: _open_reverse_tunnel(port, "inference"),
+        close_tunnel=lambda: _kill_reverse_tunnel("inference"),
+        tunnel_alive=lambda: bool(_tunnels.get("inference")) and _tunnels["inference"][1].poll() is None)
+    try:
+        inference_worker.stop_container()        # a server left behind by a previous agent run
+    except Exception:                            # noqa: BLE001 — never block startup
+        pass
     mining_income.start()
     _restore_vm_watch()  # recover detached rentals before any mining permit is considered
     try:

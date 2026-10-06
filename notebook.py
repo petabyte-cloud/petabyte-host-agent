@@ -26,7 +26,37 @@ SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "jupyter/base-notebook:latest")
 SANDBOX_GPU_IMAGE = os.getenv("SANDBOX_GPU_IMAGE", "quay.io/jupyter/pytorch-notebook:cuda12-latest")
 WALL_TIMEOUT = int(os.getenv("NB_TIMEOUT", "300"))          # outer hard kill (s)
 CELL_TIMEOUT = int(os.getenv("NB_CELL_TIMEOUT", "120"))     # per-cell (s)
-MAX_OUTPUT_BYTES = int(os.getenv("NB_MAX_OUTPUT", str(8 * 1024 * 1024)))  # 8 MB
+MAX_OUTPUT_BYTES = min(256 * 1024, max(1024, int(os.getenv("NB_MAX_OUTPUT", str(256 * 1024)))) )  # leave headroom for JSON/proxy overhead
+
+
+_TRUNCATION_OUTPUT = {"type": "error", "value": "Output truncated (size cap reached)"}
+
+
+def _compact_json_size(value) -> int:
+    return len(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii"))
+
+
+def _append_bounded_output(outputs: List[dict], item: dict, total: int) -> tuple[int, bool]:
+    """Append only when the complete serialized array still fits and leaves room for a truncation marker.
+
+    total includes the array brackets and all separators, using compact JSON serialization.
+    """
+    size = _compact_json_size(item)
+    comma = 1 if outputs else 0
+    candidate_total = total + comma + size
+    marker_size = _compact_json_size(_TRUNCATION_OUTPUT)
+    # Reserve the marker and its separator so overflow can always be reported without exceeding
+    # the wire-size cap. MAX_OUTPUT_BYTES has a 1 KiB minimum, so the marker always fits alone.
+    if candidate_total + 1 + marker_size <= MAX_OUTPUT_BYTES:
+        outputs.append(item)
+        return candidate_total, True
+
+    marker_total = total + comma + marker_size
+    if marker_total > MAX_OUTPUT_BYTES:
+        # Defensive fallback if a caller violates the accounting invariant.
+        return total, False
+    outputs.append(_TRUNCATION_OUTPUT.copy())
+    return marker_total, False
 
 
 def timed(func):
@@ -148,26 +178,30 @@ def run_notebook_code(code: Union[str, List[str], dict], cpu: int = 1, ram: int 
         executed = nbformat.read(out_path, as_version=4)
 
         outputs: List[dict] = []
-        total = 0
+        total = 2  # opening and closing brackets of the serialized output array
         for cell in executed.cells:
             for output in cell.get("outputs", []):
                 t = output.get("output_type")
+                item = None
                 if t == "execute_result":
-                    val = output["data"].get("text/plain", "")
-                    outputs.append({"type": "text", "value": val})
+                    item = {"type": "text", "value": output["data"].get("text/plain", "")}
                 elif t == "stream":
-                    outputs.append({"type": "text", "value": output.get("text", "")})
+                    item = {"type": "text", "value": output.get("text", "")}
                 elif t == "error":
-                    outputs.append({"type": "error", "value": f"{output.get('ename')}: {output.get('evalue')}"})
+                    item = {"type": "error", "value": f"{output.get('ename')}: {output.get('evalue')}"}
                 elif t == "display_data":
                     data = output.get("data", {})
                     if "image/png" in data:
-                        outputs.append({"type": "image", "mime": "image/png", "base64": data["image/png"]})
+                        item = {"type": "image", "mime": "image/png", "base64": data["image/png"]}
                     elif "text/html" in data:
-                        outputs.append({"type": "html", "value": data["text/html"]})
-                total += len(json.dumps(outputs[-1])) if outputs else 0
-                if total > MAX_OUTPUT_BYTES:
-                    outputs.append({"type": "error", "value": "Output truncated (size cap reached)"})
+                        item = {"type": "html", "value": data["text/html"]}
+                if item is None:
+                    continue
+                # Bound each item BEFORE appending it. The result is JSON text inside a signed JSON
+                # request, so a cap on the final serialized form leaves room for both escaping layers
+                # and the reverse proxy's 4 MiB request limit.
+                total, accepted = _append_bounded_output(outputs, item, total)
+                if not accepted:
                     return outputs
         return outputs
     finally:
