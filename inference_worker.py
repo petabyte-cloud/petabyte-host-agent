@@ -27,6 +27,10 @@ NAME = "petabyte-inference"
 LABEL = "market.petabyte.inference=1"
 MODELS = Path(os.getenv("PETABYTE_INFERENCE_MODELS", "/var/lib/petabyte-agent/inference"))
 RETRY_AFTER_ERROR_S = 120
+# The lease is <= 30 s and renewed every heartbeat (15 s), so ONE late or discarded heartbeat put the
+# next renewal just past expiry and tore down a warm server (2060, 2026-10-06). A rental still stops
+# it at once (before_work); this only stops a single slow heartbeat from forcing a full reload.
+LEASE_GRACE_S = 20
 READY_TIMEOUT_S = 300
 _IMAGE_RE = re.compile(r"^ghcr\.io/ggml-org/llama\.cpp@sha256:[0-9a-f]{64}$")
 _URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.gguf$")
@@ -167,8 +171,9 @@ class Controller:
             self.stop()
 
     def after_work(self):
+        """job_loop calls this after EVERY poll, job or not. Only a poll that ran a job (before_work)
+        moved the generation; bumping it on idle polls discarded heartbeats in flight every ~5 s."""
         with self.lock:
-            self.generation += 1
             self.busy = False
 
     def stop(self):
@@ -193,7 +198,7 @@ class Controller:
                 if self._thread or self._state.get("state") not in ("off", "error"):
                     self.stop()
                 return
-            self._until = time.monotonic() + permit["seconds"]
+            self._until = time.monotonic() + permit["seconds"] + LEASE_GRACE_S
             key = (permit["model"], permit["sha256"], permit["ctx"], permit["parallel"], permit["image"])
             if self._thread and self._thread.is_alive() and self._key == key:
                 return                                    # lease renewed; already serving it
