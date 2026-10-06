@@ -277,6 +277,7 @@ def heartbeat_loop():
             _hb = {"spec_id": int(SPEC_ID), "hardware_evidence": hardware_evidence.collect(),
                    "selling_now": _advertise_selling_now(),  # JIT also waits for tunnel enrollment
                    "gpu_busy": _gpu_busy_report(),           # why it is not offered (busy-GPU guard)
+                   "render_capabilities": _render_capabilities(),   # engines + headless_eevee (self-tested)
                    "remote_fixes": _fixes.enabled()}  # owner allowed signed support fixes
             try:
                 import diagnostics
@@ -956,16 +957,21 @@ def _env_true(name: str) -> bool:
 
 
 def _select_runtime(available_runtimes: str, is_gpu: bool):
-    """Choose the OCI runtime for `--runtime`, or None for docker's default (runc).
+    """Choose the OCI runtime for `--runtime`, or None for Docker's default runtime.
 
-    NEVER weakens isolation below gVisor. Kata Containers runs each container in its OWN hardware VM
-    (KVM) — the strongest boundary — and is now the DEFAULT whenever the kata runtime is available.
+    Prefers Kata (hardware VM per container, the strongest boundary) whenever the kata runtime is
+    available. If an operator has registered gVisor (runsc) themselves it is selected when Kata is
+    unavailable; the agent does not install it, so on a fresh install the non-Kata fallback is
+    Docker's hardened default runtime (normally runc): all caps dropped, no-new-privileges, seccomp, private
+    namespaces, no runtime socket, no host filesystem, a per-job firewalled network — a hardened
+    container on the host kernel, not a VM. (2026-10-06 audit: earlier comments here and on the
+    /security page wrongly described gVisor as the fallback; it was never installed.)
     Selection:
       * AGENT_RUNTIME=runc                                      -> docker default (no extra runtime)
-      * AGENT_RUNTIME=gvisor|runsc, or AGENT_KATA_ENABLED=false -> opt OUT to gVisor (else default)
+      * AGENT_RUNTIME=gvisor|runsc, or AGENT_KATA_ENABLED=false -> registered runsc, else Docker default
       * default / AGENT_RUNTIME=kata -> Kata when installed AND (CPU job, or GPU job with
-        AGENT_KATA_GPU=true); otherwise SAFELY falls back to gVisor/default — never fails, and never
-        runs a GPU job on a Kata that cannot pass the GPU through. GPU-in-VM stays gated on
+        AGENT_KATA_GPU=true); otherwise registered runsc if available, then Docker's
+        default runtime. Never run a GPU job on Kata without GPU passthrough. GPU-in-VM stays gated on
         AGENT_KATA_GPU because most nodes lack VFIO.
 
     `available_runtimes` is the `docker info --format {{.Runtimes}}` string; the Kata runtime is
@@ -983,14 +989,14 @@ def _select_runtime(available_runtimes: str, is_gpu: bool):
     pref = (os.getenv("AGENT_RUNTIME") or "auto").strip().lower()
     if pref == "runc":
         return None
-    # Opt OUT of Kata (back to gVisor) via either control.
+    # Opt out of Kata via either control; runsc is selected only if registered.
     if pref in ("gvisor", "runsc") or os.getenv("AGENT_KATA_ENABLED", "").strip().lower() in ("0", "false", "no", "off"):
         return gvisor
     # DEFAULT: prefer Kata (VM per container) whenever it is available. A GPU job still needs
-    # AGENT_KATA_GPU (VFIO) or it falls back to gVisor.
+    # AGENT_KATA_GPU (VFIO) or it falls back to registered runsc, then Docker's default.
     if kata and (not is_gpu or _env_true("AGENT_KATA_GPU")):
         return kata
-    return gvisor   # kata unavailable / GPU-without-VFIO -> gVisor
+    return gvisor   # Kata unavailable / GPU without VFIO: registered runsc, else Docker default
 
 
 def _isolation_flags(task):
@@ -2013,6 +2019,86 @@ def _wipe_ready():
         return True
     _WIPE_READY["ok"] = bool(_cuda_wipe_image())          # once cached, it stays cached
     return _WIPE_READY["ok"]
+
+
+# Headless EEVEE capability (2026-10-06). EEVEE needs an EGL GPU context; whether that works in a
+# headless container is build/driver-specific, so we NEVER assume it — the node advertises EEVEE
+# only after a tiny real EEVEE GPU render actually succeeds here. Tested once per boot, only when the
+# render image is already cached (never pulls on the hot path). AGENT_EEVEE_ENABLED=false opts out.
+_EEVEE = {"ok": None, "blender_version": None}
+
+
+def _eevee_render_image():
+    return os.getenv("EEVEE_RENDER_IMAGE", os.getenv("RENDER_IMAGE", "linuxserver/blender:latest"))
+
+
+def _eevee_selftest(img):
+    """One tiny headless EEVEE GPU render of the factory scene. True only if a frame is produced on
+    the GPU with no software-GL (llvmpipe) or EGL fallback. Never raises; records the Blender version."""
+    import tempfile, subprocess, os as _os, shutil as _sh
+    out = tempfile.mkdtemp(prefix="eevee-selftest-")
+    try:
+        _os.chmod(out, 0o777)
+        expr = _render_setup_expr(samples=1, gpu=True, engine="EEVEE", resolution=(64, 64))
+        cmd = ["docker", "run", "--rm", "--network", "none", *_isolation_flags({}),
+               *gpu_runtime.docker_gpu_args(), "-v", f"{out}:/out", "--entrypoint", "blender", img,
+               "-b", "--factory-startup", "--disable-autoexec", "--python-exit-code", "86",
+               "--python-expr", expr, "-o", "/out/pb_eevee_", "-f", "1"]
+        r = _run_docker(cmd, timeout=int(os.getenv("EEVEE_SELFTEST_TIMEOUT_S", "180")),
+                        capture_output=True, text=True, check=False)
+        combined = ((r.stdout or "") + (r.stderr or "")).lower()
+        for line in combined.splitlines():
+            if line.startswith("blender ") and _EEVEE["blender_version"] is None:
+                _EEVEE["blender_version"] = line.split()[1] if len(line.split()) > 1 else None
+        produced = any(f.startswith("pb_eevee_") for f in _os.listdir(out))
+        software = ("llvmpipe" in combined or "egl_bad" in combined
+                    or "could not open display" in combined or "software rasteriz" in combined)
+        return bool(r.returncode == 0 and produced and not software)
+    except Exception:                                    # noqa: BLE001 — capability probe, never fatal
+        return False
+    finally:
+        import shutil as _sh2; _sh2.rmtree(out, ignore_errors=True)
+
+
+def _eevee_ready():
+    """Can this node render EEVEE headless on the GPU? Cached after one real self-test per boot.
+    Only runs the test once the render image is cached (so it never pulls on the hot path); until
+    then it is simply not advertised — fail-safe, never a false capability."""
+    if _EEVEE["ok"] is not None:
+        return _EEVEE["ok"]
+    import subprocess
+    if (os.getenv("AGENT_EEVEE_ENABLED", "true").strip().lower() not in ("1", "true", "yes", "on")
+            or not gpu_runtime.has_gpu() or not __import__("shutil").which("docker")):
+        _EEVEE["ok"] = False
+        return False
+    img = _eevee_render_image()
+    try:
+        cached = subprocess.run(["docker", "image", "inspect", img],
+                                capture_output=True, timeout=10).returncode == 0
+    except Exception:                                    # noqa: BLE001
+        cached = False
+    if not cached:
+        return False                                     # not tested yet; re-checked next time
+    _EEVEE["ok"] = _eevee_selftest(img)
+    return _EEVEE["ok"]
+
+
+def _render_capabilities():
+    """What this node can render, for the marketplace. `headless_eevee` is only true after a real
+    EEVEE self-test passed here; `render_engines` always includes Cycles on a GPU node."""
+    v = gpu_runtime.vendor()
+    engines, eevee = [], False
+    if v in ("nvidia", "amd"):
+        engines.append("CYCLES")
+        eevee = _EEVEE["ok"] is True   # cached: the background probe / a render runs the real self-test
+        if eevee:
+            engines.append("EEVEE")
+    try:
+        gpu_count = len(_gpu_usage() or []) if gpu_runtime.has_gpu() else 0
+    except Exception:                                    # noqa: BLE001
+        gpu_count = 1 if gpu_runtime.has_gpu() else 0
+    return {"blender": True, "render_engines": engines, "headless_eevee": bool(eevee),
+            "gpu_count": gpu_count, "gpu_vendor": v, "blender_version": _EEVEE["blender_version"]}
 
 
 # Busy-GPU guard (owner 2026-10-05). A GPU already loaded by something that is not ours (a miner on
@@ -3216,28 +3302,54 @@ def _run_container(task):
         _remove_env_file(task)
 
 
-def _render_setup_expr(samples=None, gpu=True, engine=None):
+_IMG_FORMATS = {"PNG": "PNG", "JPEG": "JPEG", "JPG": "JPEG", "EXR": "OPEN_EXR", "OPEN_EXR": "OPEN_EXR"}
+
+
+def _render_setup_expr(samples=None, gpu=True, engine=None, file_format=None, resolution=None):
     """Blender `--python-expr`, run after the buyer's .blend loads and before `-a` renders it.
 
-    0) `engine` (from _render_plan, only ever 'CYCLES') switches the scene's engine first — a
-       Blender Internal file, or an EEVEE file the buyer asked to convert.
+    0) `engine` (from _render_plan) switches the scene's engine first: 'CYCLES' for a Blender
+       Internal file or a convert request, or 'EEVEE' to render EEVEE headless on the GPU. EEVEE
+       resolves to the version's real id (BLENDER_EEVEE_NEXT on 4.2+, else BLENDER_EEVEE) so the
+       same expr works across Blender versions. None keeps the file's own engine.
     1) Cycles defaults to the CPU and a headless container has no saved Blender preferences, so
        every "GPU render" used to run on the seller's CPU (2026-09-25: no Cycles device was ever
        chosen). Point Cycles at the GPU the container was given: OptiX, else CUDA/HIP/oneAPI.
        get_devices_for_type() also returns the CPU row, and a new device entry defaults to
        use=True, so enabling every row rendered hybrid CPU+GPU (#556) — enable only the GPUs.
-    2) Apply the buyer's requested sample count (POST /render `samples`, previously ignored).
-    3) A movie output format is rendered as PNG frames, so a range split across nodes can be
-       stitched back together (a node can't append to another node's video).
+       EEVEE renders on the GPU through its GL/EGL context automatically (no device table); the
+       node only advertises headless EEVEE after a real self-test, so we do not CPU-guard it here.
+    2) Apply the buyer's requested sample count (Cycles samples / EEVEE taa_render_samples).
+    3) Output format (PNG default; a movie format is rendered as frames so a split range can be
+       stitched) and an optional resolution override.
     It comes from OUR argv, not the scene: --disable-autoexec still blocks the .blend's own scripts.
     """
     n = int(samples) if samples else 0
+    fmt = _IMG_FORMATS.get(str(file_format or "PNG").upper(), "PNG")
+    res = ""
+    if resolution and isinstance(resolution, (list, tuple)) and len(resolution) == 2:
+        try:
+            w, h = int(resolution[0]), int(resolution[1])
+            if w > 0 and h > 0:
+                res = (f"s.render.resolution_x = {w}\ns.render.resolution_y = {h}\n"
+                       "s.render.resolution_percentage = 100\n")
+        except (TypeError, ValueError):
+            res = ""
+    set_engine = ""
+    if engine == "EEVEE":
+        set_engine = (
+            "eng = {e.identifier for e in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items}\n"
+            "s.render.engine = 'BLENDER_EEVEE_NEXT' if 'BLENDER_EEVEE_NEXT' in eng else 'BLENDER_EEVEE'\n"
+            "print('PBENGINE=' + s.render.engine, flush=True)\n")
+    elif engine:
+        set_engine = f"s.render.engine = '{engine}'\n"
     return (
         "import bpy\n"
         "s = bpy.context.scene\n"
-        + (f"s.render.engine = '{engine}'\n" if engine else "")
-        + "s.render.image_settings.file_format = 'PNG'\n"
-        "if s.render.engine == 'CYCLES':\n"
+        + set_engine
+        + f"s.render.image_settings.file_format = '{fmt}'\n"
+        + res
+        + "if s.render.engine == 'CYCLES':\n"
         f"    if {n} > 0:\n"
         f"        s.cycles.samples = {n}\n"
         f"    if {bool(gpu)}:\n"
@@ -3256,6 +3368,10 @@ def _render_setup_expr(samples=None, gpu=True, engine=None):
         "                break\n"
         "        else:\n"
         "            raise RuntimeError('No Cycles GPU device is available; refusing CPU fallback for the requested GPU render')\n"
+        + ("elif s.render.engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'):\n"
+           f"    if {n} > 0:\n"
+           f"        s.eevee.taa_render_samples = {n}\n" if n > 0 else
+           "elif s.render.engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'):\n    pass\n")
     )
 
 
@@ -3334,7 +3450,7 @@ def _blend_file_version(path):
     return int(h[9:12]) if h[:7] == b"BLENDER" and h[9:12].isdigit() else None
 
 
-def _render_plan(file_version, engine="auto", blender_version="latest", detect=lambda: ""):
+def _render_plan(file_version, engine="auto", blender_version="latest", detect=lambda: "", eevee_ok=False):
     """How to render a scene -> (runner, set_engine, note, refuse_cause).
 
     runner: "2.79" (host Blender 2.79b, CPU) or "latest" (the render image, GPU); set_engine: the
@@ -3350,7 +3466,7 @@ def _render_plan(file_version, engine="auto", blender_version="latest", detect=l
       2.8+/unknown  auto, file engine EEVEE         -> refuse (no headless GPU EEVEE)
       2.8+/unknown  auto, anything else             -> render as is
     """
-    engine = engine if engine in ("auto", "CYCLES", "BLENDER_RENDER") else "auto"
+    engine = engine if engine in ("auto", "CYCLES", "BLENDER_RENDER", "EEVEE") else "auto"
     legacy = file_version is not None and file_version < 280
     saved = f"Blender {file_version // 100}.{file_version % 100}" if file_version else "a newer Blender"
     if blender_version in ("2.79", "2.79b") or engine == "BLENDER_RENDER":
@@ -3368,11 +3484,21 @@ def _render_plan(file_version, engine="auto", blender_version="latest", detect=l
         return ("latest", "CYCLES", msg, None)
     if engine == "CYCLES":
         return ("latest", "CYCLES", None, None)
+    if engine == "EEVEE":
+        if eevee_ok:
+            return ("latest", "EEVEE", "Rendering with EEVEE on the GPU (headless).", None)
+        return (None, None,
+                "This node is not set up for headless EEVEE rendering. Your .blend was NOT changed "
+                "— submit with engine=CYCLES for a fast GPU render, or retry to land on an "
+                "EEVEE-capable node.", "unsupported_engine_eevee")
     found = detect() or ""
     if "EEVEE" in found.upper():
-        msg = (f"This scene's render engine is {found}, which cannot be rendered on a headless "
-               "GPU. Your .blend was NOT changed — set the scene's render engine to Cycles, or "
-               "submit again with engine=CYCLES to convert it, for a fast GPU render.")
+        if eevee_ok:
+            return ("latest", "EEVEE",
+                    "This scene uses EEVEE; rendering it with EEVEE on the GPU (headless).", None)
+        msg = (f"This scene's render engine is {found}, which this node cannot render headless. "
+               "Your .blend was NOT changed — set the engine to Cycles, submit with engine=CYCLES "
+               "to convert it, or retry to land on an EEVEE-capable node.")
         return (None, None, msg, "unsupported_engine_eevee")
     return ("latest", None, None, None)
 
@@ -3434,11 +3560,11 @@ def _run_render(task):
         open(scene, "wb").write(safe_fetch.get(g["download_url"], timeout=120, max_bytes=128 * 1024 * 1024).content)
         report_progress(tid, 15, f"scene fetched; rendering {fs}-{fe} in {image}")
 
-        # 1b) Detect the scene's render engine BEFORE committing GPU time. EEVEE(-Next) needs a GPU
-        # DISPLAY context that does not exist in a headless container — it errors EGL_BAD_MATCH and
-        # crawls in software (tens of minutes/frame). So we do NOT render EEVEE: hand the buyer's
-        # file straight back with a note to switch to Cycles (which renders headless on the GPU via
-        # OptiX reliably). Best-effort — on any detection error we fall through and just render.
+        # 1b) Detect the scene's render engine BEFORE committing GPU time. EEVEE needs an EGL GPU
+        # context; the node renders EEVEE headless on the GPU ONLY if its EEVEE self-test passed
+        # (_eevee_ready) — otherwise EEVEE is refused with a note to switch to Cycles, so a scene
+        # never silently falls back to slow software rendering. Best-effort — on any detection error
+        # we fall through and just render.
         def _detect_engine():
             try:
                 _dcmd = ["docker", "run", "--rm", "--network", "none"]
@@ -3458,7 +3584,9 @@ def _run_render(task):
         # render). See _render_plan for the full table.
         runner, set_engine, note, refuse = _render_plan(
             _blend_file_version(scene), task.get("engine") or "auto",
-            task.get("blender_version") or "latest", detect=_detect_engine)
+            task.get("blender_version") or "latest", detect=_detect_engine,
+            eevee_ok=(_EEVEE["ok"] is True))   # cached: the background probe ran the real self-test;
+            # the server only routes an EEVEE job to a node that already advertised the capability.
         if refuse:
             report_log(tid, note)
             _post("/jobs/result", _signed_result(tid, status="failed", failure_cause=refuse,
@@ -3489,13 +3617,20 @@ def _run_render(task):
             cmd += [*ep, "-b", "/scene.blend", "--disable-autoexec",
                     "--python-exit-code", "86",
                     "--python-expr", _render_setup_expr(task.get("samples"), gpu=bool(task.get("gpu")),
-                                                        engine=set_engine)]
+                                                        engine=set_engine, file_format=task.get("format"),
+                                                        resolution=task.get("resolution"))]
         cmd += ["-o", "/out/frame_", "-s", str(fs), "-e", str(fe), "-j", "1", "-a"]
         # Hard-kill the container at the buyer's AUTHORIZED runtime budget (audit H1): a render
         # can't consume more of the seller's GPU than the buyer paid to authorize (_run_docker
         # force-removes the container when the client-side timeout fires).
         _rt = task.get("max_runtime_s")
-        _run_docker(cmd, timeout=(int(_rt) if _rt else None))
+        try:
+            _run_docker(cmd, timeout=(int(_rt) if _rt else None), capture_output=True, text=True)
+        except subprocess.CalledProcessError as _ce:
+            # Blender exited non-zero. Surface WHY instead of a generic failure: the real reason is
+            # in its output, which until now was discarded (the buyer then saw a hardcoded "it's
+            # probably EEVEE" guess even for a Cycles scene). 2026-10-06.
+            raise RuntimeError(_blender_fail_reason((_ce.stderr or "") + (_ce.stdout or ""))) from _ce
         _render_frame_files(out_dir, fs, fe)
         report_progress(tid, 85, "uploading frames")
         # 3) tar the frames and upload as the buyer's DOWNLOADABLE output — UNENCRYPTED, under the
@@ -3514,11 +3649,35 @@ def _run_render(task):
                                              content_hash=hashlib.sha256(raw).hexdigest()))
         _set_ui(status="idle", task=None, ok=True)
     except Exception as e:                              # noqa: BLE001
-        report_log(tid, f"render failed: {e}")
-        _post("/jobs/result", _signed_result(tid, status="failed"))
+        reason = str(e)[:600] or "the render did not finish on this node"
+        report_log(tid, f"render failed: {reason}")
+        _post("/jobs/result", _signed_result(tid, status="failed", result=reason))
         _set_ui(status="idle", task=None, fail=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _blender_fail_reason(output: str) -> str:
+    """Map Blender's output to a plain-English reason the buyer can act on, else the raw tail.
+    The buyer is never charged for a failed render (see the render except); this only explains it."""
+    low = (output or "").lower()
+    tail = (output or "").strip()[-400:]
+    if "out of memory" in low or "cuda error: out of memory" in low or "optix" in low and "memory" in low:
+        return ("The scene ran out of GPU memory on this node. Try a GPU with more VRAM, lower the "
+                "resolution/samples, or render fewer frames at a time. You were not charged.")
+    if ("no cycles gpu device" in low or "cuda" in low and "no" in low and "device" in low
+            or "optix" in low or "cuda error" in low):
+        return ("This node's GPU could not run the Cycles render (driver/OptiX/CUDA). The job is "
+                "retried on another node; you were not charged for this attempt.")
+    if ("no such file" in low or "unable to open" in low or "cannot read" in low
+            or "version" in low and "unsupported" in low or "malformed" in low):
+        return ("The render Blender could not open this .blend (it may be too old or corrupt). "
+                "Re-save it in a recent Blender and re-submit. You were not charged.")
+    if "eevee" in low or "egl" in low:
+        return ("This scene renders with EEVEE, which needs a display a headless GPU server does "
+                "not have. Set the render engine to Cycles in Blender and re-submit. Not charged.")
+    return ("The render did not finish on this node (you were not charged). Blender reported:\n"
+            + (tail or "no output")) if tail else "The render did not finish on this node (you were not charged)."
 
 
 def _run_transcode(task):
@@ -4173,6 +4332,9 @@ def run_agent():
         pass
     _probe_job_network()                 # the first heartbeat already says whether apps can run here
     threading.Thread(target=_job_network_loop, daemon=True, name="pb-jobnet-probe").start()
+    # Headless-EEVEE capability: a real EEVEE GPU render in the background (only runs when the render
+    # image is cached), so the node advertises EEVEE only where it actually works. Never blocks boot.
+    threading.Thread(target=_eevee_ready, daemon=True, name="pb-eevee-probe").start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()   # online while we wait
     _TUN_SETTLED.wait(timeout=240)       # don't claim a serving job this node can't publish yet
     job_loop()

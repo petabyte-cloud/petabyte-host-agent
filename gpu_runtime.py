@@ -58,14 +58,21 @@ def docker_gpu_args():
     """Docker args that expose the host GPU to a container, for the detected vendor.
 
     NVIDIA: the nvidia-container-toolkit runtime (`--gpus all`). AMD: the KFD compute device + DRI
-    render nodes, the `video` group, and relaxed seccomp (HIP needs a handful of syscalls the
-    default profile blocks). CPU: nothing."""
+    render nodes and the `video` group. CPU: nothing.
+
+    Security (2026-10-06 audit): AMD jobs keep Docker's DEFAULT seccomp profile. Earlier this path
+    shipped `seccomp=unconfined`, which handed an untrusted buyer container the full host syscall
+    surface. ROCm/HIP works under the default profile on current runtimes; a node that genuinely
+    needs the wider surface can opt back in with AGENT_AMD_SECCOMP_UNCONFINED=true (fail-safe: the
+    default is confined, and a job that cannot init just fails the node's GPU self-test)."""
     v = vendor()
     if v == "nvidia":
         return ["--gpus", "all"]
     if v == "amd":
-        return ["--device", "/dev/kfd", "--device", "/dev/dri",
-                "--group-add", "video", "--security-opt", "seccomp=unconfined"]
+        args = ["--device", "/dev/kfd", "--device", "/dev/dri", "--group-add", "video"]
+        if (os.getenv("AGENT_AMD_SECCOMP_UNCONFINED") or "").strip().lower() in ("1", "true", "yes", "on"):
+            args += ["--security-opt", "seccomp=unconfined"]
+        return args
     return []
 
 

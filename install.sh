@@ -4,8 +4,8 @@
 #     export PETABYTE_API_URL=https://petabyte.market PETABYTE_API_KEY=pk_your_node_key
 #     curl -fsSL https://petabyte.market/install.sh | sudo --preserve-env=PETABYTE_API_URL,PETABYTE_API_KEY bash
 # The /install page generates the token-bound equivalent with sudo.
-# PRICE_PER_HOUR is optional: leave it unset and the node auto-prices from its GPU's
-# benchmark; set it (e.g. PRICE_PER_HOUR=1.5) to pin your own rate.
+# PRICE_PER_HOUR only applies to a CPU-only node: a GPU node rents at Petabyte's one price
+# for its GPU model (set by Petabyte; sellers do not set or undercut prices).
 set -euo pipefail
 ENVF=/etc/petabyte/agent.env
 
@@ -99,22 +99,22 @@ fi
 # --- Kata Containers: VM-per-container isolation (DEFAULT on KVM-capable nodes) ----
 # Kata runs each buyer container in its OWN hardware VM (KVM) — the strongest boundary against a
 # buyer escaping onto the seller host. Installed BY DEFAULT when this node has /dev/kvm (bare-metal
-# or nested-virt; NOT standard cloud droplets, which transparently stay on gVisor). Opt out with
+# or nested-virt; NOT standard cloud droplets, which stay on the hardened default runtime, runc). Opt out with
 # PETABYTE_KATA=false. GPU-in-VM also needs IOMMU+VFIO the operator sets up (then set
-# AGENT_KATA_GPU=true); until then GPU jobs safely use gVisor.
+# AGENT_KATA_GPU=true); until then GPU jobs run in a hardened container on the host kernel (runc).
 # Supply chain: a PINNED release checked against a PINNED SHA-256 (GitHub's asset digest) BEFORE it
 # is unpacked, unpacked into a scratch dir on disk (never straight into /), and only opt/kata is
 # moved into place. Fail-safe: no KVM, low disk, a download/checksum/unpack failure, or an
-# unparseable daemon.json all leave the node on gVisor/default — never blocking the install and
+# unparseable daemon.json all leave the node on the hardened default runtime (runc) — never blocking the install and
 # never overwriting docker's config.
 KATA_VERSION="3.20.0"
 KATA_SHA256="bc6bc429cbf28199193cff5dea449991153842971be8ab95f07b954e4baecef5"
 KATA_OK=0
 if [ "${PETABYTE_KATA:-true}" != "false" ]; then
   if [ ! -e /dev/kvm ]; then
-    echo "==> no /dev/kvm on this node — Kata skipped (normal on cloud droplets); using gVisor/default"
+    echo "==> no /dev/kvm on this node — Kata skipped (normal on cloud droplets); using the hardened default runtime (runc)"
   elif [ "$(df -Pk /var/tmp | awk 'NR==2{print $4}')" -lt 6000000 ] 2>/dev/null; then
-    echo "!! under 6 GB free on /var/tmp — Kata skipped (~930 MB download, ~3 GB unpacked); using gVisor/default"
+    echo "!! under 6 GB free on /var/tmp — Kata skipped (~930 MB download, ~3 GB unpacked); using the hardened default runtime (runc)"
   else
     echo "==> installing Kata Containers ${KATA_VERSION} (default; VM per container; ~930 MB download)"
     KTMP="$(mktemp -d /var/tmp/pbkata.XXXXXX)"
@@ -148,7 +148,7 @@ KATAPY
         echo "!! /etc/docker/daemon.json is not valid JSON — Kata skipped, docker config left untouched"
       fi
     else
-      echo "!! Kata download/checksum/unpack failed — keeping the existing runtime (gVisor/default)"
+      echo "!! Kata download/checksum/unpack failed — keeping the existing runtime (runc)"
     fi
     rm -rf "$KTMP"
   fi
@@ -414,7 +414,7 @@ fi
 echo "==> keep-awake $_KEEP_AWAKE (seller agent only; the display can still turn off)"
 
 # Kata: turn the runtime on for this node when it was installed above (provision.py preserves
-# operator-set lines, so this survives re-provisioning). GPU jobs stay on gVisor until the operator
+# operator-set lines, so this survives re-provisioning). GPU jobs stay on the hardened default runtime (runc) until the operator
 # confirms VFIO passthrough with AGENT_KATA_GPU=true.
 if [ "${KATA_OK:-0}" = "1" ]; then
   grep -q '^AGENT_RUNTIME=' "$ENVF" 2>/dev/null || echo 'AGENT_RUNTIME=kata' >> "$ENVF"

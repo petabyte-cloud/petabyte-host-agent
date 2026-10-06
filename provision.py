@@ -8,7 +8,7 @@ your account a seller). The key's account must already be a seller.
 
 Env:
   PETABYTE_API_URL, PETABYTE_API_KEY               (required)
-  PRICE_PER_HOUR (unset => auto-priced from this GPU's benchmark), UNITS (1), MAX_HOURS (24)
+  PRICE_PER_HOUR (CPU-only nodes; a GPU rents at Petabyte's price for its model), UNITS (1), MAX_HOURS (24)
   GPU_MODEL/GPU_COUNT/VRAM_GB                       (override auto-detect)
   AGENT_ENV (default /etc/petabyte/agent.env), PETABYTE_AGENT_KEY
 """
@@ -271,38 +271,39 @@ def _fail(title, **kw):
 
 
 def resolve_price(client, gpu_model):
-    """Decide the hourly listing price for this node.
+    """The hourly rate this node lists at.
 
-    The seller's explicit PRICE_PER_HOUR always wins. When it is unset — the common
-    case, because onboarding is meant to be one command — we do NOT guess a flat rate.
-    We ask the server for a fair, benchmark-anchored suggestion for the GPU we just
-    detected (the same number the /install page shows), so a 4090 never lists at the
-    same price as a 2060. Only if that call cannot be reached do we fall back to a
-    labelled placeholder, and we say so out loud.
+    A GPU node rents at Petabyte's ONE price for its GPU model: Petabyte sets it, sellers with the
+    same hardware do not undercut each other, and the server ignores any price the agent sends.
+    We ask for it only so the summary shows the real number. PRICE_PER_HOUR still applies to a
+    CPU-only node, which has no GPU model to price.
 
-    Returns (price: float, basis: str).
+    Returns (price: float | None, basis: str); None means Petabyte has not priced this GPU yet.
     """
     raw = (os.getenv("PRICE_PER_HOUR") or "").strip()
-    if raw:
+    if not gpu_model:
         try:
-            v = float(raw)
-            if v > 0:
-                return v, "seller-set"
+            v = float(raw) if raw else 0.0
         except ValueError:
-            pass
-        print(f"PRICE_PER_HOUR={raw!r} is not a positive number — ignoring it and auto-pricing.")
+            v = 0.0
+        if v > 0:
+            return v, "seller-set (CPU-only node)"
+        if raw:
+            print(f"PRICE_PER_HOUR={raw!r} is not a positive number — using the default CPU-only rate.")
+        return 1.0, "default CPU-only rate"
+    if raw:
+        print("PRICE_PER_HOUR is ignored for GPU nodes: Petabyte sets one price per GPU model.")
     try:
-        r = client.get("/pricing/suggest", params={"gpu_model": gpu_model or ""})
+        r = client.get("/pricing/suggest", params={"gpu_model": gpu_model})
         if r.status_code == 200:
             body = r.json()
             p = float(body.get("suggested_price") or 0)
             if p > 0:
-                return p, "auto: " + str(body.get("basis") or "benchmark-anchored")
-    except Exception as e:  # network/parse — never let pricing block onboarding
-        print(f"could not fetch a benchmark-anchored price ({e}); using a placeholder.")
-    print("WARNING: no price set and the pricing service was unreachable — listing at "
-          "$1.00/hr as a placeholder. Set PRICE_PER_HOUR or edit your listing to fix it.")
-    return 1.0, "fallback (pricing service unreachable)"
+                return p, str(body.get("basis") or "Petabyte price")
+            return None, str(body.get("basis") or "Petabyte has not priced this GPU model yet")
+    except Exception as e:  # network/parse — never let a display lookup block onboarding
+        print(f"could not fetch the Petabyte price for this GPU ({e}).")
+    return None, "set by Petabyte (see your dashboard)"
 
 
 def main():
@@ -378,7 +379,7 @@ def main():
         ui.step(f"Registering spec with {API} …")
         spec = c.post("/register_specs", headers=h, json={
             "cpu": cpu, "ram": ram, "duration": int(os.getenv("MAX_HOURS", "24")),
-            "price_per_hour": price,
+            **({"price_per_hour": price} if price else {}),   # ignored for GPUs (Petabyte prices)
             "provider": provider, "gpu_model": gpu, "gpu_count": gc, "vram_gb": vram,
             "units": int(os.getenv("UNITS", "1")),
             "egress_pubkey": egress_pub,
@@ -413,7 +414,7 @@ def main():
     ui.success("Node provisioned and online", **{
         "Spec": f"#{spec_id}",
         "GPU": (f"{gpu} x{gc}" if gpu else "CPU-only"),
-        "Price": f"${price:.2f}/hour ({price_basis})",
+        "Price": (f"${price:.2f}/hour ({price_basis})" if price else price_basis),
         "Env": env_path,
         "Next": "python main.py   (or start the petabyte-agent service)",
     })

@@ -3,8 +3,8 @@
 #   $env:PETABYTE_API_URL="https://petabyte.market"
 #   $env:PETABYTE_API_KEY="pk_your_node_key"
 #   irm https://petabyte.market/install.ps1 | iex
-# PRICE_PER_HOUR is optional: leave it unset to auto-price from your GPU's benchmark,
-# or set $env:PRICE_PER_HOUR="1.5" to pin your own rate.
+# PRICE_PER_HOUR only applies to a CPU-only node: a GPU node rents at Petabyte's one price
+# for its GPU model (set by Petabyte; sellers do not set or undercut prices).
 #
 # What it does:
 #   1) Verifies admin + NVIDIA driver (nvidia-smi on Windows).
