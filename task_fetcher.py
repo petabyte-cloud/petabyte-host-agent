@@ -2047,8 +2047,36 @@ def _eevee_selftest(img):
             _EEVEE["backend"], _EEVEE["error"] = backend, None
             return True
         errs.append(f"[{backend}] {_EEVEE['error']}")
-    _EEVEE["backend"], _EEVEE["error"] = None, " ".join(errs)
+    _EEVEE["backend"], _EEVEE["error"] = None, " ".join(errs) + " [diag] " + _eevee_diag(img)
     return False
+
+
+def _eevee_diag(img):
+    """Why can't the NVIDIA graphics stack start in the render container? Unresolved dependencies of
+    the driver's EGL/Vulkan libraries as the toolkit mounted them, plus the host driver and toolkit
+    versions. Both backends segfaulted inside NVIDIA's libraries on the RTX 2060 (2026-10-07), the
+    signature of a toolkit that mounts only part of the graphics stack. Never raises."""
+    import subprocess
+    script = ("d=/usr/lib/x86_64-linux-gnu; echo nvlibs=$(ls $d | grep -c nvidia); "
+              "for l in libEGL_nvidia.so.0 libGLX_nvidia.so.0; do [ -e $d/$l ] || { echo absent=$l; continue; }; "
+              "ldd $d/$l | awk '/not found/{print \"missing=\"$1}'; done")
+    parts = []
+    try:
+        r = _run_docker(["docker", "run", "--rm", "--network", "none", *_isolation_flags({"gpu": True}),
+                         *gpu_runtime.docker_gpu_args(), *gpu_runtime.graphics_env(),
+                         "--entrypoint", "sh", img, "-c", script],
+                        timeout=60, capture_output=True, text=True, check=False)
+        parts.append(" ".join(((r.stdout or "") + (r.stderr or "")).split())[:300])
+    except Exception as e:                               # noqa: BLE001
+        parts.append(f"container {type(e).__name__}")
+    for cmd in (["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                ["nvidia-container-cli", "--version"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
+            parts.append(f"{cmd[0]}={out.splitlines()[0][:40] if out else '?'}")
+        except Exception:                                # noqa: BLE001
+            parts.append(f"{cmd[0]}=n/a")
+    return "; ".join(parts)
 
 
 def _eevee_selftest_one(img, backend):
@@ -2073,7 +2101,8 @@ def _eevee_selftest_one(img, backend):
         # has no /proc/driver/nvidia, so the NVIDIA hook failed and EEVEE never passed (2060, 10-07).
         cmd = ["docker", "run", "--rm", "--network", "none", *_isolation_flags({"gpu": True}),
                *gpu_runtime.docker_gpu_args(), *gpu_runtime.graphics_env(),
-               "-v", f"{out}:/out", "--entrypoint", "blender", img,
+               # TMPDIR=/out: a crash leaves blender.crash.txt where we can read it after exit
+               "-v", f"{out}:/out", "-e", "TMPDIR=/out", "--entrypoint", "blender", img,
                "-b", "--gpu-backend", backend, "--factory-startup", "--disable-autoexec",
                "--python-exit-code", "86", "--python-expr", expr, "-o", "/out/pb_eevee_", "-f", "1"]
         r = _run_docker(cmd, timeout=int(os.getenv("EEVEE_SELFTEST_TIMEOUT_S", "180")),
@@ -2091,9 +2120,22 @@ def _eevee_selftest_one(img, backend):
             software = ("llvmpipe" in combined or "egl_bad" in combined
                         or "could not open display" in combined or "software rasteriz" in combined)
         ok = bool(r.returncode == 0 and produced and not software)
-        _EEVEE["error"] = None if ok else (
-            f"exit {r.returncode}{'' if produced else ', no frame'}{', software GL' if software else ''}"
-            f"{', renderer ' + gl if gl else ''}: " + raw.strip()[-180:])
+        if not ok:
+            # The libraries a crash ran through (blender.crash.txt), and the output minus NVIDIA's
+            # repeated "EGL_SUCCESS" lines, which buried the real error on the 2060.
+            crash = ""
+            try:
+                with open(_os.path.join(out, "blender.crash.txt"), errors="replace") as f:
+                    libs = dict.fromkeys(re.findall(r"(lib[\w.+-]*\.so[\w.]*)", f.read()))
+                crash = f", crash in {' '.join(list(libs)[:6]) or '?'}"
+            except OSError:
+                pass
+            tail = "\n".join(ln for ln in raw.strip().splitlines() if "EGL_SUCCESS" not in ln)[-180:]
+            _EEVEE["error"] = (
+                f"exit {r.returncode}{'' if produced else ', no frame'}{', software GL' if software else ''}"
+                f"{', renderer ' + gl if gl else ''}{crash}: " + tail)
+        else:
+            _EEVEE["error"] = None
         return ok
     except Exception as e:                               # noqa: BLE001 — capability probe, never fatal
         _EEVEE["error"] = f"{type(e).__name__}: {e}"[:200]

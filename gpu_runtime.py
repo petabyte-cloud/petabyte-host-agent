@@ -95,7 +95,12 @@ def graphics_env():
                 "-e", "__EGL_VENDOR_LIBRARY_FILENAMES=/pb-egl/10_nvidia.json",
                 "-v", f"{_nvidia_vulkan_icd_json()}:/pb-egl/nvidia_icd.json:ro",
                 "-e", "VK_DRIVER_FILES=/pb-egl/nvidia_icd.json",
-                "-e", "VK_ICD_FILENAMES=/pb-egl/nvidia_icd.json"]   # older Vulkan loaders
+                "-e", "VK_ICD_FILENAMES=/pb-egl/nvidia_icd.json",   # older Vulkan loaders
+                # The image ships NVIDIA EGL *window-system* plugins (wayland/gbm/xcb/xlib) from its
+                # own distro packages, which NVIDIA's libEGL loads at startup; built for other driver
+                # series they can crash the host driver (2060, driver 550: segfault on both backends).
+                # Headless rendering needs none of them, so point the loader at a dir with no configs.
+                "-e", "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/pb-egl/no-platforms"]
     return []
 
 
