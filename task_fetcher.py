@@ -2041,7 +2041,8 @@ def _eevee_selftest(img):
         _os.chmod(out, 0o777)
         expr = _render_setup_expr(samples=1, gpu=True, engine="EEVEE", resolution=(64, 64))
         cmd = ["docker", "run", "--rm", "--network", "none", *_isolation_flags({}),
-               *gpu_runtime.docker_gpu_args(), "-v", f"{out}:/out", "--entrypoint", "blender", img,
+               *gpu_runtime.docker_gpu_args(), *gpu_runtime.graphics_env(),
+               "-v", f"{out}:/out", "--entrypoint", "blender", img,
                "-b", "--factory-startup", "--disable-autoexec", "--python-exit-code", "86",
                "--python-expr", expr, "-o", "/out/pb_eevee_", "-f", "1"]
         r = _run_docker(cmd, timeout=int(os.getenv("EEVEE_SELFTEST_TIMEOUT_S", "180")),
@@ -2081,6 +2082,24 @@ def _eevee_ready():
         return False                                     # not tested yet; re-checked next time
     _EEVEE["ok"] = _eevee_selftest(img)
     return _EEVEE["ok"]
+
+
+_EEVEE_PROBE = threading.Lock()
+
+
+def _eevee_probe_bg():
+    """Run _eevee_ready in the background unless it already has an answer or is running. Called at
+    boot AND after each render: boot skips the test while the render image isn't cached, and before
+    2026-10-07 nothing retried, so a node that pulled the image later never advertised EEVEE."""
+    if _EEVEE["ok"] is not None or not _EEVEE_PROBE.acquire(blocking=False):
+        return
+
+    def run():
+        try:
+            _eevee_ready()
+        finally:
+            _EEVEE_PROBE.release()
+    threading.Thread(target=run, daemon=True, name="pb-eevee-probe").start()
 
 
 def _render_capabilities():
@@ -3305,7 +3324,8 @@ def _run_container(task):
 _IMG_FORMATS = {"PNG": "PNG", "JPEG": "JPEG", "JPG": "JPEG", "EXR": "OPEN_EXR", "OPEN_EXR": "OPEN_EXR"}
 
 
-def _render_setup_expr(samples=None, gpu=True, engine=None, file_format=None, resolution=None):
+def _render_setup_expr(samples=None, gpu=True, engine=None, file_format=None, resolution=None,
+                       optix=True):
     """Blender `--python-expr`, run after the buyer's .blend loads and before `-a` renders it.
 
     0) `engine` (from _render_plan) switches the scene's engine first: 'CYCLES' for a Blender
@@ -3354,7 +3374,7 @@ def _render_setup_expr(samples=None, gpu=True, engine=None, file_format=None, re
         f"        s.cycles.samples = {n}\n"
         f"    if {bool(gpu)}:\n"
         "        p = bpy.context.preferences.addons['cycles'].preferences\n"
-        "        for dt in ('OPTIX', 'CUDA', 'HIP', 'ONEAPI'):\n"
+        f"        for dt in {('OPTIX', 'CUDA', 'HIP', 'ONEAPI') if optix else ('CUDA', 'HIP', 'ONEAPI')}:\n"
         "            try:\n"
         "                p.compute_device_type = dt\n"
         "                devs = p.get_devices_for_type(dt)\n"
@@ -3614,6 +3634,8 @@ def _run_render(task):
         else:
             if task.get("gpu"):
                 cmd += [*gpu_runtime.docker_gpu_args()]
+                if set_engine == "EEVEE":
+                    cmd += gpu_runtime.graphics_env()   # EEVEE needs the driver's EGL libraries
             cmd += [*ep, "-b", "/scene.blend", "--disable-autoexec",
                     "--python-exit-code", "86",
                     "--python-expr", _render_setup_expr(task.get("samples"), gpu=bool(task.get("gpu")),
@@ -3624,13 +3646,30 @@ def _run_render(task):
         # can't consume more of the seller's GPU than the buyer paid to authorize (_run_docker
         # force-removes the container when the client-side timeout fires).
         _rt = task.get("max_runtime_s")
+        _t0 = time.monotonic()
         try:
             _run_docker(cmd, timeout=(int(_rt) if _rt else None), capture_output=True, text=True)
         except subprocess.CalledProcessError as _ce:
-            # Blender exited non-zero. Surface WHY instead of a generic failure: the real reason is
-            # in its output, which until now was discarded (the buyer then saw a hardcoded "it's
-            # probably EEVEE" guess even for a Cycles scene). 2026-10-06.
-            raise RuntimeError(_blender_fail_reason((_ce.stderr or "") + (_ce.stdout or ""))) from _ce
+            # Blender exited non-zero. Surface WHY instead of a generic failure (2026-10-06), and log
+            # its raw output: the mapped reason is only a summary, and once hid the real error.
+            _out = (_ce.stderr or "") + (_ce.stdout or "")
+            report_log(tid, "Blender output (last lines):\n" + _out.strip()[-1500:])
+            _left = (int(_rt) - (time.monotonic() - _t0)) if _rt else None
+            # OptiX can fail where plain CUDA works on the same card (driver/OptiX mismatch): retry
+            # once on CUDA within the remaining authorized runtime instead of failing the buyer.
+            if "PBDEVICE=OPTIX" not in _out or (_left is not None and _left < 60):
+                raise RuntimeError(_blender_fail_reason(_out)) from _ce
+            report_log(tid, "OptiX failed on this node; retrying the render on CUDA")
+            cmd[cmd.index("--python-expr") + 1] = _render_setup_expr(
+                task.get("samples"), gpu=True, engine=set_engine, file_format=task.get("format"),
+                resolution=task.get("resolution"), optix=False)
+            try:
+                _run_docker(cmd, timeout=(int(_left) if _left is not None else None),
+                            capture_output=True, text=True)
+            except subprocess.CalledProcessError as _ce2:
+                _out = (_ce2.stderr or "") + (_ce2.stdout or "")
+                report_log(tid, "Blender output on CUDA (last lines):\n" + _out.strip()[-1500:])
+                raise RuntimeError(_blender_fail_reason(_out)) from _ce2
         _render_frame_files(out_dir, fs, fe)
         report_progress(tid, 85, "uploading frames")
         # 3) tar the frames and upload as the buyer's DOWNLOADABLE output — UNENCRYPTED, under the
@@ -3655,18 +3694,24 @@ def _run_render(task):
         _set_ui(status="idle", task=None, fail=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        _eevee_probe_bg()        # the render image is cached now: test EEVEE if boot couldn't
 
 
 def _blender_fail_reason(output: str) -> str:
     """Map Blender's output to a plain-English reason the buyer can act on, else the raw tail.
     The buyer is never charged for a failed render (see the render except); this only explains it."""
-    low = (output or "").lower()
-    tail = (output or "").strip()[-400:]
-    if "out of memory" in low or "cuda error: out of memory" in low or "optix" in low and "memory" in low:
+    # Our PBDEVICE= marker and Cycles' "Writing constant memory" status line appear in EVERY GPU
+    # render, so they must never decide the reason (2026-10-07: every OptiX failure on the RTX 2060
+    # read as "out of GPU memory" for a scene that peaks at ~150 MB).
+    output = "\n".join(ln for ln in (output or "").splitlines() if not ln.startswith("PBDEVICE="))
+    low = output.lower()
+    tail = output.strip()[-400:]
+    if "out of memory" in low or "out of gpu memory" in low:
         return ("The scene ran out of GPU memory on this node. Try a GPU with more VRAM, lower the "
                 "resolution/samples, or render fewer frames at a time. You were not charged.")
-    if ("no cycles gpu device" in low or "cuda" in low and "no" in low and "device" in low
-            or "optix" in low or "cuda error" in low):
+    if "no cycles gpu device" in low or any(
+            ("optix" in ln or "cuda" in ln) and ("error" in ln or "fail" in ln or "insufficient" in ln)
+            for ln in low.splitlines()):
         return ("This node's GPU could not run the Cycles render (driver/OptiX/CUDA). The job is "
                 "retried on another node; you were not charged for this attempt.")
     if ("no such file" in low or "unable to open" in low or "cannot read" in low
@@ -3674,8 +3719,8 @@ def _blender_fail_reason(output: str) -> str:
         return ("The render Blender could not open this .blend (it may be too old or corrupt). "
                 "Re-save it in a recent Blender and re-submit. You were not charged.")
     if "eevee" in low or "egl" in low:
-        return ("This scene renders with EEVEE, which needs a display a headless GPU server does "
-                "not have. Set the render engine to Cycles in Blender and re-submit. Not charged.")
+        return ("EEVEE could not start a GPU context on this node. Re-submit with engine=CYCLES "
+                "(\"Use recommended settings\" in Studio) for a GPU render. You were not charged.")
     return ("The render did not finish on this node (you were not charged). Blender reported:\n"
             + (tail or "no output")) if tail else "The render did not finish on this node (you were not charged)."
 
@@ -4334,7 +4379,7 @@ def run_agent():
     threading.Thread(target=_job_network_loop, daemon=True, name="pb-jobnet-probe").start()
     # Headless-EEVEE capability: a real EEVEE GPU render in the background (only runs when the render
     # image is cached), so the node advertises EEVEE only where it actually works. Never blocks boot.
-    threading.Thread(target=_eevee_ready, daemon=True, name="pb-eevee-probe").start()
+    _eevee_probe_bg()
     threading.Thread(target=heartbeat_loop, daemon=True).start()   # online while we wait
     _TUN_SETTLED.wait(timeout=240)       # don't claim a serving job this node can't publish yet
     job_loop()

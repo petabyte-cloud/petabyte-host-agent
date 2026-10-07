@@ -76,6 +76,16 @@ def docker_gpu_args():
     return []
 
 
+def graphics_env():
+    """Extra docker args for a GPU *graphics* (EGL) workload such as headless EEVEE. NVIDIA's
+    container toolkit mounts only the compute+utility driver libraries by default, so EGL has no
+    GPU driver and EEVEE cannot start; this asks it for the graphics libraries too. AMD's /dev/dri
+    is already passed by docker_gpu_args()."""
+    if vendor() == "nvidia":
+        return ["-e", "NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics"]
+    return []
+
+
 # Torch runtime image per vendor — used by the FP16 benchmark GEMM and the VRAM wipe. ROCm's torch
 # exposes the same torch.cuda API, so the workload code is identical across vendors.
 _TORCH = {"nvidia": "pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime",
