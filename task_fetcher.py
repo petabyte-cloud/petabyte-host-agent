@@ -2042,7 +2042,9 @@ def _eevee_selftest(img):
     try:
         _os.chmod(out, 0o777)
         expr = _render_setup_expr(samples=1, gpu=True, engine="EEVEE", resolution=(64, 64))
-        cmd = ["docker", "run", "--rm", "--network", "none", *_isolation_flags({}),
+        # gpu=True: the GPU runtime, as a real render gets. With {} a KVM host picked Kata, whose VM
+        # has no /proc/driver/nvidia, so the NVIDIA hook failed and EEVEE never passed (2060, 10-07).
+        cmd = ["docker", "run", "--rm", "--network", "none", *_isolation_flags({"gpu": True}),
                *gpu_runtime.docker_gpu_args(), *gpu_runtime.graphics_env(),
                "-v", f"{out}:/out", "--entrypoint", "blender", img,
                "-b", "--factory-startup", "--disable-autoexec", "--python-exit-code", "86",
