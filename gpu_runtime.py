@@ -80,10 +80,35 @@ def graphics_env():
     """Extra docker args for a GPU *graphics* (EGL) workload such as headless EEVEE. NVIDIA's
     container toolkit mounts only the compute+utility driver libraries by default, so EGL has no
     GPU driver and EEVEE cannot start; this asks it for the graphics libraries too. AMD's /dev/dri
-    is already passed by docker_gpu_args()."""
+    is already passed by docker_gpu_args().
+
+    The toolkit mounts libEGL_nvidia, but GLVND only loads a vendor listed in an egl_vendor.d JSON,
+    which NVIDIA's OpenGL images ship and generic images (linuxserver/blender) don't, so EGL fell
+    back to Mesa llvmpipe (RTX 2060, 2026-10-07: Blender reported "llvmpipe | Mesa"). We mount that
+    one-line JSON read-only and point GLVND at it, so EEVEE gets the NVIDIA driver or fails loudly."""
     if vendor() == "nvidia":
-        return ["-e", "NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics"]
+        return ["-e", "NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics",
+                "-v", f"{_nvidia_egl_vendor_json()}:/pb-egl/10_nvidia.json:ro",
+                "-e", "__EGL_VENDOR_LIBRARY_FILENAMES=/pb-egl/10_nvidia.json"]
     return []
+
+
+@functools.lru_cache(maxsize=1)
+def _nvidia_egl_vendor_json():
+    """Create the GLVND vendor file once in the agent's Docker-visible TMPDIR."""
+    import tempfile
+    body = '{"file_format_version": "1.0.0", "ICD": {"library_path": "libEGL_nvidia.so.0"}}\n'
+    # mkstemp avoids a predictable filename/symlink in a shared temp directory. The systemd agent
+    # sets TMPDIR=/var/lib/petabyte-agent so Docker sees this bind-mount source despite PrivateTmp.
+    fd, path = tempfile.mkstemp(prefix="petabyte-egl-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        os.chmod(path, 0o644)
+    except Exception:
+        os.unlink(path)
+        raise
+    return path
 
 
 # Torch runtime image per vendor — used by the FP16 benchmark GEMM and the VRAM wipe. ROCm's torch
