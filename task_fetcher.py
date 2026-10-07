@@ -2041,7 +2041,16 @@ def _eevee_selftest(img):
     out = tempfile.mkdtemp(prefix="eevee-selftest-")
     try:
         _os.chmod(out, 0o777)
-        expr = _render_setup_expr(samples=1, gpu=True, engine="EEVEE", resolution=(64, 64))
+        expr = _render_setup_expr(samples=1, gpu=True, engine="EEVEE", resolution=(64, 64)) + (
+            # Ask Blender which GL renderer drew the frame: the only reliable software-GL test. EGL
+            # warnings alone are not (the 2060 rendered with exit 0 but logged EGL_BAD_MATCH, 10-07).
+            "\nimport gpu\n"
+            "def _pb_gpu(*a):\n"
+            "    try:\n"
+            "        print('PBGPU=' + gpu.platform.renderer_get() + ' | ' + gpu.platform.vendor_get(), flush=True)\n"
+            "    except Exception as e:\n"
+            "        print('PBGPU=?' + str(e), flush=True)\n"
+            "bpy.app.handlers.render_post.append(_pb_gpu)\n")
         # gpu=True: the GPU runtime, as a real render gets. With {} a KVM host picked Kata, whose VM
         # has no /proc/driver/nvidia, so the NVIDIA hook failed and EEVEE never passed (2060, 10-07).
         cmd = ["docker", "run", "--rm", "--network", "none", *_isolation_flags({"gpu": True}),
@@ -2057,12 +2066,16 @@ def _eevee_selftest(img):
             if line.startswith("blender ") and _EEVEE["blender_version"] is None:
                 _EEVEE["blender_version"] = line.split()[1] if len(line.split()) > 1 else None
         produced = any(f.startswith("pb_eevee_") for f in _os.listdir(out))
-        software = ("llvmpipe" in combined or "egl_bad" in combined
-                    or "could not open display" in combined or "software rasteriz" in combined)
+        gl = next((ln[6:].strip() for ln in raw.splitlines() if ln.startswith("PBGPU=")), None)
+        if gl and not gl.startswith("?"):                # Blender named its renderer: trust that
+            software = any(w in gl.lower() for w in ("llvmpipe", "softpipe", "swrast", "software"))
+        else:                                            # no answer: fall back to log heuristics
+            software = ("llvmpipe" in combined or "egl_bad" in combined
+                        or "could not open display" in combined or "software rasteriz" in combined)
         ok = bool(r.returncode == 0 and produced and not software)
         _EEVEE["error"] = None if ok else (
-            f"exit {r.returncode}{'' if produced else ', no frame'}{', software GL' if software else ''}: "
-            + raw.strip()[-400:])
+            f"exit {r.returncode}{'' if produced else ', no frame'}{', software GL' if software else ''}"
+            f"{', renderer ' + gl if gl else ''}: " + raw.strip()[-400:])
         return ok
     except Exception as e:                               # noqa: BLE001 — capability probe, never fatal
         _EEVEE["error"] = f"{type(e).__name__}: {e}"[:400]
