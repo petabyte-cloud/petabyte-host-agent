@@ -2025,7 +2025,9 @@ def _wipe_ready():
 # headless container is build/driver-specific, so we NEVER assume it — the node advertises EEVEE
 # only after a tiny real EEVEE GPU render actually succeeds here. Tested once per boot, only when the
 # render image is already cached (never pulls on the hot path). AGENT_EEVEE_ENABLED=false opts out.
-_EEVEE = {"ok": None, "blender_version": None}
+# "error": why the node is not EEVEE-capable (self-test output tail), sent in the heartbeat so a
+# failing node can be diagnosed without shell access (2026-10-07: the RTX 2060 reported only false).
+_EEVEE = {"ok": None, "blender_version": None, "error": None}
 
 
 def _eevee_render_image():
@@ -2047,15 +2049,21 @@ def _eevee_selftest(img):
                "--python-expr", expr, "-o", "/out/pb_eevee_", "-f", "1"]
         r = _run_docker(cmd, timeout=int(os.getenv("EEVEE_SELFTEST_TIMEOUT_S", "180")),
                         capture_output=True, text=True, check=False)
-        combined = ((r.stdout or "") + (r.stderr or "")).lower()
+        raw = (r.stdout or "") + (r.stderr or "")
+        combined = raw.lower()
         for line in combined.splitlines():
             if line.startswith("blender ") and _EEVEE["blender_version"] is None:
                 _EEVEE["blender_version"] = line.split()[1] if len(line.split()) > 1 else None
         produced = any(f.startswith("pb_eevee_") for f in _os.listdir(out))
         software = ("llvmpipe" in combined or "egl_bad" in combined
                     or "could not open display" in combined or "software rasteriz" in combined)
-        return bool(r.returncode == 0 and produced and not software)
-    except Exception:                                    # noqa: BLE001 — capability probe, never fatal
+        ok = bool(r.returncode == 0 and produced and not software)
+        _EEVEE["error"] = None if ok else (
+            f"exit {r.returncode}{'' if produced else ', no frame'}{', software GL' if software else ''}: "
+            + raw.strip()[-400:])
+        return ok
+    except Exception as e:                               # noqa: BLE001 — capability probe, never fatal
+        _EEVEE["error"] = f"{type(e).__name__}: {e}"[:400]
         return False
     finally:
         import shutil as _sh2; _sh2.rmtree(out, ignore_errors=True)
@@ -2068,9 +2076,16 @@ def _eevee_ready():
     if _EEVEE["ok"] is not None:
         return _EEVEE["ok"]
     import subprocess
-    if (os.getenv("AGENT_EEVEE_ENABLED", "true").strip().lower() not in ("1", "true", "yes", "on")
-            or not gpu_runtime.has_gpu() or not __import__("shutil").which("docker")):
-        _EEVEE["ok"] = False
+    if os.getenv("AGENT_EEVEE_ENABLED", "true").strip().lower() not in ("1", "true", "yes", "on"):
+        prerequisite_error = "EEVEE self-test disabled; set AGENT_EEVEE_ENABLED=true to enable it"
+    elif not gpu_runtime.has_gpu():
+        prerequisite_error = "No GPU detected; check that the agent can access the GPU and driver"
+    elif not __import__("shutil").which("docker"):
+        prerequisite_error = "Docker executable not found; install Docker and make it available on PATH"
+    else:
+        prerequisite_error = None
+    if prerequisite_error:
+        _EEVEE["ok"], _EEVEE["error"] = False, prerequisite_error
         return False
     img = _eevee_render_image()
     try:
@@ -2079,6 +2094,7 @@ def _eevee_ready():
     except Exception:                                    # noqa: BLE001
         cached = False
     if not cached:
+        _EEVEE["error"] = f"not tested yet: render image {img} is not cached"
         return False                                     # not tested yet; re-checked next time
     _EEVEE["ok"] = _eevee_selftest(img)
     return _EEVEE["ok"]
@@ -2117,7 +2133,8 @@ def _render_capabilities():
     except Exception:                                    # noqa: BLE001
         gpu_count = 1 if gpu_runtime.has_gpu() else 0
     return {"blender": True, "render_engines": engines, "headless_eevee": bool(eevee),
-            "gpu_count": gpu_count, "gpu_vendor": v, "blender_version": _EEVEE["blender_version"]}
+            "gpu_count": gpu_count, "gpu_vendor": v, "blender_version": _EEVEE["blender_version"],
+            "eevee_error": _EEVEE["error"]}
 
 
 # Busy-GPU guard (owner 2026-10-05). A GPU already loaded by something that is not ours (a miner on
