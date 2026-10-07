@@ -2027,7 +2027,11 @@ def _wipe_ready():
 # render image is already cached (never pulls on the hot path). AGENT_EEVEE_ENABLED=false opts out.
 # "error": why the node is not EEVEE-capable (self-test output tail), sent in the heartbeat so a
 # failing node can be diagnosed without shell access (2026-10-07: the RTX 2060 reported only false).
-_EEVEE = {"ok": None, "blender_version": None, "error": None}
+# "backend": the Blender GPU backend whose self-test passed; EEVEE renders use the same one.
+_EEVEE = {"ok": None, "blender_version": None, "error": None, "backend": None}
+# Vulkan first: it needs no EGL. On the RTX 2060 (2026-10-07) NVIDIA's EGL loaded but Blender
+# segfaulted creating the headless OpenGL context; Vulkan renders headless in the same image.
+_EEVEE_BACKENDS = ("vulkan", "opengl")
 
 
 def _eevee_render_image():
@@ -2035,8 +2039,22 @@ def _eevee_render_image():
 
 
 def _eevee_selftest(img):
-    """One tiny headless EEVEE GPU render of the factory scene. True only if a frame is produced on
-    the GPU with no software-GL (llvmpipe) or EGL fallback. Never raises; records the Blender version."""
+    """Self-test each GPU backend in turn; the first that renders on the GPU becomes the node's EEVEE
+    backend. On failure the heartbeat gets every backend's reason. Never raises."""
+    errs = []
+    for backend in _EEVEE_BACKENDS:
+        if _eevee_selftest_one(img, backend):
+            _EEVEE["backend"], _EEVEE["error"] = backend, None
+            return True
+        errs.append(f"[{backend}] {_EEVEE['error']}")
+    _EEVEE["backend"], _EEVEE["error"] = None, " ".join(errs)
+    return False
+
+
+def _eevee_selftest_one(img, backend):
+    """One tiny headless EEVEE GPU render of the factory scene on one Blender GPU backend. True only
+    if a frame is produced on the GPU with no software (llvmpipe) fallback. Records the Blender
+    version, and the reason in _EEVEE["error"] on failure."""
     import tempfile, subprocess, os as _os, shutil as _sh
     out = tempfile.mkdtemp(prefix="eevee-selftest-")
     try:
@@ -2056,8 +2074,8 @@ def _eevee_selftest(img):
         cmd = ["docker", "run", "--rm", "--network", "none", *_isolation_flags({"gpu": True}),
                *gpu_runtime.docker_gpu_args(), *gpu_runtime.graphics_env(),
                "-v", f"{out}:/out", "--entrypoint", "blender", img,
-               "-b", "--factory-startup", "--disable-autoexec", "--python-exit-code", "86",
-               "--python-expr", expr, "-o", "/out/pb_eevee_", "-f", "1"]
+               "-b", "--gpu-backend", backend, "--factory-startup", "--disable-autoexec",
+               "--python-exit-code", "86", "--python-expr", expr, "-o", "/out/pb_eevee_", "-f", "1"]
         r = _run_docker(cmd, timeout=int(os.getenv("EEVEE_SELFTEST_TIMEOUT_S", "180")),
                         capture_output=True, text=True, check=False)
         raw = (r.stdout or "") + (r.stderr or "")
@@ -2075,10 +2093,10 @@ def _eevee_selftest(img):
         ok = bool(r.returncode == 0 and produced and not software)
         _EEVEE["error"] = None if ok else (
             f"exit {r.returncode}{'' if produced else ', no frame'}{', software GL' if software else ''}"
-            f"{', renderer ' + gl if gl else ''}: " + raw.strip()[-400:])
+            f"{', renderer ' + gl if gl else ''}: " + raw.strip()[-180:])
         return ok
     except Exception as e:                               # noqa: BLE001 — capability probe, never fatal
-        _EEVEE["error"] = f"{type(e).__name__}: {e}"[:400]
+        _EEVEE["error"] = f"{type(e).__name__}: {e}"[:200]
         return False
     finally:
         import shutil as _sh2; _sh2.rmtree(out, ignore_errors=True)
@@ -3667,8 +3685,11 @@ def _run_render(task):
             if task.get("gpu"):
                 cmd += [*gpu_runtime.docker_gpu_args()]
                 if set_engine == "EEVEE":
-                    cmd += gpu_runtime.graphics_env()   # EEVEE needs the driver's EGL libraries
-            cmd += [*ep, "-b", "/scene.blend", "--disable-autoexec",
+                    cmd += gpu_runtime.graphics_env()   # EEVEE needs the driver's EGL/Vulkan libraries
+            # EEVEE renders on the backend whose self-test passed on this node (Vulkan or OpenGL)
+            _be = (["--gpu-backend", _EEVEE["backend"]]
+                   if set_engine == "EEVEE" and _EEVEE.get("backend") else [])
+            cmd += [*ep, "-b", *_be, "/scene.blend", "--disable-autoexec",
                     "--python-exit-code", "86",
                     "--python-expr", _render_setup_expr(task.get("samples"), gpu=bool(task.get("gpu")),
                                                         engine=set_engine, file_format=task.get("format"),

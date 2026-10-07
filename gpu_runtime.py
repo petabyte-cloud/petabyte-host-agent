@@ -85,22 +85,37 @@ def graphics_env():
     The toolkit mounts libEGL_nvidia, but GLVND only loads a vendor listed in an egl_vendor.d JSON,
     which NVIDIA's OpenGL images ship and generic images (linuxserver/blender) don't, so EGL fell
     back to Mesa llvmpipe (RTX 2060, 2026-10-07: Blender reported "llvmpipe | Mesa"). We mount that
-    one-line JSON read-only and point GLVND at it, so EEVEE gets the NVIDIA driver or fails loudly."""
+    one-line JSON read-only and point GLVND at it, so EEVEE gets the NVIDIA driver or fails loudly.
+
+    Vulkan (Blender's --gpu-backend vulkan, which needs no EGL) has the same gap: the image lists only
+    Mesa's Vulkan ICDs, so NVIDIA's ICD file is mounted the same way and the loader pointed at it."""
     if vendor() == "nvidia":
         return ["-e", "NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics",
                 "-v", f"{_nvidia_egl_vendor_json()}:/pb-egl/10_nvidia.json:ro",
-                "-e", "__EGL_VENDOR_LIBRARY_FILENAMES=/pb-egl/10_nvidia.json"]
+                "-e", "__EGL_VENDOR_LIBRARY_FILENAMES=/pb-egl/10_nvidia.json",
+                "-v", f"{_nvidia_vulkan_icd_json()}:/pb-egl/nvidia_icd.json:ro",
+                "-e", "VK_DRIVER_FILES=/pb-egl/nvidia_icd.json",
+                "-e", "VK_ICD_FILENAMES=/pb-egl/nvidia_icd.json"]   # older Vulkan loaders
     return []
 
 
-@functools.lru_cache(maxsize=1)
 def _nvidia_egl_vendor_json():
-    """Create the GLVND vendor file once in the agent's Docker-visible TMPDIR."""
+    return _driver_json("petabyte-egl-",
+                        '{"file_format_version": "1.0.0", "ICD": {"library_path": "libEGL_nvidia.so.0"}}\n')
+
+
+def _nvidia_vulkan_icd_json():
+    return _driver_json("petabyte-vk-", '{"file_format_version": "1.0.1", "ICD": '
+                        '{"library_path": "libGLX_nvidia.so.0", "api_version": "1.3.0"}}\n')
+
+
+@functools.lru_cache(maxsize=None)
+def _driver_json(prefix, body):
+    """Create a driver-discovery JSON once in the agent's Docker-visible TMPDIR."""
     import tempfile
-    body = '{"file_format_version": "1.0.0", "ICD": {"library_path": "libEGL_nvidia.so.0"}}\n'
     # mkstemp avoids a predictable filename/symlink in a shared temp directory. The systemd agent
     # sets TMPDIR=/var/lib/petabyte-agent so Docker sees this bind-mount source despite PrivateTmp.
-    fd, path = tempfile.mkstemp(prefix="petabyte-egl-", suffix=".json")
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".json")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(body)
