@@ -100,8 +100,32 @@ def graphics_env():
                 # own distro packages, which NVIDIA's libEGL loads at startup; built for other driver
                 # series they can crash the host driver (2060, driver 550: segfault on both backends).
                 # Headless rendering needs none of them, so point the loader at a dir with no configs.
-                "-e", "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/pb-egl/no-platforms"]
+                "-e", "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/pb-egl/no-platforms",
+                *_nvidia_compat_lib_args()]
     return []
+
+
+# Driver libraries an OLD nvidia-container-toolkit doesn't know to mount. libnvidia-gpucomp (driver
+# 535+) is a hard dependency of libEGL_nvidia/libGLX_nvidia; toolkit 1.12.1 on the RTX 2060 (driver
+# 550.67) left it out, so EEVEE segfaulted on both backends (2026-10-07). Mounted into a private dir
+# on the library path, never over the toolkit's own mounts (newer toolkits mount it themselves).
+_COMPAT_LIBS = ("libnvidia-gpucomp.so.",)
+_LIB_DIRS = ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib")
+
+
+@functools.lru_cache(maxsize=1)
+def _nvidia_compat_lib_args():
+    found = {}
+    for d in _LIB_DIRS:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if n.startswith(_COMPAT_LIBS) and n[n.index(".so.") + 4:][:1].isdigit() and n not in found:
+                found[n] = os.path.join(d, n)
+    args = [a for n, p in sorted(found.items()) for a in ("-v", f"{p}:/pb-nvlib/{n}:ro")]
+    return args + (["-e", "LD_LIBRARY_PATH=/pb-nvlib"] if found else [])
 
 
 def _nvidia_egl_vendor_json():
