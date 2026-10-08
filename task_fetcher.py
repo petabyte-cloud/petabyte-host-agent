@@ -415,6 +415,10 @@ def heartbeat_loop():
                         _handle_snapshot(_s)
                 except Exception as _se:             # noqa: BLE001
                     logging.debug(f"snapshot handling skipped: {_se}")
+                try:
+                    _kill_tasks(_body.get("kill_tasks"))   # admin-killed jobs: stop their containers
+                except Exception as _ke:             # noqa: BLE001 — never break a heartbeat over a kill
+                    logging.warning(f"admin kill skipped: {_ke}")
                 # SIGNED SUPPORT FIX (fixes.py): queue it for the root runner, which verifies it;
                 # then report anything the runner finished. Never breaks a heartbeat.
                 try:
@@ -3305,6 +3309,34 @@ def _run_benchmark(task):
     _set_ui(status="idle", task=None, ok=response.is_success)
 
 
+TASK_LABEL = "market.petabyte.task"
+_KILLED = set()                   # task ids an admin killed: never retried on this node
+
+
+def _kill_tasks(ids):
+    """An admin killed these tasks (POST /admin/tasks/{id}/kill; the server lists them in the heartbeat
+    reply while this node still reports them live). Remove their job containers now instead of letting
+    them run to the end of the booking. The job's own docker call then fails, and its failure report is
+    ignored by the server (the task is already terminal). Only work this node is running is touched."""
+    import subprocess as _sp
+    live = set(_live_task_ids())
+    for tid in ids or []:
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            continue
+        if tid not in live:
+            continue
+        _KILLED.add(tid)
+        out = _sp.run(["docker", "ps", "-q", "--filter", f"label={TASK_LABEL}={tid}"],
+                      capture_output=True, text=True, timeout=15, check=False).stdout.split()
+        for cid in out:
+            if re.fullmatch(r"[0-9a-f]{12,64}", cid):
+                _sp.run(["docker", "rm", "-f", cid], capture_output=True, timeout=30, check=False)
+        if out:
+            logging.warning(f"task {tid} killed by an admin: removed {len(out)} container(s)")
+
+
 def _run_docker(argv, timeout=None, *, capture_output=False, text=False, check=True):
     """Run a `docker run --rm ...` command with a unique --name, and if the CLIENT times out,
     force-remove the daemon-owned container. Killing the local docker client does NOT stop the
@@ -3315,7 +3347,9 @@ def _run_docker(argv, timeout=None, *, capture_output=False, text=False, check=T
     name = None
     if list(argv[:3]) == ["docker", "run", "--rm"]:
         name = "pb-task-" + _uuid.uuid4().hex[:12]
-        argv = list(argv[:3]) + ["--name", name] + list(argv[3:])
+        # Tag the container with the job it runs, so an admin kill (_kill_tasks) can find it.
+        tag = ["--label", f"{TASK_LABEL}={_CURRENT_TASK['id']}"] if _CURRENT_TASK["id"] is not None else []
+        argv = list(argv[:3]) + ["--name", name] + tag + list(argv[3:])
     try:
         return _sp.run(argv, check=check, timeout=timeout, capture_output=capture_output, text=text)
     except _sp.TimeoutExpired:
@@ -3920,6 +3954,8 @@ def _run_render(task):
         try:
             _run_docker(cmd, timeout=(int(_rt) if _rt else None), capture_output=True, text=True)
         except subprocess.CalledProcessError as _ce:
+            if tid in _KILLED:                      # an admin killed it: no CUDA retry
+                raise RuntimeError("killed by an admin") from _ce
             # Blender exited non-zero. Surface WHY instead of a generic failure (2026-10-06), and log
             # its raw output: the mapped reason is only a summary, and once hid the real error.
             _out = (_ce.stderr or "") + (_ce.stdout or "")
