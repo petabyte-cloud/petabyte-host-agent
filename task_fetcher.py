@@ -733,6 +733,9 @@ def report_progress(task_id, percent, message=""):
 
 
 def report_log(task_id, line):
+    if not str(task_id).isdigit():       # not a buyer task (e.g. the inference tunnel): log locally
+        logging.info("%s: %s", task_id, line)
+        return
     _post("/jobs/log", {"task_id": task_id, "line": line})
 
 

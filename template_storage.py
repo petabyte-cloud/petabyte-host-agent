@@ -107,9 +107,22 @@ def free_bytes():
     return shutil.disk_usage(root).free
 
 
+def node_images():
+    """IDs of images the node itself depends on: the mandatory VRAM-wipe image. A template that
+    pulled the same image (pytorch) made it cache-owned, and LRU eviction then deleted it; every
+    later job was refused for an unverifiable wipe (spec 270, 2026-10-08). Never evicted here."""
+    try:
+        import gpu_runtime
+        refs = [r for r in gpu_runtime.wipe_image_candidates() if r]
+    except Exception:                                    # noqa: BLE001 — never block a launch on it
+        return set()
+    return {i["Id"] for i in (inspect(r) for r in refs) if i}
+
+
 def collect(state, *, all_owned=False):
     budget, reserve = policy()
     present = set(docker("image", "ls", "-aq", "--no-trunc").splitlines())
+    keep = set() if all_owned else node_images()     # uninstall (all_owned) still removes everything
     for image_id, entry in sorted(list(state["images"].items()),
                                   key=lambda item: item[1]["used_at"]):
         if image_id not in present:
@@ -118,6 +131,8 @@ def collect(state, *, all_owned=False):
         size = sum(x["bytes"] for x in state["images"].values())
         if not all_owned and size <= budget and free_bytes() >= reserve:
             break
+        if image_id in keep:
+            continue
         # Include stopped containers belonging to ANY application. Never force deletion.
         if docker("ps", "-aq", "--filter", "ancestor=" + image_id):
             continue
