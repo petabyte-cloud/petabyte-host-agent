@@ -86,3 +86,10 @@ cp "$TMP/agent.tar.gz.sig" "$STATE/bundle.sig"     # lets the next tick skip the
 # branches: the update that first ships it is applied by the previous update.sh, which lacks this.
 "$APP/.venv/bin/python" "$APP/isolation.py" repair --auto "$BUNDLE_SHA" \
   || echo "isolation: this host still can't isolate buyers' apps (see above); serving batch jobs only"
+
+# Keep the NVIDIA Container Toolkit current (gpu_toolkit.py), once per signed bundle: toolkit packages
+# only, from NVIDIA's repo; never the GPU driver, never a Docker restart (running rentals keep going).
+if [ -f "$APP/gpu_toolkit.py" ]; then
+  "$APP/.venv/bin/python" "$APP/gpu_toolkit.py" upgrade --auto "$BUNDLE_SHA" \
+    || echo "gpu toolkit: not upgraded (see above); the agent mounts what an old toolkit misses"
+fi

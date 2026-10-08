@@ -2209,7 +2209,26 @@ def _render_capabilities():
         gpu_count = 1 if gpu_runtime.has_gpu() else 0
     return {"blender": True, "render_engines": engines, "headless_eevee": bool(eevee),
             "gpu_count": gpu_count, "gpu_vendor": v, "blender_version": _EEVEE["blender_version"],
-            "eevee_error": _EEVEE["error"]}
+            "eevee_error": _EEVEE["error"], **_nvidia_stack()}
+
+
+_NV_STACK = {"at": 0.0, "v": {}}
+
+
+def _nvidia_stack():
+    """Host NVIDIA driver + container-toolkit versions, so ops see which sellers run an old stack
+    (gpu_toolkit.py upgrades the toolkit; drivers are the seller's). Cached for 10 minutes."""
+    if gpu_runtime.vendor() != "nvidia":
+        return {}
+    if time.time() - _NV_STACK["at"] > 600:
+        import gpu_toolkit
+        try:
+            drv = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                                 capture_output=True, text=True, timeout=10).stdout.split()[0]
+        except Exception:                                # noqa: BLE001 — advisory
+            drv = None
+        _NV_STACK.update(at=time.time(), v={"nvidia_driver": drv, "nvidia_toolkit": gpu_toolkit.installed()})
+    return _NV_STACK["v"]
 
 
 # Busy-GPU guard (owner 2026-10-05). A GPU already loaded by something that is not ours (a miner on
