@@ -2060,6 +2060,36 @@ def _wipe_ready():
     return _WIPE_READY["ok"]
 
 
+# `kicked` starts at import: run_agent already starts the first pull of the wipe image.
+_WIPE_WAIT = {"since": None, "kicked": time.time(), "reported": False}
+
+
+def _wipe_image_pending():
+    """True while a GPU node must not CLAIM jobs: its mandatory-wipe image is still downloading
+    (fresh install, or right after an auto-update). _wipe_ready() keeps the node off sale, but the
+    server still hands it GPU probes — and claiming one then made the job refuse itself, bench a
+    healthy node and email a false "mandatory VRAM wipe failed" report (spec 270, 2026-10-08).
+    Retries a failed pull every 10 min; still not cached after 2 h is stuck, not slow, so support
+    gets ONE diagnostics report (a node that can never pull must not go silent)."""
+    if _wipe_ready():
+        if _WIPE_WAIT["since"] is not None:
+            _WIPE_WAIT.update(since=None, reported=False)
+            logging.warning("VRAM-wipe image cached: taking jobs again")
+        return False
+    now = time.time()
+    if _WIPE_WAIT["since"] is None:
+        _WIPE_WAIT["since"] = now
+        logging.warning("VRAM-wipe image still downloading: not taking jobs until it is cached")
+    if now - _WIPE_WAIT["kicked"] >= 600:                  # the first pull may have failed
+        _WIPE_WAIT["kicked"] = now
+        _ensure_wipe_image_async()
+    if now - _WIPE_WAIT["since"] >= 7200 and not _WIPE_WAIT["reported"]:
+        _WIPE_WAIT["reported"] = True
+        threading.Thread(target=lambda: _send_diagnostics("VRAM-wipe image not cached after 2 h"),
+                         daemon=True, name="pb-diagnostics").start()
+    return True
+
+
 # Headless EEVEE capability (2026-10-06). EEVEE needs an EGL GPU context; whether that works in a
 # headless container is build/driver-specific, so we NEVER assume it — the node advertises EEVEE
 # only after a tiny real EEVEE GPU render actually succeeds here. Tested once per boot, only when the
@@ -4432,6 +4462,9 @@ def job_loop():
                 continue
             if _draining():                      # an opt-in driver update waits for this node to idle
                 time.sleep(POLL_S)
+                continue
+            if _wipe_image_pending():            # mandatory-wipe image still downloading: no new jobs
+                time.sleep(30)                   # the pull takes minutes; no need to poll faster
                 continue
             # spec_id pins the claim to THIS machine: one account's machines (or every JIT standby
             # droplet, which share the operator account) must never run each other's jobs.
