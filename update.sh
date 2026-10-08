@@ -93,3 +93,9 @@ if [ -f "$APP/gpu_toolkit.py" ]; then
   "$APP/.venv/bin/python" "$APP/gpu_toolkit.py" upgrade --auto "$BUNDLE_SHA" \
     || echo "gpu toolkit: not upgraded (see above); the agent mounts what an old toolkit misses"
 fi
+
+# OPT-IN NVIDIA driver update (gpu_driver.py): only if the seller turned it on for this node, only on
+# Ubuntu / Pop!_OS (never WSL or Secure Boot), only while idle; verified before it reboots.
+if [ -f "$APP/gpu_driver.py" ]; then
+  "$APP/.venv/bin/python" "$APP/gpu_driver.py" upgrade || echo "gpu driver: no update applied (see above)"
+fi

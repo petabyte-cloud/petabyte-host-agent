@@ -148,9 +148,15 @@ class Response:
         return json.loads(self.content)
 
 
-def get(url, timeout=60, max_redirects=5, max_bytes=MAX_BYTES):
-    deadline = time.monotonic() + min(float(timeout), 60.0)
-    if timeout <= 0 or not 0 < max_bytes <= 128 * 1024 * 1024 or not 0 <= max_redirects <= 5:
+SINK_MAX_BYTES = 8 * 1024 ** 3      # streamed to a file (render inputs): disk, not memory
+
+
+def get(url, timeout=60, max_redirects=5, max_bytes=MAX_BYTES, sink=None):
+    """Fetch a public URL with the same destination pinning. `sink`: a file to stream the body into
+    instead of memory (render scene archives), which allows SINK_MAX_BYTES and up to an hour."""
+    cap_bytes, cap_time = (SINK_MAX_BYTES, 3600.0) if sink is not None else (128 * 1024 * 1024, 60.0)
+    deadline = time.monotonic() + min(float(timeout), cap_time)
+    if timeout <= 0 or not 0 < max_bytes <= cap_bytes or not 0 <= max_redirects <= 5:
         raise FetchDenied("invalid notebook fetch limits")
     for hop in range(max_redirects + 1):
         parsed, host, port, records = _destination(url, deadline)
@@ -182,17 +188,21 @@ def get(url, timeout=60, max_redirects=5, max_bytes=MAX_BYTES):
                     raise FetchDenied("invalid notebook response length") from None
                 if not 0 <= length <= max_bytes:
                     raise FetchDenied("notebook response exceeds size limit")
-            body = bytearray()
+            body, got = bytearray(), 0
             while not response.isclosed():
                 conn.transport_socket.settimeout(_remaining(deadline))
-                block = response.read1(min(65536, max_bytes + 1 - len(body)))
+                block = response.read1(min(65536, max_bytes + 1 - got))
                 if not block:
                     break
-                body.extend(block)
-                if len(body) > max_bytes:
+                got += len(block)
+                if got > max_bytes:
                     raise FetchDenied("notebook response exceeds size limit")
+                if sink is None:
+                    body.extend(block)
+                else:
+                    sink.write(block)
             _remaining(deadline)
-            if length is not None and len(body) != length:
+            if length is not None and got != length:
                 raise FetchDenied("incomplete notebook response")
             return Response(response.status, bytes(body))
         except FetchDenied:

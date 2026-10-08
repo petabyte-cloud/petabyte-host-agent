@@ -118,8 +118,45 @@ _JOB_RUNNING = threading.Event()
 _CLAIM_LOCK = threading.Lock()
 
 
+# Opt-in NVIDIA driver updates (gpu_driver.py, run as root by update.sh). The agent mirrors the
+# seller's dashboard choice into OPTIN, publishes its live tasks to BUSY on every heartbeat, and claims
+# no new job while gpu_driver.py holds DRAIN (it then installs and reboots only an idle node).
+_DRV = {n: f"/var/lib/petabyte-agent/{f}" for n, f in (
+    ("optin", "driver_update_optin"), ("busy", "busy.json"), ("drain", "drain"), ("state", "gpu_driver.json"))}
+
+
+def _draining():
+    return os.path.exists(_DRV["drain"])
+
+
+def _driver_sync(body):
+    try:
+        if isinstance(body, dict) and "driver_updates" in body:
+            if body["driver_updates"]:
+                open(_DRV["optin"], "w").close()
+            elif os.path.exists(_DRV["optin"]):
+                os.unlink(_DRV["optin"])
+        with open(_DRV["busy"] + ".tmp", "w") as f:
+            json.dump({"at": time.time(), "tasks": _live_task_ids()}, f)
+        os.replace(_DRV["busy"] + ".tmp", _DRV["busy"])
+    except OSError:                                      # e.g. a dev run without the state dir
+        pass
+
+
+def _driver_update_report():
+    """The last opt-in driver update attempt, for the seller's dashboard, or None."""
+    try:
+        with open(_DRV["state"]) as f:
+            st = json.load(f)
+        return {k: st.get(k) for k in ("ok", "reason", "before", "target", "at", "rebooting")}
+    except (OSError, ValueError):
+        return None
+
+
 def _selling_now():
     if _GPU_UNUSABLE.is_set() or _fixes.pending():   # not offered while a support fix is in flight
+        return False
+    if _draining():                                   # an opt-in driver update waits for idle
         return False
     s, e = _sched["start"], _sched["end"]
     if s is None or e is None or s == e:
@@ -278,7 +315,8 @@ def heartbeat_loop():
                    "selling_now": _advertise_selling_now(),  # JIT also waits for tunnel enrollment
                    "gpu_busy": _gpu_busy_report(),           # why it is not offered (busy-GPU guard)
                    "render_capabilities": _render_capabilities(),   # engines + headless_eevee (self-tested)
-                   "remote_fixes": _fixes.enabled()}  # owner allowed signed support fixes
+                   "remote_fixes": _fixes.enabled(),  # owner allowed signed support fixes
+                   "driver_update": _driver_update_report()}   # last opt-in driver update attempt
             try:
                 import diagnostics
                 _hb["diagnostics"] = diagnostics.status()
@@ -330,6 +368,7 @@ def heartbeat_loop():
                 _note_gateways(_body.get("gateways"))
                 _note_egress_gateway(_body.get("egress_gateway"))
                 _note_agent_update(_body)       # server-requested signed self-update (job_loop)
+                _driver_sync(_body)             # opt-in driver updates: consent + what is running
                 _sc = _body.get("sell_schedule")
                 if _sc is not None:
                     _sched["start"], _sched["end"] = _parse_sched(_sc)
@@ -3506,6 +3545,77 @@ def _render_setup_expr(samples=None, gpu=True, engine=None, file_format=None, re
     )
 
 
+def _relink_expr(search_dir):
+    """Prefix for a project-folder render: relink every texture/library the .blend can't find, by
+    file name, from the uploaded folder (Blender's File > External Data > Find Missing Files). Fixes
+    absolute paths from the author's machine (C:\\Users\\...\\wood.jpg). Python 3.5-safe (2.79b)."""
+    if not search_dir:
+        return ""
+    return ("import bpy\n"
+            "try:\n"
+            "    bpy.ops.file.find_missing_files(directory=%r)\n"
+            "except Exception as e:\n"
+            "    print('PBRELINK failed: %%s' %% e)\n") % search_dir
+
+
+# Render inputs stream to disk; a project archive (scene + textures) may be large.
+_SCENE_MAX = int(os.getenv("RENDER_INPUT_MAX_BYTES", str(4 * 1024 ** 3)))
+_ZIP_MAX_FILES = 20000
+
+
+def _zip_junk(name):
+    return any(p.startswith(".") or p == "__MACOSX" for p in name.split("/"))
+
+
+def _scene_in_zip(infos):
+    """The archive's main .blend: the shallowest, then the largest (linked libraries sit deeper or
+    are smaller). Mirrors lumaris_api/blend_inspect.scene_in_zip, so the check and the render agree."""
+    blends = [i for i in infos if i.filename.replace("\\", "/").lower().endswith(".blend")
+              and not _zip_junk(i.filename.replace("\\", "/"))]
+    if not blends:
+        return None
+    return min(blends, key=lambda i: (i.filename.replace("\\", "/").count("/"), -i.file_size)).filename
+
+
+def _unzip_scene(path, dest):
+    """Extract an uploaded project archive into `dest`; return the main .blend's path inside it.
+    Refuses absolute or `..` names and symlinks, skips macOS/hidden junk, and caps the file count and
+    the bytes ACTUALLY written (a zip bomb's declared sizes can lie)."""
+    import zipfile
+    root = os.path.realpath(dest)
+    os.makedirs(root, exist_ok=True)
+    with zipfile.ZipFile(path) as zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if len(infos) > _ZIP_MAX_FILES:
+            raise RuntimeError(f"The project archive has too many files ({_ZIP_MAX_FILES:,} max).")
+        main = _scene_in_zip(infos)
+        if not main:
+            raise RuntimeError("No .blend file in the uploaded project archive.")
+        budget = _SCENE_MAX
+        for i in infos:
+            name = i.filename.replace("\\", "/")
+            parts = name.split("/")
+            if (name.startswith("/") or ".." in parts or ":" in parts[0]
+                    or (i.external_attr >> 16) & 0o170000 == 0o120000):
+                raise RuntimeError(f"Unsafe path in the project archive: {i.filename[:120]}")
+            if _zip_junk(name):
+                continue
+            target = os.path.realpath(os.path.join(root, name))
+            if not target.startswith(root + os.sep):
+                raise RuntimeError(f"Unsafe path in the project archive: {i.filename[:120]}")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with zf.open(i) as src, open(target, "wb") as dst:
+                while True:
+                    block = src.read(1 << 20)
+                    if not block:
+                        break
+                    budget -= len(block)
+                    if budget < 0:
+                        raise RuntimeError("The project archive expands past the size limit.")
+                    dst.write(block)
+    return main.replace("\\", "/")
+
+
 def _render_setup_expr_279(engine=None):
     """Blender 2.79b `--python-expr` — Python 3.5, so no f-strings in the generated code. Keeps the
     file's own engine (Blender Internal) unless the buyer named one, writes PNG frames (stitchable
@@ -3681,6 +3791,7 @@ def _run_render(task):
     ep = ["--entrypoint", "blender", image]
     work = tempfile.mkdtemp(prefix=f"render-{tid}-")
     scene = _os.path.join(work, "scene.blend")
+    mount, blend_in, search = ["-v", f"{scene}:/scene.blend:ro"], "/scene.blend", None
     out_dir = _os.path.join(work, "out"); _os.makedirs(out_dir, exist_ok=True)
     _os.chmod(out_dir, 0o777)   # forced non-root container writes frames; the 0700 parent tmpdir
     # keeps this world-writable leaf unreachable by any other host account
@@ -3688,7 +3799,19 @@ def _run_render(task):
         # 1) pull the scene via a pre-signed GET (no standing creds on the node)
         g = httpx.post(f"{API_URL}/jobs/input_url", headers=HEADERS, timeout=15,
                        json={"task_id": tid, "ref": task.get("blend_ref", "")}, trust_env=False).json()
-        open(scene, "wb").write(safe_fetch.get(g["download_url"], timeout=120, max_bytes=128 * 1024 * 1024).content)
+        with open(scene, "wb") as fh:            # streamed to disk: a project archive can be large
+            safe_fetch.get(g["download_url"], timeout=1800, max_bytes=_SCENE_MAX, sink=fh)
+        with open(scene, "rb") as fh:
+            is_zip = fh.read(4) == b"PK\x03\x04"
+        if is_zip:
+            # A project folder (scene + textures), zipped by /studio: render the main .blend in place
+            # and relink any texture it can't find from the folder, by file name.
+            pdir = _os.path.join(work, "scene")
+            main = _unzip_scene(scene, pdir)
+            _os.unlink(scene)
+            scene = _os.path.join(pdir, main)
+            mount, blend_in, search = ["-v", f"{pdir}:/scene:ro"], "/scene/" + main, "/scene"
+            report_log(tid, f"project folder: rendering {main}; missing textures are relinked from the folder")
         report_progress(tid, 15, f"scene fetched; rendering {fs}-{fe} in {image}")
 
         # 1b) Detect the scene's render engine BEFORE committing GPU time. EEVEE needs an EGL GPU
@@ -3700,7 +3823,7 @@ def _run_render(task):
             try:
                 _dcmd = ["docker", "run", "--rm", "--network", "none"]
                 _dcmd += _isolation_flags(task)
-                _dcmd += ["-v", f"{scene}:/scene.blend:ro", *ep, "-b", "/scene.blend",
+                _dcmd += [*mount, *ep, "-b", blend_in,
                           "--disable-autoexec", "--python-expr",
                           "import bpy;print('PBENGINE='+bpy.context.scene.render.engine)"]
                 _d = _run_docker(_dcmd, capture_output=True, text=True, timeout=120, check=False)
@@ -3733,15 +3856,15 @@ def _run_render(task):
         # the scene's embedded scripts from running at all.
         cmd = ["docker", "run", "--rm", "--network", "none"]
         cmd += _isolation_flags(task)
-        cmd += ["-v", f"{scene}:/scene.blend:ro", "-v", f"{out_dir}:/out"]
+        cmd += [*mount, "-v", f"{out_dir}:/out"]
         if runner == "2.79":
             # Blender Internal is CPU-only: no GPU flags. The host's verified 2.79b tree is mounted
             # read-only and run in the same image (it ships the X/GL libs 2.79 links against).
             report_progress(tid, 18, "rendering as authored with Blender 2.79b (CPU)")
             cmd += ["-v", f"{_ensure_blender_279()}:/opt/blender-2.79b:ro",
                     "--entrypoint", "/opt/blender-2.79b/blender", image,
-                    "-b", "/scene.blend", "--disable-autoexec",
-                    "--python-expr", _render_setup_expr_279(set_engine)]
+                    "-b", blend_in, "--disable-autoexec",
+                    "--python-expr", _relink_expr(search) + _render_setup_expr_279(set_engine)]
         else:
             if task.get("gpu"):
                 cmd += [*gpu_runtime.docker_gpu_args()]
@@ -3750,9 +3873,9 @@ def _run_render(task):
             # EEVEE renders on the backend whose self-test passed on this node (Vulkan or OpenGL)
             _be = (["--gpu-backend", _EEVEE["backend"]]
                    if set_engine == "EEVEE" and _EEVEE.get("backend") else [])
-            cmd += [*ep, "-b", *_be, "/scene.blend", "--disable-autoexec",
+            cmd += [*ep, "-b", *_be, blend_in, "--disable-autoexec",
                     "--python-exit-code", "86",
-                    "--python-expr", _render_setup_expr(task.get("samples"), gpu=bool(task.get("gpu")),
+                    "--python-expr", _relink_expr(search) + _render_setup_expr(task.get("samples"), gpu=bool(task.get("gpu")),
                                                         engine=set_engine, file_format=task.get("format"),
                                                         resolution=task.get("resolution"))]
         cmd += ["-o", "/out/frame_", "-s", str(fs), "-e", str(fe), "-j", "1", "-a"]
@@ -3774,7 +3897,7 @@ def _run_render(task):
             if "PBDEVICE=OPTIX" not in _out or (_left is not None and _left < 60):
                 raise RuntimeError(_blender_fail_reason(_out)) from _ce
             report_log(tid, "OptiX failed on this node; retrying the render on CUDA")
-            cmd[cmd.index("--python-expr") + 1] = _render_setup_expr(
+            cmd[cmd.index("--python-expr") + 1] = _relink_expr(search) + _render_setup_expr(
                 task.get("samples"), gpu=True, engine=set_engine, file_format=task.get("format"),
                 resolution=task.get("resolution"), optix=False)
             try:
@@ -4305,6 +4428,9 @@ def job_loop():
                 time.sleep(POLL_S)
                 continue
             if _self_update_holds_claims():      # updating to a newer signed agent: no new jobs
+                time.sleep(POLL_S)
+                continue
+            if _draining():                      # an opt-in driver update waits for this node to idle
                 time.sleep(POLL_S)
                 continue
             # spec_id pins the claim to THIS machine: one account's machines (or every JIT standby
