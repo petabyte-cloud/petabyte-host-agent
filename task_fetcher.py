@@ -556,7 +556,7 @@ def _run_project_bundle(task, env):
         gpu = bool(env.get("gpu"))
         image = gpu_runtime.torch_image() if gpu else "python:3.11-slim"
         name = f"pb-run-{tid}-{_uuid.uuid4().hex[:6]}"
-        cmd = ["docker", "run", "--rm", "--name", name, "--network", "none",
+        cmd = ["docker", "run", "--rm", "--name", name, "--label", f"{TASK_LABEL}={tid}", "--network", "none",
                "-v", f"{work}:/work", "-w", "/work"]
         cmd += _isolation_flags(task)
         if gpu:
@@ -3459,6 +3459,8 @@ def build_container_cmd(task, name=None):
     argv = ["docker", "run", "--rm"]
     if name:
         argv += ["--name", name]
+    if task.get("task_id") is not None:                  # findable by an admin kill (_kill_tasks)
+        argv += ["--label", f"{TASK_LABEL}={task['task_id']}"]
     argv += ["--network", "none"]
     argv += _isolation_flags(task)
     env = task.get("env") or {}
@@ -3978,20 +3980,13 @@ def _run_render(task):
                 raise RuntimeError(_blender_fail_reason(_out)) from _ce2
         _render_frame_files(out_dir, fs, fe)
         report_progress(tid, 85, "uploading frames")
-        # 3) tar the frames and upload as the buyer's DOWNLOADABLE output — UNENCRYPTED, under the
-        # job's output prefix — so an artist downloads exactly the frames Blender rendered, via
+        # 3) upload the frames as the buyer's DOWNLOADABLE output — UNENCRYPTED, under the job's
+        # output prefix — so an artist downloads exactly the frames Blender rendered, via
         # /jobs/output_url (NOT the encrypted backup path, which the buyer could never open).
-        bundle = _os.path.join(work, f"frames_{fs}_{fe}.tar")
-        with tarfile.open(bundle, "w") as tf:
-            tf.add(out_dir, arcname="frames")
-        grant = httpx.post(f"{API_URL}/jobs/output_put", headers=HEADERS, timeout=15,
-                           json={"task_id": tid, "filename": f"frames_{fs}_{fe}.tar"}, trust_env=False).json()
-        raw = open(bundle, "rb").read()
-        uploaded = httpx.put(grant["upload_url"], content=raw, timeout=600, trust_env=False)
-        uploaded.raise_for_status()   # storage rejection is failure, never a completed result
-        _post("/jobs/result", _signed_result(tid, status="completed",
-                                             result=grant["ref"],   # clean s3 URI -> /jobs/output_url
-                                             content_hash=hashlib.sha256(raw).hexdigest()))
+        refs, hashes = _upload_frame_parts(tid, out_dir, work, fs, fe)
+        _post("/jobs/result", _signed_result(
+            tid, status="completed", result=refs[0],   # clean s3 URI -> /jobs/output_url lists every part
+            content_hash=hashes[0] if len(hashes) == 1 else hashlib.sha256("\n".join(hashes).encode()).hexdigest()))
         _set_ui(status="idle", task=None, ok=True)
     except Exception as e:                              # noqa: BLE001
         reason = str(e)[:600] or "the render did not finish on this node"
@@ -4001,6 +3996,61 @@ def _run_render(task):
     finally:
         shutil.rmtree(work, ignore_errors=True)
         _eevee_probe_bg()        # the render image is cached now: test EEVEE if boot couldn't
+
+
+# A rendered frame range is uploaded as tars of at most this many bytes, split on frame boundaries
+# (each part extracts on its own) and STREAMED from disk. 2026-10-08: one 3.6 GB tar of 110 4K frames
+# was read into RAM and sent as a single write, which timed out at 600 s and lost the whole render;
+# a single object PUT also caps at 5 GB.
+RENDER_PART_BYTES = int(os.getenv("RENDER_PART_BYTES", str(2 * 1024 ** 3)))
+
+
+def _frame_parts(files, limit):
+    """Group frame files (in order) into runs that stay under `limit` bytes; a single frame larger
+    than the limit gets a part of its own."""
+    part, size = [], 0
+    for f in files:
+        n = os.path.getsize(f)
+        if part and size + n > limit:
+            yield part
+            part, size = [], 0
+        part.append(f)
+        size += n
+    if part:
+        yield part
+
+
+def _upload_frame_parts(tid, out_dir, work, fs, fe):
+    """Tar + stream-upload the frames in parts (see RENDER_PART_BYTES); returns (refs, sha256s).
+    One part keeps the historical name frames_<fs>_<fe>.tar. Each part is deleted once stored, so
+    peak disk is the frames plus one part. Any storage rejection raises: never a completed result."""
+    import tarfile
+    files = sorted(p for p in (os.path.join(out_dir, f) for f in os.listdir(out_dir)) if os.path.isfile(p))
+    groups = list(_frame_parts(files, RENDER_PART_BYTES))
+    refs, hashes = [], []
+    for i, group in enumerate(groups, 1):
+        name = f"frames_{fs}_{fe}.tar" if len(groups) == 1 else f"frames_{fs}_{fe}.part{i:03d}.tar"
+        path = os.path.join(work, name)
+        with tarfile.open(path, "w") as tar:
+            for f in group:
+                tar.add(f, arcname="frames/" + os.path.basename(f))
+        digest = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        grant = httpx.post(f"{API_URL}/jobs/output_put", headers=HEADERS, timeout=15,
+                           json={"task_id": tid, "filename": name}, trust_env=False).json()
+        with open(path, "rb") as fh:     # streamed in chunks: each write has its own timeout
+            r = httpx.put(grant["upload_url"], content=fh, trust_env=False,
+                          headers={"Content-Length": str(os.path.getsize(path))},
+                          timeout=httpx.Timeout(60.0, write=300.0))
+        r.raise_for_status()
+        os.remove(path)
+        refs.append(grant["ref"])
+        hashes.append(digest.hexdigest())
+        if len(groups) > 1:
+            report_progress(tid, 85 + int(14 * i / len(groups)), f"uploaded frames part {i}/{len(groups)}")
+    return refs, hashes
 
 
 def _blender_fail_reason(output: str) -> str:
@@ -4622,6 +4672,29 @@ def _remove_legacy_miner():
         pass
 
 
+def _remove_orphan_job_containers():
+    """A batch job container (`docker run --rm --name pb-task-…` / `pb-run-…`) is driven by the agent
+    process that started it: that process waits on it, collects its output and reports the result.
+    One still running at STARTUP outlived its agent (a crash, a restart, a timer-driven self-update
+    mid-job), so nothing can ever report it -- it only holds the GPU (spec 246, 2026-10-08: an
+    admin-killed 110-frame render kept rendering after its task was failed and refunded). One agent
+    per host, and this runs before the agent starts any container, so every match is an orphan.
+    Rentals (`pb-<template>-…`, restored by _restore_vm_watch) are never touched."""
+    import subprocess
+    try:
+        ids = []
+        for prefix in ("pb-task-", "pb-run-"):
+            ids += subprocess.run(["docker", "ps", "-q", "--filter", f"name=^{prefix}"],
+                                  capture_output=True, text=True, timeout=15, check=False).stdout.split()
+        for cid in ids:
+            if re.fullmatch(r"[0-9a-f]{12,64}", cid):
+                subprocess.run(["docker", "rm", "-f", cid], capture_output=True, timeout=30, check=False)
+        if ids:
+            logging.warning(f"removed {len(ids)} orphaned job container(s) left by a previous agent run")
+    except Exception:                                    # noqa: BLE001 — never block startup
+        pass
+
+
 def _ensure_wipe_image_async():
     """Cache the VRAM-wipe image if none is present. install.sh does this on a fresh install, but a
     node that AUTO-UPDATES never re-runs install.sh — and without a cached image the mandatory wipe
@@ -4667,6 +4740,7 @@ def run_agent():
         agent_scratch.sweep_stale()
     except Exception:                                    # noqa: BLE001 — never block startup
         pass
+    _remove_orphan_job_containers()   # before this run starts any container of its own
     for _bg in (_ensure_wipe_image_async, _ensure_tunnel_async):
         try:
             _bg()
