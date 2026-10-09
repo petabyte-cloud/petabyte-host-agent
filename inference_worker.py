@@ -68,7 +68,14 @@ def valid(p):
             and isinstance(p.get("sha256"), str) and _SHA_RE.match(p["sha256"])
             and isinstance(p.get("image"), str) and _IMAGE_RE.match(p["image"])
             and num(p.get("size"), 1, 200 * 1024 ** 3) and num(p.get("ctx"), 512, 131072)
-            and num(p.get("parallel"), 1, 8) and num(p.get("seconds"), 1, 30))
+            and num(p.get("parallel"), 1, 8) and num(p.get("seconds"), 1, 30)
+            and isinstance(p.get("offload", False), bool))
+
+
+# A big (MoE) model split between GPU and RAM: --fit keeps what fits in VRAM (256 MiB margin) and the
+# rest of the experts in RAM; --no-mmap loads them into memory instead of paging them from disk.
+# Tuned on an RTX 4080 + 31 GiB with Qwen3-Next-80B: 21 tok/s vs 7 tok/s mmap'd (2026-10-09).
+OFFLOAD_ARGS = ("--fit", "on", "--fit-target", "256", "--no-mmap")
 
 
 def fetch_model(p, cancelled=lambda: False):
@@ -142,7 +149,7 @@ class Controller:
         self.tunnel_alive = lambda: False
         self._state = {"state": "off"}
         self._thread, self._stop, self._key = None, threading.Event(), None
-        self._until, self._retry_at = 0.0, 0.0
+        self._until, self._retry_at, self._retry_key = 0.0, 0.0, None
 
     def attach(self, open_tunnel, close_tunnel, tunnel_alive):
         self.open_tunnel, self.close_tunnel, self.tunnel_alive = open_tunnel, close_tunnel, tunnel_alive
@@ -201,8 +208,8 @@ class Controller:
             key = (permit["model"], permit["sha256"], permit["ctx"], permit["parallel"], permit["image"])
             if self._thread and self._thread.is_alive() and self._key == key:
                 return                                    # lease renewed; already serving it
-            if time.monotonic() < self._retry_at:
-                return
+            if time.monotonic() < self._retry_at and key == self._retry_key:
+                return                                    # cool down a failed lease, not its replacement
             self.stop()
             self._stop = threading.Event()
             self._key = key
@@ -235,7 +242,8 @@ class Controller:
                        "--mount", f"type=bind,src={path},dst=/models/model.gguf,readonly",
                        "-e", f"LLAMA_ARG_API_KEY={key}",
                        image, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
-                       "-c", str(p["ctx"] * p["parallel"]), "-np", str(p["parallel"]), "-ngl", "999",
+                       "-c", str(p["ctx"] * p["parallel"]), "-np", str(p["parallel"]),
+                       *(OFFLOAD_ARGS if p.get("offload") else ("-ngl", "999")),
                        timeout=60)
             if r.returncode:
                 raise RuntimeError(f"inference server did not start: {r.stderr.strip()[:160]}")
@@ -277,6 +285,7 @@ class Controller:
             logging.warning("inference worker: %s", e)
             self._set(state="error", model=p["model"], error=str(e)[:200])
             self._retry_at = time.monotonic() + RETRY_AFTER_ERROR_S
+            self._retry_key = (p["model"], p["sha256"], p["ctx"], p["parallel"], p["image"])
         finally:
             # stop() already cleaned up (and a newer worker may own the container by now); only a
             # worker that ended on its own — lease lapsed or failed — tidies up after itself.
