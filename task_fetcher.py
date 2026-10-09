@@ -1435,7 +1435,11 @@ def _agent_bundle():
 # and refuses anything unsigned or tampered, so this can only ever apply a genuinely signed release.
 _UPDATE_UNIT = "petabyte-agent-update.service"
 _UPDATE_RETRY_S = 1800        # a refused/failed update (e.g. bad signature) retries at most this often
-_AGENT_UPDATE = {"wanted": None, "started": 0.0}
+# update.sh's downloads are bounded, so its agent restart lands well within this. A run still going after
+# it is hung, or past the restart into the toolkit/driver repairs: neither is a reason to refuse jobs.
+# Holding claims for it took spec 270 out of service for hours (2026-10-09).
+_UPDATE_HOLD_S = 1800
+_AGENT_UPDATE = {"wanted": None, "started": 0.0, "active_since": None}
 
 
 def _note_agent_update(body):
@@ -1452,6 +1456,27 @@ def _systemctl(*args):
         return None
 
 
+def _update_running():
+    """update.sh is replacing this agent right now. job_loop claims nothing meanwhile, so the node
+    must not be offered for rent either: a rental placed then waited out its startup deadline and
+    was refunded (spec 270, 2026-10-09). No side effects (unlike _self_update_holds_claims)."""
+    want = _AGENT_UPDATE["wanted"]
+    if not want or want == _agent_bundle():
+        return False
+    held = _update_unit_held_s()
+    return held is not None and held < _UPDATE_HOLD_S
+
+
+def _update_unit_held_s():
+    """Seconds this agent has seen update.sh running (None when it isn't)."""
+    st = _systemctl("is-active", _UPDATE_UNIT)
+    if st is None or st.stdout.strip() not in ("activating", "active"):
+        _AGENT_UPDATE["active_since"] = None
+        return None
+    _AGENT_UPDATE["active_since"] = _AGENT_UPDATE["active_since"] or time.time()
+    return time.time() - _AGENT_UPDATE["active_since"]
+
+
 def _self_update_holds_claims():
     """True while a server-requested self-update is starting or running: job_loop claims nothing, so
     the agent restart that update.sh performs never lands mid-job. Respects the seller's opt-out:
@@ -1459,9 +1484,9 @@ def _self_update_holds_claims():
     want = _AGENT_UPDATE["wanted"]
     if not want or want == _agent_bundle():
         return False
-    st = _systemctl("is-active", _UPDATE_UNIT)
-    if st is not None and st.stdout.strip() in ("activating", "active"):
-        return True                                  # update.sh is running: wait for its restart
+    held = _update_unit_held_s()
+    if held is not None:                             # update.sh is running: wait for its restart,
+        return held < _UPDATE_HOLD_S                 # but not for one that is hung (never re-started)
     if time.time() - _AGENT_UPDATE["started"] < _UPDATE_RETRY_S:
         return False                                 # tried recently and it did not land: keep serving
     en = _systemctl("is-enabled", "petabyte-agent-update.timer")
@@ -2048,8 +2073,9 @@ def _advertise_selling_now():
     their chosen selling schedule and existing tunnel policy.
     """
     scheduled = _selling_now()
-    return scheduled and (not os.getenv("PROVIDER", "").startswith("pb-jit-")
-                          or _reverse_tunnel_enabled()) and not _gpu_busy_elsewhere() and _wipe_ready()
+    return (scheduled and (not os.getenv("PROVIDER", "").startswith("pb-jit-")
+                           or _reverse_tunnel_enabled()) and not _gpu_busy_elsewhere() and _wipe_ready()
+            and not _update_running())
 
 
 _WIPE_READY = {"ok": False}

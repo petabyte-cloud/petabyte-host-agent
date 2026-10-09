@@ -19,6 +19,9 @@ STATE="${PETABYTE_AGENT_STATE:-/var/lib/petabyte-agent}"
 ENVF="${PETABYTE_AGENT_ENV:-/etc/petabyte/agent.env}"
 
 command -v rsync >/dev/null || { echo "rsync missing"; exit 0; }
+# Every fetch is time-bounded. A stalled download used to hang this oneshot forever, and the agent
+# holds job claims while an update runs: the node stayed listed but never took a rental (spec 270).
+CURL=(curl -fsSL --connect-timeout 20)
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 verify_bundle() {  # verify_bundle <bundle> <sigfile> — 0 ok, 1 fail/unavailable
@@ -43,11 +46,11 @@ fi
 # Cheap no-op tick: this runs every 6 h on every node, so fetch only the 64-byte signature first. If it
 # is the one we last verified and applied, the bundle has not changed: skip the full download. Nothing
 # is applied on this path, so it cannot weaken the signed-update guarantee.
-if curl -fsSL "$API_URL/agent.tar.gz.sig" -o "$TMP/current.sig" 2>/dev/null    && [ -s "$TMP/current.sig" ] && [ -s "$STATE/bundle.sha256" ] && cmp -s "$TMP/current.sig" "$STATE/bundle.sig"; then
+if "${CURL[@]}" --max-time 60 "$API_URL/agent.tar.gz.sig" -o "$TMP/current.sig" 2>/dev/null    && [ -s "$TMP/current.sig" ] && [ -s "$STATE/bundle.sha256" ] && cmp -s "$TMP/current.sig" "$STATE/bundle.sig"; then
   echo "already up to date (signature unchanged)"
   exit 0
 fi
-if ! curl -fsSL "$API_URL/agent.tar.gz" -o "$TMP/agent.tar.gz" 2>/dev/null \
+if ! "${CURL[@]}" --max-time 900 "$API_URL/agent.tar.gz" -o "$TMP/agent.tar.gz" 2>/dev/null \
    || ! tar -xzf "$TMP/agent.tar.gz" -C "$TMP" 2>/dev/null || [ ! -d "$TMP/$SUBDIR" ]; then
   echo "signed agent bundle unavailable from $API_URL — skipping update (no unsigned fallback)"
   exit 0
@@ -56,7 +59,7 @@ if [ ! -f "$PUBKEY" ]; then
   echo "SECURITY: no pinned release key at $PUBKEY — refusing to apply an unsigned agent update." \
        "Ship the release public key in the installer (see update.sh header)."; exit 1
 fi
-curl -fsSL "$API_URL/agent.tar.gz.sig" -o "$TMP/agent.tar.gz.sig" 2>/dev/null || true
+"${CURL[@]}" --max-time 60 "$API_URL/agent.tar.gz.sig" -o "$TMP/agent.tar.gz.sig" 2>/dev/null || true
 if ! verify_bundle "$TMP/agent.tar.gz" "$TMP/agent.tar.gz.sig"; then
   echo "SECURITY: agent bundle signature did not verify against $PUBKEY — refusing update"; exit 1
 fi
@@ -66,7 +69,7 @@ RSYNC_EXCL=(--exclude .venv --exclude '*.env' --exclude '*.log' --exclude __pyca
 # differ, so `grep -q .` would always be false and the update would silently never apply.
 if rsync -rcni "${RSYNC_EXCL[@]}" "$TMP/$SUBDIR/" "$APP/" | grep -q . ; then
   rsync -rc "${RSYNC_EXCL[@]}" "$TMP/$SUBDIR/" "$APP/"
-  "$APP/.venv/bin/pip" install -q -r "$APP/requirements.txt" || true
+  "$APP/.venv/bin/pip" install -q --timeout 30 -r "$APP/requirements.txt" || true
   systemctl restart "$SERVICE"
   echo "agent updated and restarted"
 else

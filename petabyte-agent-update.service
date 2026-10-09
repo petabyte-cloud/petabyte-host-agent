@@ -6,3 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/opt/petabyte-agent/update.sh
+# A oneshot has no start timeout by default, so a hung run never ended. Backstop only: it must stay
+# above every bounded step update.sh runs, an opt-in driver install (gpu_driver.py) alone allows 2x1h,
+# and killing one mid-install would leave the node without a working driver.
+TimeoutStartSec=6h
