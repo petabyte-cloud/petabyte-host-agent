@@ -3983,6 +3983,8 @@ def _run_render(task):
         # 3) upload the frames as the buyer's DOWNLOADABLE output — UNENCRYPTED, under the job's
         # output prefix — so an artist downloads exactly the frames Blender rendered, via
         # /jobs/output_url (NOT the encrypted backup path, which the buyer could never open).
+        if task.get("video") not in (None, False):           # the buyer asked for a video too
+            _encode_and_upload_video(tid, task, out_dir, work, fs, fe)
         refs, hashes = _upload_frame_parts(tid, out_dir, work, fs, fe)
         _post("/jobs/result", _signed_result(
             tid, status="completed", result=refs[0],   # clean s3 URI -> /jobs/output_url lists every part
@@ -4020,6 +4022,23 @@ def _frame_parts(files, limit):
         yield part
 
 
+def _put_output(tid, path, name):
+    """Store one file as a downloadable job output (POST /jobs/output_put -> presigned PUT), STREAMED
+    from disk so each write has its own timeout. Returns (ref, sha256). A rejection raises."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    grant = httpx.post(f"{API_URL}/jobs/output_put", headers=HEADERS, timeout=15,
+                       json={"task_id": tid, "filename": name}, trust_env=False).json()
+    with open(path, "rb") as fh:
+        r = httpx.put(grant["upload_url"], content=fh, trust_env=False,
+                      headers={"Content-Length": str(os.path.getsize(path))},
+                      timeout=httpx.Timeout(60.0, write=300.0))
+    r.raise_for_status()
+    return grant["ref"], digest.hexdigest()
+
+
 def _upload_frame_parts(tid, out_dir, work, fs, fe):
     """Tar + stream-upload the frames in parts (see RENDER_PART_BYTES); returns (refs, sha256s).
     One part keeps the historical name frames_<fs>_<fe>.tar. Each part is deleted once stored, so
@@ -4034,23 +4053,86 @@ def _upload_frame_parts(tid, out_dir, work, fs, fe):
         with tarfile.open(path, "w") as tar:
             for f in group:
                 tar.add(f, arcname="frames/" + os.path.basename(f))
-        digest = hashlib.sha256()
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                digest.update(chunk)
-        grant = httpx.post(f"{API_URL}/jobs/output_put", headers=HEADERS, timeout=15,
-                           json={"task_id": tid, "filename": name}, trust_env=False).json()
-        with open(path, "rb") as fh:     # streamed in chunks: each write has its own timeout
-            r = httpx.put(grant["upload_url"], content=fh, trust_env=False,
-                          headers={"Content-Length": str(os.path.getsize(path))},
-                          timeout=httpx.Timeout(60.0, write=300.0))
-        r.raise_for_status()
+        ref, sha = _put_output(tid, path, name)
         os.remove(path)
-        refs.append(grant["ref"])
-        hashes.append(digest.hexdigest())
+        refs.append(ref)
+        hashes.append(sha)
         if len(groups) > 1:
             report_progress(tid, 85 + int(14 * i / len(groups)), f"uploaded frames part {i}/{len(groups)}")
     return refs, hashes
+
+
+RENDER_VIDEO_IMAGE = "jrottenberg/ffmpeg:6.1-nvidia"   # the image transcodes already use (cached)
+
+
+_VIDEO_CODECS = {"h264": "libx264", "h265": "libx265"}
+_VIDEO_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow")
+
+
+def _video_settings(v):
+    """The buyer's video settings (validated by the API's RenderVideoModel), re-checked here against the
+    same whitelist so nothing but known values ever reaches the ffmpeg command line."""
+    v = v if isinstance(v, dict) else {}
+
+    def _int(key, lo, hi, default):
+        try:
+            return min(max(int(v.get(key, default)), lo), hi)
+        except (TypeError, ValueError):
+            return default
+    width = v.get("width")
+    return {"fps": _int("fps", 1, 240, 24), "crf": _int("crf", 0, 51, 18),
+            "codec": v.get("codec") if v.get("codec") in _VIDEO_CODECS else "h264",
+            "preset": v.get("preset") if v.get("preset") in _VIDEO_PRESETS else "medium",
+            "pix_fmt": v.get("pix_fmt") if v.get("pix_fmt") in ("yuv420p", "yuv422p", "yuv444p") else "yuv420p",
+            "container": v.get("container") if v.get("container") in ("mp4", "mov", "mkv") else "mp4",
+            "width": (_int("width", 16, 16384, 0) // 2 * 2) if width else None}   # even, for 4:2:0
+
+
+def _video_cmd(task, out_dir, vid_dir, name, ext, s):
+    """ffmpeg (in the transcode image, no network, the job's isolation) turning the rendered frames into
+    a video with the buyer's settings `s` (_video_settings). Dimensions are kept even (4:2:0 needs it).
+    ponytail: x264/x265 on the CPU; NVENC when long 4K animations make encode time matter."""
+    scale = f"scale={s['width']}:-2" if s["width"] else "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    cmd = ["docker", "run", "--rm", "--network", "none", *_isolation_flags(task),
+           "-v", f"{out_dir}:/in:ro", "-v", f"{vid_dir}:/work", RENDER_VIDEO_IMAGE, "-y",
+           "-framerate", str(s["fps"]), "-pattern_type", "glob", "-i", f"/in/frame_*.{ext}",
+           "-c:v", _VIDEO_CODECS[s["codec"]], "-preset", s["preset"], "-crf", str(s["crf"]),
+           "-pix_fmt", s["pix_fmt"], "-vf", scale]
+    if s["codec"] == "h265" and s["container"] in ("mp4", "mov"):
+        cmd += ["-tag:v", "hvc1"]                        # so Apple players open H.265
+    if s["container"] in ("mp4", "mov"):
+        cmd += ["-movflags", "+faststart"]               # plays while it downloads
+    return cmd + [f"/work/{name}"]
+
+
+def _encode_and_upload_video(tid, task, out_dir, work, fs, fe):
+    """The render's optional video (render `video` settings), stored next to the frames as
+    video_<fs>_<fe>.<container>. Best-effort: the frames are the job's product, so a failed encode is
+    logged and never fails the render."""
+    import shutil
+    frames = sorted(f for f in os.listdir(out_dir) if f.startswith("frame_"))
+    if not frames:
+        return
+    s = _video_settings(task.get("video"))
+    name = f"video_{fs}_{fe}.{s['container']}"
+    vid_dir = os.path.join(work, "video")
+    try:
+        os.makedirs(vid_dir, exist_ok=True)
+        os.chmod(vid_dir, 0o777)        # the forced non-root container writes it; parent stays 0700
+        report_progress(tid, 80, f"encoding {len(frames)} frame(s) into {name}")
+        cmd = _video_cmd(task, out_dir, vid_dir, name, frames[0].rsplit(".", 1)[-1], s)
+        _rt = task.get("max_runtime_s")
+        _run_docker(cmd, timeout=(int(_rt) if _rt else None), capture_output=True, text=True)
+        _put_output(tid, os.path.join(vid_dir, name), name)
+        report_log(tid, f"video: {name} encoded from {len(frames)} frame(s) — {s['codec']} crf {s['crf']} "
+                        f"{s['preset']} {s['pix_fmt']} {s['fps']} fps")
+    except Exception as e:                               # noqa: BLE001 — the frames still ship
+        if tid in _KILLED:
+            raise
+        tail = (getattr(e, "stderr", "") or str(e)).strip()[-300:]
+        report_log(tid, f"video encode failed (the frames are unaffected): {tail}")
+    finally:
+        shutil.rmtree(vid_dir, ignore_errors=True)
 
 
 def _blender_fail_reason(output: str) -> str:
