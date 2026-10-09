@@ -1760,7 +1760,8 @@ def _launch_failure_reason(e):
     It used to be a bare "container launch failed", so nobody could tell why a node refused."""
     import subprocess
     if isinstance(e, subprocess.CalledProcessError):
-        lines = [ln.strip() for ln in str(e.stderr or "").splitlines() if ln.strip()]
+        # a failed image pull (template_storage._pull) carries Docker's message in output, not stderr
+        lines = [ln.strip() for ln in str(e.stderr or e.output or "").splitlines() if ln.strip()]
         text = " | ".join(lines[-3:]) or f"docker exited {e.returncode}"
     else:
         text = f"{type(e).__name__}: {e}"
