@@ -80,6 +80,9 @@ echo "==> installing Docker (sandbox runtime)"
 # enables Docker Engine when that is safe, never touches Docker Desktop, and prints why otherwise.
 python3 "$APP/isolation.py" repair || true
 
+# WSL2 keeps nvidia-smi in /usr/lib/wsl/lib, which `sudo` drops from PATH: without this, `curl … | sudo bash`
+# on WSL2 skipped the toolkit and `docker run --gpus` failed (prod spec 272, 2026-10-09).
+if [ -d /usr/lib/wsl/lib ]; then PATH="$PATH:/usr/lib/wsl/lib"; fi
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "==> installing nvidia-container-toolkit (GPU in containers; native + WSL2)"
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \

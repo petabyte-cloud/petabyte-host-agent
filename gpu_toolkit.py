@@ -1,15 +1,20 @@
-"""gpu_toolkit.py — keep the NVIDIA Container Toolkit current on every NVIDIA node (apt hosts).
+"""gpu_toolkit.py — install, and keep current, the NVIDIA Container Toolkit on every NVIDIA node (apt hosts).
 
 update.sh runs `gpu_toolkit.py upgrade --auto <bundle-sha>` as root after each signed agent update,
 at most once per bundle. An old toolkit mounts only part of a newer driver: 1.12.1 on the RTX 2060
 (driver 550.67) left out libnvidia-gpucomp, so every EEVEE render segfaulted (2026-10-07).
 
+A missing toolkit is installed: `curl … | sudo bash` on WSL2 hid nvidia-smi from install.sh (sudo
+drops /usr/lib/wsl/lib from PATH), which skipped the toolkit, so `docker run --gpus` failed and the
+node was never offered (prod spec 272, RTX 2060 on WSL2, 2026-10-09).
+
 What it changes, and what it never does:
-  * upgrades ONLY the toolkit packages, to the newest version in NVIDIA's own apt repo, requested by
-    exact version so a distro pin (Pop!_OS prefers System76's older build) can't hold it back;
-  * never restarts Docker: running rentals keep their containers, new containers use the new hook;
+  * installs or upgrades ONLY the toolkit packages, to the newest version in NVIDIA's own apt repo,
+    requested by exact version so a distro pin (Pop!_OS prefers System76's older build) can't hold it back;
+  * restarts Docker only right after a FRESH install (dockerd finds the NVIDIA hook at startup), and
+    only with no container running; an upgrade never restarts it: rentals keep their containers;
   * never touches the GPU driver: a driver change needs a reboot and can break the seller's desktop.
-Non-apt hosts and hosts without the toolkit are left alone, with the reason recorded.
+Non-apt hosts are left alone, with the reason recorded.
 
 Stdlib only: runs with the agent venv's python, but needs nothing from it.
 """
@@ -21,6 +26,8 @@ import shutil
 import subprocess
 import sys
 import time
+
+import gpu_runtime  # noqa: F401 — on import, puts WSL2's nvidia-smi dir (/usr/lib/wsl/lib) on PATH
 
 STATE = "/var/lib/petabyte-agent/gpu_toolkit.json"
 LIST = "/etc/apt/sources.list.d/nvidia-container-toolkit.list"
@@ -74,8 +81,6 @@ def why_not():
         return "no NVIDIA GPU"
     if not (shutil.which("apt-get") and shutil.which("apt-cache")):
         return "not an apt host: update nvidia-container-toolkit with this system's package manager"
-    if not installed():
-        return "nvidia-container-toolkit is not installed: re-run the Petabyte installer"
     return None
 
 
@@ -103,13 +108,21 @@ def _ensure_repo():
     return good
 
 
+def _restart_docker_if_idle():
+    """True if dockerd was restarted: only with no container running, so nothing is interrupted."""
+    ps = _run(["docker", "ps", "-q"], timeout=30)
+    if ps.returncode != 0 or ps.stdout.strip():
+        return False
+    return _run(["systemctl", "restart", "docker"], timeout=180).returncode == 0
+
+
 def upgrade(bundle=None):
-    """Upgrade if NVIDIA's repo has a newer toolkit. Records {bundle, before, after, ok, reason}."""
+    """Install the toolkit, or upgrade it if NVIDIA's repo has a newer one. Records the result."""
     last = _load()
     if bundle and last.get("bundle") == bundle:
         print("gpu toolkit: already checked for this agent version; skipping")
         return bool(last.get("ok"))
-    before, reason, ok = installed(), why_not(), False
+    before, reason, ok, restarted = installed(), why_not(), False, None
     if reason is None:
         if not _ensure_repo():
             reason = "could not add NVIDIA's apt repository"
@@ -131,8 +144,10 @@ def upgrade(bundle=None):
                          timeout=1800)
                 ok = r.returncode == 0
                 reason = None if ok else ((r.stderr or r.stdout).strip()[-300:] or "apt-get failed")
+                if ok and before is None:
+                    restarted = _restart_docker_if_idle()
     state = {"bundle": bundle, "at": int(time.time()), "before": before, "after": installed(),
-             "ok": ok, "reason": reason}
+             "ok": ok, "reason": reason, "docker_restarted": restarted}
     _save(state)
     print("gpu toolkit: " + json.dumps(state))
     return ok
