@@ -3979,7 +3979,6 @@ def _run_render(task):
                 report_log(tid, "Blender output on CUDA (last lines):\n" + _out.strip()[-1500:])
                 raise RuntimeError(_blender_fail_reason(_out)) from _ce2
         _render_frame_files(out_dir, fs, fe)
-        report_progress(tid, 85, "uploading frames")
         # 3) upload the frames as the buyer's DOWNLOADABLE output — UNENCRYPTED, under the job's
         # output prefix — so an artist downloads exactly the frames Blender rendered, via
         # /jobs/output_url (NOT the encrypted backup path, which the buyer could never open).
@@ -4053,13 +4052,20 @@ def _upload_frame_parts(tid, out_dir, work, fs, fe):
         with tarfile.open(path, "w") as tar:
             for f in group:
                 tar.add(f, arcname="frames/" + os.path.basename(f))
+        # Say what is happening BEFORE the (possibly long) upload, with its size: a 2 GB part over a
+        # home connection takes many minutes, and the last message must never be a stale step.
+        part = f" part {i}/{len(groups)}" if len(groups) > 1 else ""
+        report_progress(tid, 85 + int(14 * (i - 1) / len(groups)),
+                        f"uploading frames{part} ({_human_size(os.path.getsize(path))})")
         ref, sha = _put_output(tid, path, name)
         os.remove(path)
         refs.append(ref)
         hashes.append(sha)
-        if len(groups) > 1:
-            report_progress(tid, 85 + int(14 * i / len(groups)), f"uploaded frames part {i}/{len(groups)}")
     return refs, hashes
+
+
+def _human_size(n):
+    return f"{n / 1024 ** 3:.1f} GB" if n >= 1024 ** 3 else f"{max(1, round(n / 1024 ** 2))} MB"
 
 
 RENDER_VIDEO_IMAGE = "jrottenberg/ffmpeg:6.1-nvidia"   # the image transcodes already use (cached)
@@ -4123,6 +4129,7 @@ def _encode_and_upload_video(tid, task, out_dir, work, fs, fe):
         cmd = _video_cmd(task, out_dir, vid_dir, name, frames[0].rsplit(".", 1)[-1], s)
         _rt = task.get("max_runtime_s")
         _run_docker(cmd, timeout=(int(_rt) if _rt else None), capture_output=True, text=True)
+        report_progress(tid, 82, f"uploading {name} ({_human_size(os.path.getsize(os.path.join(vid_dir, name)))})")
         _put_output(tid, os.path.join(vid_dir, name), name)
         report_log(tid, f"video: {name} encoded from {len(frames)} frame(s) — {s['codec']} crf {s['crf']} "
                         f"{s['preset']} {s['pix_fmt']} {s['fps']} fps")
