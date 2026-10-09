@@ -128,7 +128,7 @@ print(json.dumps(result,separators=(",",":")))
 '''
 
 
-def run(challenge, runner, prepare, isolation_flags, gpu_flags, task_id):
+def run(challenge, runner, prepare, isolation_flags, gpu_flags, task_id, local=lambda image: image):
     # Same strict bounds as the independent server checker; validate before image preparation.
     if not isinstance(challenge, dict) or challenge.get("template") not in ("pytorch", "tensorflow", "jupyter"):
         raise ValueError("unsupported template probe")
@@ -164,7 +164,7 @@ def run(challenge, runner, prepare, isolation_flags, gpu_flags, task_id):
         if _CANCEL.is_set():
             return answer
         command = ["docker", "run", "--rm", "--label", "pb.template_probe=1", "--label", f"pb.task={task_id}", "--pull=never", "--network", "none", *isolation_flags,
-                   *gpu_flags, *env_flags, "--entrypoint", "python3", challenge["image"], "-c", PROGRAM,
+                   *gpu_flags, *env_flags, "--entrypoint", "python3", local(challenge["image"]), "-c", PROGRAM,
                    challenge["template"], challenge["nonce"]]
         proc = runner(command, timeout=180, capture_output=True, text=True, check=False)
         output = proc.stdout or ""

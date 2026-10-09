@@ -3014,7 +3014,7 @@ def _run_template(task):
                     timeout=params.get("max_startup_seconds", 900))
             report_log(tid, "Docker image " + outcome + "; model/work files are private to this rental")
             cmd += _template_env_flags(task, _template_env)
-            cmd += [image]
+            cmd += [template_storage.local(image)]        # a mirror pull runs by its mirror ref
             # a model delivered as a CLI arg (vllm --model, TGI --model-id, llama.cpp -hf)
             if task.get("model_arg") and model:
                 cmd += [task["model_arg"], model]
@@ -3266,7 +3266,8 @@ def _run_template_probe(task):
     _set_ui(status="running", task=f"Template check #{tid}")
     answer = template_probe.run(task["template_probe"], _run_docker, template_storage.prepare,
         _isolation_flags({"gpu": True, "memory": "4g", "cpus": 2, "pids": 256}),
-        gpu_runtime.docker_gpu_args(), tid)
+        gpu_runtime.docker_gpu_args(), tid,
+        local=template_storage.local)
     result = json.dumps(answer, separators=(",", ":"))
     status = "completed" if answer.get("status") == "completed" else "failed"
     proof = execution_receipt.make(tid, result=result, status=status)
@@ -3324,7 +3325,7 @@ def _run_benchmark(task):
             proof["runtime_check"] = benchmark_runtime.run(
                 task["runtime_check"], _run_docker,
                 _isolation_flags({"gpu": True, "memory": "4g", "cpus": 2, "pids": 256}),
-                gpu_runtime.docker_gpu_args())
+                gpu_runtime.docker_gpu_args(), local=template_storage.local)
         except ValueError:
             proof["runtime_check"] = {"status": "failed"}
     import execution_receipt, hardware_evidence

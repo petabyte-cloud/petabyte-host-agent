@@ -218,9 +218,9 @@ class Controller:
         try:
             self._set(state="downloading", model=p["model"])
             path = fetch_model(p, lambda: self._lapsed(stop))
-            if docker("image", "inspect", p["image"]).returncode:
-                if docker("pull", p["image"], timeout=1800).returncode:
-                    raise RuntimeError("could not pull the inference server image")
+            import template_storage                 # cache-managed, with the registry-mirror fallback
+            template_storage.prepare(p["image"], 0, timeout=1800)
+            image = template_storage.local(p["image"])
             if self._lapsed(stop):
                 return
             self._set(state="starting", model=p["model"])
@@ -234,7 +234,7 @@ class Controller:
                        "--log-opt=max-size=1m", "--log-opt=max-file=1",
                        "--mount", f"type=bind,src={path},dst=/models/model.gguf,readonly",
                        "-e", f"LLAMA_ARG_API_KEY={key}",
-                       p["image"], "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
+                       image, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
                        "-c", str(p["ctx"] * p["parallel"]), "-np", str(p["parallel"]), "-ngl", "999",
                        timeout=60)
             if r.returncode:

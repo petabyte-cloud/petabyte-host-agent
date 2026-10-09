@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -19,6 +20,36 @@ _LOCK = threading.RLock()
 _CATALOG = ()
 STATE = Path("/var/lib/petabyte/images.json")
 GIB = 1024 ** 3
+
+
+# Petabyte's registry mirror (deploy/registry-mirror) serves the catalog's digest-pinned images to
+# nodes that cannot reach the upstream registry: Docker Hub is unreachable from mainland China, so
+# every Docker Hub template failed on spec 270 (2026-10-09). Docker checks every byte against the
+# pinned digest, so the mirror can deliver an image but never alter it; unpinned refs never use it.
+MIRROR = "registry.petabyte.market"
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def mirror_repo(image):
+    """'<registry>/<repository>' with Docker's defaults applied: 'ollama/ollama:latest@sha256:..'
+    -> 'docker.io/ollama/ollama'. The mirror's allowlist is generated with this same function."""
+    name = image.split("@", 1)[0]
+    if ":" in name.rsplit("/", 1)[-1]:
+        name = name.rsplit(":", 1)[0]                    # drop the tag
+    host, _, rest = name.partition("/")
+    if not rest or not ("." in host or ":" in host or host == "localhost"):
+        host, rest = "docker.io", name
+    if host in ("index.docker.io", "registry-1.docker.io"):
+        host = "docker.io"
+    if host == "docker.io" and "/" not in rest:
+        rest = "library/" + rest
+    return f"{host}/{rest}"
+
+
+def mirror_ref(image):
+    """The same image through the mirror, or None when the ref is not digest-pinned."""
+    digest = image.rpartition("@")[2]
+    return f"{MIRROR}/{mirror_repo(image)}@{digest}" if "@" in image and _DIGEST.fullmatch(digest) else None
 
 
 def docker(*args, timeout=30):
@@ -95,11 +126,23 @@ def policy():
             max(0, int(os.getenv("PB_DISK_RESERVE_GB", "10"))) * GIB)
 
 
-def inspect(image):
+def _inspect(ref):
     try:
-        return json.loads(docker("image", "inspect", image))[0]
+        return json.loads(docker("image", "inspect", ref))[0]
     except subprocess.CalledProcessError:
         return None
+
+
+def inspect(image):
+    """Docker's record of the image, also when it arrived through the mirror."""
+    m = mirror_ref(image)
+    return _inspect(image) or (_inspect(m) if m else None)
+
+
+def local(image):
+    """The ref to `docker run --pull=never` an image by: its mirror ref when only that one is here."""
+    m = mirror_ref(image)
+    return m if m and _inspect(image) is None and _inspect(m) is not None else image
 
 
 def free_bytes():
@@ -167,7 +210,17 @@ def prepare(image, task_id, *, cached_only=False, timeout=900):
             if image not in pending:
                 pending[image] = sorted(docker("image", "ls", "-aq", "--no-trunc").splitlines())
                 save(state)
-            _pull(image, timeout=max(1, min(int(timeout), 3600)))   # TimeoutExpired: keeps downloading
+            try:
+                _pull(image, timeout=max(1, min(int(timeout), 3600)))   # TimeoutExpired: keeps downloading
+            except subprocess.CalledProcessError as direct:
+                m = mirror_ref(image)
+                if not m:
+                    raise
+                try:                                # the registry is unreachable from here: same digest
+                    _pull(m, timeout=max(1, min(int(timeout), 3600)))
+                except subprocess.CalledProcessError as e:
+                    raise subprocess.CalledProcessError(e.returncode, e.cmd, output=(
+                        f"{direct.output or ''}\n{MIRROR}: {e.output or ''}")) from None
             existing = inspect(image)
             if existing is None:
                 raise RuntimeError("Downloaded image is unavailable")

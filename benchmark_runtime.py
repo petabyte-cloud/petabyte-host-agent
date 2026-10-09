@@ -43,7 +43,7 @@ def validate(challenge):
     return challenge
 
 
-def run(challenge, runner, isolation_flags, gpu_flags):
+def run(challenge, runner, isolation_flags, gpu_flags, local=lambda image: image):
     validate(challenge)
     nonce, image = challenge["nonce"], challenge["image"]
     result = {k: challenge[k] for k in ("version", "nonce", "n", "image")}
@@ -52,7 +52,7 @@ def run(challenge, runner, isolation_flags, gpu_flags):
         if not gpu_flags:
             return result
         command = ["docker", "run", "--rm", "--pull=never", "--network", "none", *isolation_flags,
-                   *gpu_flags, "--entrypoint", "python3", image, "-c", PROGRAM, nonce]
+                   *gpu_flags, "--entrypoint", "python3", local(image), "-c", PROGRAM, nonce]
         completed = runner(command, timeout=180, capture_output=True, text=True, check=False)
         # Bound parser input and never forward logs/host paths in signed/public evidence.
         output = completed.stdout or ""
