@@ -285,6 +285,7 @@ def report(gateway=""):
             result = {"version": 1, "probe_version": 1, "port_bridge_version": 1, "native_udp_version": 1,
                       "minecraft_status_version": 1, "ssh_start_version": 1,
                       "inference_offload_version": 1,     # inference_worker splits big models GPU/RAM
+                      "image_pool_version": 1,            # inference_worker serves image leases (sd-server)
                       "images": images, "cache_budget_bytes": int(budget),
                       "cache_bytes": sum(x["bytes"] for x in state["images"].values()),
                       "disk_free_bytes": free_bytes(), "disk_reserve_bytes": int(reserve)}
