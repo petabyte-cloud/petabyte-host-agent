@@ -23,6 +23,10 @@ _CATALOG = ()
 _KEEP_WARM = ()
 _WARM_TRIED = {}      # image -> monotonic time of its last idle pull attempt
 WARM_RETRY_S = 600
+# Keep-warm needs room: Jupyter is ~12 GB on disk. Below this budget a node neither pins nor pre-pulls
+# it; pinning it there would crowd out everything else, and pre-pulling an unpinned image only to have
+# it evicted would download it again and again.
+KEEP_WARM_MIN_BUDGET_GB = 24
 STATE = Path("/var/lib/petabyte/images.json")
 GIB = 1024 ** 3
 
@@ -33,6 +37,10 @@ GIB = 1024 ** 3
 # pinned digest, so the mirror can deliver an image but never alter it; unpinned refs never use it.
 MIRROR = "registry.petabyte.market"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# A direct pull still running after this long is too slow to serve a launch (which waits 900 s):
+# switch the same digest to the mirror. quay.io Jupyter from mainland China crawled for 900 s and a
+# customer's launch failed (booking 381, 2026-10-10) because only an outright error used the mirror.
+DIRECT_STALL_S = 900   # ...and only when no layer has finished downloading (nothing to lose)
 
 
 def mirror_repo(image):
@@ -88,6 +96,7 @@ def _pull(image, timeout):
         log = tempfile.TemporaryFile()
         proc = subprocess.Popen(["docker", "pull", "--", image], stdout=log, stderr=subprocess.STDOUT)
         proc.pb_log = log
+        proc.pb_started = time.monotonic()
         _PULLS[image] = proc
     rc = proc.wait(timeout=timeout)                 # TimeoutExpired: still downloading, left running
     _PULLS.pop(image, None)
@@ -98,6 +107,48 @@ def _pull(image, timeout):
         proc.pb_log.close()
     if rc != 0:
         raise subprocess.CalledProcessError(rc, ["docker", "pull", image], output=out)
+
+
+def _stop_pull(image):
+    """End a background pull (Docker keeps the layers it completed; the same digests are reused)."""
+    proc = _PULLS.pop(image, None)
+    if proc is not None:
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        proc.pb_log.close()
+
+
+def _pull_from(first, second, timeout):
+    """Pull `first`; if its registry refuses, `second` (the other of direct/mirror). Returns the ref
+    that delivered. TimeoutExpired propagates: that pull keeps going and the next prepare adopts it."""
+    try:
+        _pull(first, timeout=timeout)
+        return first
+    except subprocess.CalledProcessError as a:
+        if not second:
+            raise
+        try:
+            _pull(second, timeout=timeout)
+            return second
+        except subprocess.CalledProcessError as b:
+            raise subprocess.CalledProcessError(b.returncode, b.cmd, output=(
+                f"{a.output or ''}\n{b.output or ''}")) from None
+
+
+def _layers_done(proc):
+    """Layers this pull has finished downloading so far (Docker's non-TTY output lines)."""
+    try:
+        data = os.pread(proc.pb_log.fileno(), 1 << 20, 0)
+    except (AttributeError, OSError, ValueError):
+        return 0
+    return data.count(b"Download complete") + data.count(b"Pull complete")
+
+
+def _warm_ok():
+    return policy()[0] >= KEEP_WARM_MIN_BUDGET_GB * GIB
 
 
 @contextlib.contextmanager
@@ -166,7 +217,7 @@ def node_images():
         refs = [r for r in gpu_runtime.wipe_image_candidates() if r]
     except Exception:                                    # noqa: BLE001 — never block a launch on it
         refs = []
-    return {i["Id"] for i in (inspect(r) for r in [*refs, *_KEEP_WARM]) if i}
+    return {i["Id"] for i in (inspect(r) for r in [*refs, *(_KEEP_WARM if _warm_ok() else ())]) if i}
 
 
 def collect(state, *, all_owned=False):
@@ -221,17 +272,22 @@ def prepare(image, task_id, *, cached_only=False, timeout=900):
             if image not in pending:
                 pending[image] = sorted(docker("image", "ls", "-aq", "--no-trunc").splitlines())
                 save(state)
-            try:
-                _pull(image, timeout=max(1, min(int(timeout), 3600)))   # TimeoutExpired: keeps downloading
-            except subprocess.CalledProcessError as direct:
-                m = mirror_ref(image)
-                if not m:
-                    raise
-                try:                                # the registry is unreachable from here: same digest
-                    _pull(m, timeout=max(1, min(int(timeout), 3600)))
-                except subprocess.CalledProcessError as e:
-                    raise subprocess.CalledProcessError(e.returncode, e.cmd, output=(
-                        f"{direct.output or ''}\n{MIRROR}: {e.output or ''}")) from None
+            wait = max(1, min(int(timeout), 3600))   # TimeoutExpired: the pull keeps downloading
+            m = mirror_ref(image)
+            direct = _PULLS.get(image)
+            if (m and direct is not None and m not in _PULLS
+                    and time.monotonic() - getattr(direct, "pb_started", time.monotonic()) > DIRECT_STALL_S
+                    and _layers_done(direct) == 0):
+                # Stuck: not one layer arrived in 15 min. Nothing downloaded is thrown away by switching;
+                # a slow pull that IS making progress keeps going (restarting it would re-download).
+                _stop_pull(image)
+                state["mirror_first"] = True
+                save(state)
+            # A node that needed the mirror once (registry blocked or crawling) starts there next time.
+            first = m if m and (m in _PULLS or state.get("mirror_first")) else image
+            second = (image if first == m else m) if m else None
+            if _pull_from(first, second, wait) == m and first == image:
+                state["mirror_first"] = True        # the direct registry refused it from here
             existing = inspect(image)
             if existing is None:
                 raise RuntimeError("Downloaded image is unavailable")
@@ -300,7 +356,7 @@ def warm(idle):
     At most one attempt per image per WARM_RETRY_S, off the heartbeat thread; each holds the cache
     lock for a few seconds only (the pull itself continues in _PULLS and the next attempt adopts it,
     which also records the image as owned)."""
-    if not idle:
+    if not idle or not _KEEP_WARM or not _warm_ok():
         return
     now = time.monotonic()
     for image in _KEEP_WARM:

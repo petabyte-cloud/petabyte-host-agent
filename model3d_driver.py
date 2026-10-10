@@ -66,7 +66,9 @@ torus("MugHandle", 0.03, 0.008, (0.25, 0.1, 0.80), (0.8, 0.1, 0.1), rotation=(90
 ```
 Use realistic real-world sizes and enough parts that the object is recognisable. Keep existing objects
 unless asked to change them. The camera, lights, world and render settings are handled for you: never
-touch them. When the request is fully done, reply with just: DONE"""
+touch them. The request may read like an image prompt (style, mood, lighting, sky, fog, sun rays, camera,
+reflections): ignore those words and never add objects for them; build only the physical things.
+When the request is fully done, reply with just: DONE (never put DONE inside a code block)"""
 
 
 
@@ -259,6 +261,11 @@ messages = [{"role": "system", "content": SYSTEM},
             {"role": "user", "content": f"Current scene: {scene_info()}\n\nRequest: {args.prompt}"}]
 diff, log, summary, error, step, t0 = [], [], "", "", 0, time.time()
 FENCE = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.S)
+# Qwen 7B often ends its code with a bare DONE line, inside the block: that NameError'd every block of
+# commit #27, so a scene the model had fully built read as "the AI model's code never ran". A DONE line
+# is stripped before the code runs, and ends the build once that step's code has run cleanly.
+DONE_LINE = re.compile(r"^[ \t]*DONE\.?[ \t]*$", re.M)
+last_err = ""
 try:
     for step in range(args.max_steps):
         # The system prompt, the request and only the LATEST exchange: the whole history (every code
@@ -266,6 +273,7 @@ try:
         text = chat_live(messages[:2] + messages[2:][-2:]).get("content") or ""
         messages.append({"role": "assistant", "content": text})
         blocks = FENCE.findall(text)
+        finished = bool(DONE_LINE.search(text))
         if not blocks:
             summary = text.strip()[:300]
             log.append({"step": step, "done": True, "text": summary})
@@ -273,20 +281,31 @@ try:
             break
         results = []
         for code in blocks:                      # each block = one execute_blender_code call
+            code = DONE_LINE.sub("", code)
             ok, res = run_code(code)
             if ok:
                 diff.append(code)
                 _snap["dirty"] = True
                 snapshot()
+            else:
+                finished = False                 # let the model fix it first
+                last_err = (res.strip().splitlines() or [""])[-1][:300]
             log.append({"step": step, "tool": "execute_blender_code", "ok": ok, "result": res[:300]})
             print("PBSTEP", step, "code", "ok" if ok else "ERR", res[:300].replace("\n", " | "), flush=True)
             results.append(("OK: " if ok else "ERROR: ") + res[:800])
+        if finished:
+            summary = "DONE"
+            print("PBSTEP", step, "done: DONE", flush=True)
+            break
         messages.append({"role": "user", "content": "\n".join(results) + f"\nScene now: {scene_info()}"
                          "\nFix any error with another code block, add anything still missing, or reply DONE."})
 except Exception as e:  # noqa: BLE001 — the LLM call or a live view failed: keep what was built
     error = f"{type(e).__name__}: {e}"[:300]
     log.append({"step": step, "error": error})
     print("PBERROR", error.replace("\n", " | "), flush=True)
+
+if not diff and not error:
+    error = last_err                         # every block failed: say on what (not "never ran")
 
 # Commit artifacts
 frame_camera()

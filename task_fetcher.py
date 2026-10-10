@@ -4124,15 +4124,17 @@ def _run_model3d(task):
         _rt = task.get("max_runtime_s")
         try:
             res = _run_docker(cmd, timeout=(int(_rt) if _rt else None), capture_output=True, text=True)
-            log_tail = (res.stdout or "")[-1500:]
+            # only the driver's own lines: Blender's render output after them pushed the steps out of a
+            # plain stdout tail, so commit #27's log showed no step at all
+            log_tail = "\n".join(l for l in (res.stdout or "").splitlines()
+                                 if l.startswith(("PBSTEP", "PBCOMMIT", "PBERROR")))[-1500:]
         except subprocess.CalledProcessError as ce:
             if tid in _KILLED:
                 raise RuntimeError("killed by an admin") from ce
             report_log(tid, "Blender output (last lines):\n" + ((ce.stdout or "") + (ce.stderr or ""))[-1500:])
             raise RuntimeError(_model3d_reason((ce.stdout or "") + "\n" + (ce.stderr or ""),
                                                "the 3D builder stopped")) from ce
-        report_log(tid, "\n".join(l for l in log_tail.splitlines()
-                                  if l.startswith(("PBSTEP", "PBCOMMIT", "PBERROR")))[-1500:])
+        report_log(tid, log_tail)
         stop.set()
         live = os.path.join(out, "live", "latest.jpg")
         if os.path.exists(live):
@@ -4150,9 +4152,9 @@ def _run_model3d(task):
                 commit = json.load(fh)
         except (OSError, ValueError):
             commit = {}
-        if commit.get("ok") is False:   # no code block ever ran: nothing to deliver, so nothing to bill
-            raise RuntimeError(("the AI model's code never ran: " + commit["error"]) if commit.get("error")
-                               else "the AI model's code never ran (try a simpler prompt)")
+        if commit.get("ok") is False:   # no code block ran cleanly: nothing to deliver, so nothing to bill
+            raise RuntimeError(("the build failed: " + commit["error"]) if commit.get("error")
+                               else "the AI model wrote no code (try a simpler prompt)")
         _post("/jobs/result", _signed_result(tid, status="completed", result=refs["commit.json"],
                                              content_hash=hashlib.sha256("\n".join(hashes).encode()).hexdigest()))
         _set_ui(status="idle", task=None, ok=True)
