@@ -137,19 +137,21 @@ def valid(p):
 OFFLOAD_ARGS = ("--fit", "on", "--fit-target", "256", "--no-mmap")
 
 
-def _target(p):
-    return MODELS / (p["sha256"] + (".safetensors" if p["url"].endswith(".safetensors") else ".gguf"))
+def _target(p, root=None):
+    return (root or MODELS) / (p["sha256"] + (".safetensors" if p["url"].endswith(".safetensors") else ".gguf"))
 
 
-def fetch_model(p, cancelled=lambda: False, keep=()):
+def fetch_model(p, cancelled=lambda: False, keep=(), root=None, evict=True):
     """The pinned file on local disk, verified. Resumes a partial download. Keeps only this lease's
-    files: `keep` names the lease's other files (an image model is three)."""
-    MODELS.mkdir(parents=True, exist_ok=True)
-    path, part = _target(p), MODELS / f"{p['sha256']}.part"
+    files: `keep` names the lease's other files (an image model is three). A batch job passes its own
+    `root` with evict=False, so it never deletes the pool's cached models."""
+    folder = root or MODELS
+    folder.mkdir(parents=True, exist_ok=True)
+    path, part = _target(p, root), folder / f"{p['sha256']}.part"
     if path.exists() and path.stat().st_size == p["size"]:
         return path
     have = part.stat().st_size if part.exists() else 0
-    if shutil.disk_usage(MODELS).free < p["size"] - have + 2 * 1024 ** 3:
+    if shutil.disk_usage(folder).free < p["size"] - have + 2 * 1024 ** 3:
         raise RuntimeError("not enough free disk for the inference model")
     h = hashlib.sha256()
     if have:
@@ -184,6 +186,8 @@ def fetch_model(p, cancelled=lambda: False, keep=()):
         part.unlink(missing_ok=True)
         raise RuntimeError("inference model failed its hash check; discarded")
     os.replace(part, path)
+    if not evict:
+        return path
     keep = {path, *keep}
     for old in MODELS.iterdir():
         if old not in keep and not (old.suffix == ".part" and any(k.stem == old.stem for k in keep)):

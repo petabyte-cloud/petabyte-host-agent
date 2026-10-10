@@ -2310,7 +2310,9 @@ def _render_capabilities():
         gpu_count = len(_gpu_usage() or []) if gpu_runtime.has_gpu() else 0
     except Exception:                                    # noqa: BLE001
         gpu_count = 1 if gpu_runtime.has_gpu() else 0
+    # model3d: Create 3D jobs (LLM on the GPU + Blender). Needs docker + an NVIDIA GPU.
     return {"blender": True, "render_engines": engines, "headless_eevee": bool(eevee),
+            "model3d": 1 if v == "nvidia" else 0,
             "gpu_count": gpu_count, "gpu_vendor": v, "blender_version": _EEVEE["blender_version"],
             "eevee_error": _EEVEE["error"], **_nvidia_stack()}
 
@@ -4027,6 +4029,117 @@ def _run_render(task):
         _eevee_probe_bg()        # the render image is cached now: test EEVEE if boot couldn't
 
 
+# Petabyte Create 3D: a prompt -> a Blender commit, built by a local LLM. Two containers on a
+# private network with NO internet: `llm` (llama.cpp on the GPU, model pinned by sha256 by the
+# server) and the Blender container running model3d_driver.py (CPU). The driver refreshes
+# live/latest.jpg at most every 10 s; this node uploads it on the same cadence as `live.jpg`, so the
+# buyer watches the object take shape without a remote desktop.
+MODEL3D_DIR = os.getenv("PETABYTE_MODEL3D_DIR", "/var/lib/petabyte-agent/model3d")
+MODEL3D_FILES = ("preview.png", "scene.glb", "scene.blend", "diff.py", "commit.json")
+
+
+def _model3d_live_uploader(tid, live, stop):
+    """Upload live/latest.jpg whenever it changes, at most every 10 s, until `stop` is set."""
+    last = 0.0
+    while not stop.wait(10):
+        try:
+            m = os.path.getmtime(live)
+        except OSError:
+            continue
+        if m > last:
+            try:
+                _put_output(tid, live, "live.jpg")
+                last = m
+            except Exception as e:                       # noqa: BLE001 — a live frame is best-effort
+                logging.debug(f"model3d live upload: {e}")
+
+
+def _run_model3d(task):
+    tid = task["task_id"]
+    _set_ui(status="running", task=f"Create 3D #{tid}")
+    import shutil, tempfile, uuid as _uuid, pathlib
+    work = tempfile.mkdtemp(prefix=f"model3d-{tid}-")
+    out = os.path.join(work, "out")
+    os.makedirs(os.path.join(out, "live"))
+    os.chmod(out, 0o777)
+    os.chmod(os.path.join(out, "live"), 0o777)
+    tag = _uuid.uuid4().hex[:10]
+    net, llm = f"pb3d-{tag}", f"pb3d-llm-{tag}"
+    stop = threading.Event()
+    try:
+        report_progress(tid, 5, "preparing the 3D model builder")
+        model = inference_worker.fetch_model(task["model"], root=pathlib.Path(MODEL3D_DIR), evict=False)
+        template_storage.prepare(task["llm_image"], tid, timeout=1800)
+        llm_image = template_storage.local(task["llm_image"])
+        template_storage.prepare(task["image"], tid, timeout=1800)
+        image = template_storage.local(task["image"])
+        base = []
+        if task.get("parent_ref"):                    # continue from the previous commit's scene
+            g = httpx.post(f"{API_URL}/jobs/input_url", headers=HEADERS, timeout=15,
+                           json={"task_id": tid, "ref": task["parent_ref"]}, trust_env=False).json()
+            with open(os.path.join(work, "base.blend"), "wb") as fh:
+                safe_fetch.get(g["download_url"], timeout=600, max_bytes=_SCENE_MAX, sink=fh)
+            base = ["-v", f"{os.path.join(work, 'base.blend')}:/base.blend:ro"]
+        subprocess.run(["docker", "network", "create", "--internal", net], check=True,
+                       capture_output=True, timeout=30)
+        label = ["--label", f"{TASK_LABEL}={tid}"]
+        r = subprocess.run(
+            ["docker", "run", "-d", "--rm", "--pull=never", "--name", llm, "--network", net,
+             "--network-alias", "llm", *label, *gpu_runtime.docker_gpu_args(),
+             "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=256",
+             "--user=65534:65534", "-e", "HOME=/tmp", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+             "--log-opt=max-size=1m", "--mount", f"type=bind,src={model},dst=/models/model.gguf,readonly",
+             llm_image, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
+             "-c", "8192", "--fit", "on", "--fit-target", "256"],
+            capture_output=True, text=True, timeout=60)
+        if r.returncode:
+            raise RuntimeError(f"the local LLM did not start: {r.stderr.strip()[:200]}")
+        report_progress(tid, 20, "building the model from your prompt")
+        threading.Thread(target=_model3d_live_uploader, args=(tid, os.path.join(out, "live", "latest.jpg"), stop),
+                         daemon=True, name="pb-model3d-live").start()
+        driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model3d_driver.py")
+        cmd = ["docker", "run", "--rm", "--network", net, *_isolation_flags(task),
+               "-v", f"{driver}:/driver.py:ro", *base, "-v", f"{out}:/out",
+               "--entrypoint", "blender", image, "-b", *(["/base.blend"] if base else []),
+               "--python", "/driver.py", "--", "--prompt", str(task.get("prompt", ""))[:2000],
+               "--out", "/out", "--llm", "http://llm:8080", *([] if base else ["--fresh"])]
+        _rt = task.get("max_runtime_s")
+        try:
+            res = _run_docker(cmd, timeout=(int(_rt) if _rt else None), capture_output=True, text=True)
+            log_tail = (res.stdout or "")[-1500:]
+        except subprocess.CalledProcessError as ce:
+            if tid in _KILLED:
+                raise RuntimeError("killed by an admin") from ce
+            report_log(tid, "Blender output (last lines):\n" + ((ce.stdout or "") + (ce.stderr or ""))[-1500:])
+            raise RuntimeError("the 3D builder exited with an error") from ce
+        report_log(tid, "\n".join(l for l in log_tail.splitlines() if l.startswith(("PBSTEP", "PBCOMMIT")))[-1500:])
+        stop.set()
+        live = os.path.join(out, "live", "latest.jpg")
+        if os.path.exists(live):
+            _put_output(tid, live, "live.jpg")
+        refs, hashes = {}, []
+        for name in MODEL3D_FILES:
+            path = os.path.join(out, name)
+            if os.path.exists(path):
+                refs[name], h = _put_output(tid, path, name)
+                hashes.append(h)
+        if "commit.json" not in refs:
+            raise RuntimeError("the 3D builder produced no commit")
+        _post("/jobs/result", _signed_result(tid, status="completed", result=refs["commit.json"],
+                                             content_hash=hashlib.sha256("\n".join(hashes).encode()).hexdigest()))
+        _set_ui(status="idle", task=None, ok=True)
+    except Exception as e:                              # noqa: BLE001
+        reason = str(e)[:600] or "the 3D build did not finish on this node"
+        report_log(tid, f"create 3d failed: {reason}")
+        _post("/jobs/result", _signed_result(tid, status="failed", result=reason))
+        _set_ui(status="idle", task=None, fail=True)
+    finally:
+        stop.set()
+        subprocess.run(["docker", "rm", "-f", llm], capture_output=True, timeout=30, check=False)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True, timeout=30, check=False)
+        shutil.rmtree(work, ignore_errors=True)
+
+
 # A rendered frame range is uploaded as tars of at most this many bytes, split on frame boundaries
 # (each part extracts on its own) and STREAMED from disk. 2026-10-08: one 3.6 GB tar of 110 4K frames
 # was read into RAM and sent as a single write, which timed out at 600 s and lost the whole render;
@@ -4742,6 +4855,8 @@ def job_loop():
                             _run_template_probe(task)
                         elif tt == "render":
                             _run_render(task)
+                        elif tt == "model3d":
+                            _run_model3d(task)
                         elif tt == "transcode":
                             _run_transcode(task)
                         elif tt == "stitch":
