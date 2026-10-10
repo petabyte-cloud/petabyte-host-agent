@@ -83,14 +83,18 @@ def stop_container():
             docker("rm", "-f", cid)
 
 
-def _valid_args(args):
+# llama-server flags a chat lease may set: tuning only (Qwen3.8's --reasoning-budget 0 turns thinking off).
+_LLM_FLAGS = {"--reasoning-budget"}
+
+
+def _valid_args(args, flags=_SD_FLAGS, switches=_SD_SWITCHES):
     if not isinstance(args, list) or len(args) > 16:
         return False
     i = 0
     while i < len(args):
-        if args[i] in _SD_SWITCHES:
+        if args[i] in switches:
             i += 1
-        elif (args[i] in _SD_FLAGS and i + 1 < len(args) and isinstance(args[i + 1], str)
+        elif (args[i] in flags and i + 1 < len(args) and isinstance(args[i + 1], str)
               and _SD_VALUE_RE.match(args[i + 1])):
             i += 2
         else:
@@ -123,7 +127,8 @@ def valid(p):
             and isinstance(p.get("image"), str) and _IMAGE_RE.match(p["image"])
             and num(p.get("size"), 1, 200 * 1024 ** 3) and num(p.get("ctx"), 512, 131072)
             and num(p.get("parallel"), 1, 8) and num(p.get("seconds"), 1, 30)
-            and isinstance(p.get("offload", False), bool))
+            and isinstance(p.get("offload", False), bool)
+            and _valid_args(p.get("args", []), _LLM_FLAGS, set()))
 
 
 # A big (MoE) model split between GPU and RAM: --fit keeps what fits in VRAM (256 MiB margin) and the
@@ -385,7 +390,7 @@ class Controller:
                        "-e", f"LLAMA_ARG_API_KEY={key}",
                        image, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
                        "-c", str(p["ctx"] * p["parallel"]), "-np", str(p["parallel"]),
-                       *(OFFLOAD_ARGS if p.get("offload") else ("-ngl", "999")),
+                       *(OFFLOAD_ARGS if p.get("offload") else ("-ngl", "999")), *p.get("args", []),
                        timeout=60)
             if r.returncode:
                 raise RuntimeError(f"inference server did not start: {r.stderr.strip()[:160]}")
