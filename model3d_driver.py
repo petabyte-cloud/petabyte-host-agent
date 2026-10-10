@@ -24,6 +24,9 @@ os.makedirs(args.out, exist_ok=True)
 
 if args.fresh:
     bpy.ops.wm.read_factory_settings(use_empty=True)
+    # The empty factory scene has no World, and model code reads scene.world anyway (commit #26 died
+    # on scene.world.light_settings). Give it one, as Blender's normal startup scene has.
+    bpy.context.scene.world = bpy.data.worlds.new("World")
 
 
 def wait_for_llm(limit_s=600):
@@ -62,7 +65,8 @@ cylinder("Mug", 0.04, 0.10, (0.2, 0.1, 0.75 + 0.05), (0.8, 0.1, 0.1))
 torus("MugHandle", 0.03, 0.008, (0.25, 0.1, 0.80), (0.8, 0.1, 0.1), rotation=(90, 0, 0))
 ```
 Use realistic real-world sizes and enough parts that the object is recognisable. Keep existing objects
-unless asked to change them. When the request is fully done, reply with just: DONE"""
+unless asked to change them. The camera, lights, world and render settings are handled for you: never
+touch them. When the request is fully done, reply with just: DONE"""
 
 
 
@@ -123,14 +127,29 @@ def remove(name):
 NS = {}   # one namespace per commit: a fix-up block can reuse variables from earlier blocks
 
 
-def scene_info():
+def scene_objects():
     out = []
     for o in bpy.context.scene.objects:
         mat = o.active_material.name if getattr(o, "active_material", None) else None
         out.append({"name": o.name, "type": o.type, "location": [round(v, 3) for v in o.location],
                     "rotation": [round(v, 3) for v in o.rotation_euler], "scale": [round(v, 3) for v in o.scale],
                     "dimensions": [round(v, 3) for v in o.dimensions], "material": mat})
-    return json.dumps(out)
+    return out
+
+
+SCENE_MAX_CHARS = 6000   # the scene as the LLM sees it: keeps each request inside its 8k-token context
+
+
+def scene_info(limit=SCENE_MAX_CHARS):
+    """The scene for the LLM, capped: a big scene drops the less useful fields, then the last objects."""
+    objs = scene_objects()
+    s = json.dumps(objs)
+    if len(s) <= limit:
+        return s
+    slim = [{"name": o["name"], "location": o["location"], "dimensions": o["dimensions"]} for o in objs]
+    while slim and len(json.dumps(slim)) > limit - 40:
+        slim.pop()
+    return json.dumps(slim) + f" (+{len(objs) - len(slim)} more objects)"
 
 
 def run_code(code):
@@ -238,29 +257,36 @@ def chat_live(messages):
 
 messages = [{"role": "system", "content": SYSTEM},
             {"role": "user", "content": f"Current scene: {scene_info()}\n\nRequest: {args.prompt}"}]
-diff, log, summary, t0 = [], [], "", time.time()
+diff, log, summary, error, step, t0 = [], [], "", "", 0, time.time()
 FENCE = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.S)
-for step in range(args.max_steps):
-    text = chat_live(messages).get("content") or ""
-    messages.append({"role": "assistant", "content": text})
-    blocks = FENCE.findall(text)
-    if not blocks:
-        summary = text.strip()[:300]
-        log.append({"step": step, "done": True, "text": summary})
-        print("PBSTEP", step, "done:", summary[:200].replace("\n", " | "), flush=True)
-        break
-    results = []
-    for code in blocks:                      # each block = one execute_blender_code call
-        ok, res = run_code(code)
-        if ok:
-            diff.append(code)
-            _snap["dirty"] = True
-            snapshot()
-        log.append({"step": step, "tool": "execute_blender_code", "ok": ok, "result": res[:300]})
-        print("PBSTEP", step, "code", "ok" if ok else "ERR", res[:300].replace("\n", " | "), flush=True)
-        results.append(("OK: " if ok else "ERROR: ") + res[:800])
-    messages.append({"role": "user", "content": "\n".join(results) + f"\nScene now: {scene_info()}"
-                     "\nFix any error with another code block, add anything still missing, or reply DONE."})
+try:
+    for step in range(args.max_steps):
+        # The system prompt, the request and only the LATEST exchange: the whole history (every code
+        # block plus a scene dump per step) overflowed the 8k context on a long prompt (commit #26).
+        text = chat_live(messages[:2] + messages[2:][-2:]).get("content") or ""
+        messages.append({"role": "assistant", "content": text})
+        blocks = FENCE.findall(text)
+        if not blocks:
+            summary = text.strip()[:300]
+            log.append({"step": step, "done": True, "text": summary})
+            print("PBSTEP", step, "done:", summary[:200].replace("\n", " | "), flush=True)
+            break
+        results = []
+        for code in blocks:                      # each block = one execute_blender_code call
+            ok, res = run_code(code)
+            if ok:
+                diff.append(code)
+                _snap["dirty"] = True
+                snapshot()
+            log.append({"step": step, "tool": "execute_blender_code", "ok": ok, "result": res[:300]})
+            print("PBSTEP", step, "code", "ok" if ok else "ERR", res[:300].replace("\n", " | "), flush=True)
+            results.append(("OK: " if ok else "ERROR: ") + res[:800])
+        messages.append({"role": "user", "content": "\n".join(results) + f"\nScene now: {scene_info()}"
+                         "\nFix any error with another code block, add anything still missing, or reply DONE."})
+except Exception as e:  # noqa: BLE001 — the LLM call or a live view failed: keep what was built
+    error = f"{type(e).__name__}: {e}"[:300]
+    log.append({"step": step, "error": error})
+    print("PBERROR", error.replace("\n", " | "), flush=True)
 
 # Commit artifacts
 frame_camera()
@@ -287,6 +313,7 @@ except Exception as e:  # noqa: BLE001
 with open(os.path.join(args.out, "diff.py"), "w") as f:
     f.write(f"# prompt: {args.prompt}\n\n" + "\n\n# ---\n".join(diff) + "\n")
 with open(os.path.join(args.out, "commit.json"), "w") as f:
-    json.dump({"prompt": args.prompt, "summary": summary, "steps": log, "seconds": round(time.time() - t0, 1),
-               "objects": json.loads(scene_info())}, f, indent=1)
-print("PBCOMMIT", json.dumps({"ok": bool(diff), "summary": summary, "seconds": round(time.time() - t0, 1)}))
+    json.dump({"prompt": args.prompt, "ok": bool(diff), "error": error, "summary": summary, "steps": log,
+               "seconds": round(time.time() - t0, 1), "objects": scene_objects()}, f, indent=1)
+print("PBCOMMIT", json.dumps({"ok": bool(diff), "error": error, "summary": summary,
+                              "seconds": round(time.time() - t0, 1)}))

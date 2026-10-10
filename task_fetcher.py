@@ -4038,6 +4038,19 @@ MODEL3D_DIR = os.getenv("PETABYTE_MODEL3D_DIR", "/var/lib/petabyte-agent/model3d
 MODEL3D_FILES = ("preview.png", "scene.glb", "scene.blend", "diff.py", "commit.json")
 
 
+def _model3d_reason(output, default):
+    """The buyer-facing reason a build stopped: the driver's PBERROR, else the last exception line."""
+    pb = exc = ""
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if line.startswith("PBERROR "):
+            pb = line[8:]
+        elif re.match(r"^[A-Za-z_.]*(Error|Exception)\b.*:", line):
+            exc = line
+    last = pb or exc
+    return (f"{default}: {last}" if last else default)[:300]
+
+
 def _model3d_live_uploader(tid, live, stop):
     """Upload live/latest.jpg whenever it changes, at most every 10 s, until `stop` is set."""
     last = 0.0
@@ -4101,6 +4114,8 @@ def _run_model3d(task):
         cmd = ["docker", "run", "--rm", "--network", net, *_isolation_flags(task),
                "-v", f"{driver}:/driver.py:ro", *base, "-v", f"{out}:/out",
                "--entrypoint", "blender", image, "-b", *(["/base.blend"] if base else []),
+               # Without this Blender exits 0 when the script raises, and the crash read as "no commit".
+               "--python-exit-code", "1",
                "--python", "/driver.py", "--", "--prompt", str(task.get("prompt", ""))[:2000],
                "--out", "/out", "--llm", "http://llm:8080", *([] if base else ["--fresh"])]
         _rt = task.get("max_runtime_s")
@@ -4111,8 +4126,10 @@ def _run_model3d(task):
             if tid in _KILLED:
                 raise RuntimeError("killed by an admin") from ce
             report_log(tid, "Blender output (last lines):\n" + ((ce.stdout or "") + (ce.stderr or ""))[-1500:])
-            raise RuntimeError("the 3D builder exited with an error") from ce
-        report_log(tid, "\n".join(l for l in log_tail.splitlines() if l.startswith(("PBSTEP", "PBCOMMIT")))[-1500:])
+            raise RuntimeError(_model3d_reason((ce.stdout or "") + "\n" + (ce.stderr or ""),
+                                               "the 3D builder stopped")) from ce
+        report_log(tid, "\n".join(l for l in log_tail.splitlines()
+                                  if l.startswith(("PBSTEP", "PBCOMMIT", "PBERROR")))[-1500:])
         stop.set()
         live = os.path.join(out, "live", "latest.jpg")
         if os.path.exists(live):
@@ -4124,7 +4141,15 @@ def _run_model3d(task):
                 refs[name], h = _put_output(tid, path, name)
                 hashes.append(h)
         if "commit.json" not in refs:
-            raise RuntimeError("the 3D builder produced no commit")
+            raise RuntimeError(_model3d_reason(res.stdout, "the 3D builder produced no commit"))
+        try:
+            with open(os.path.join(out, "commit.json")) as fh:
+                commit = json.load(fh)
+        except (OSError, ValueError):
+            commit = {}
+        if commit.get("ok") is False:   # no code block ever ran: nothing to deliver, so nothing to bill
+            raise RuntimeError(("the AI model's code never ran: " + commit["error"]) if commit.get("error")
+                               else "the AI model's code never ran (try a simpler prompt)")
         _post("/jobs/result", _signed_result(tid, status="completed", result=refs["commit.json"],
                                              content_hash=hashlib.sha256("\n".join(hashes).encode()).hexdigest()))
         _set_ui(status="idle", task=None, ok=True)
