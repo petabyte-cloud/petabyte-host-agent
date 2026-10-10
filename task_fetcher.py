@@ -365,6 +365,9 @@ def heartbeat_loop():
                     logging.warning("Inference worker paused: %s", exc)
                 # Owner may have changed the selling window in the dashboard — adopt it live.
                 template_storage.set_catalog(_body.get("template_image_catalog"))
+                # Keep Jupyter (the server's keep-warm list) cached: never evicted, pulled while idle.
+                template_storage.set_keep_warm(_body.get("keep_warm_images"))
+                template_storage.warm(idle=not _body.get("pause_template_probes") and not _rental_live())
                 _note_gateways(_body.get("gateways"))
                 _note_egress_gateway(_body.get("egress_gateway"))
                 _note_agent_update(_body)       # server-requested signed self-update (job_loop)

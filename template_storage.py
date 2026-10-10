@@ -18,6 +18,11 @@ import time
 
 _LOCK = threading.RLock()
 _CATALOG = ()
+# Images the server wants warm on every node (heartbeat `keep_warm_images`; Jupyter today): never
+# evicted by collect(), and pulled in the background while the node is idle (warm()).
+_KEEP_WARM = ()
+_WARM_TRIED = {}      # image -> monotonic time of its last idle pull attempt
+WARM_RETRY_S = 600
 STATE = Path("/var/lib/petabyte/images.json")
 GIB = 1024 ** 3
 
@@ -151,15 +156,17 @@ def free_bytes():
 
 
 def node_images():
-    """IDs of images the node itself depends on: the mandatory VRAM-wipe image. A template that
-    pulled the same image (pytorch) made it cache-owned, and LRU eviction then deleted it; every
-    later job was refused for an unverifiable wipe (spec 270, 2026-10-08). Never evicted here."""
+    """IDs of images never evicted here. The mandatory VRAM-wipe image: a template that pulled the
+    same image (pytorch) made it cache-owned, and LRU eviction then deleted it; every later job was
+    refused for an unverifiable wipe (spec 270, 2026-10-08). And the keep-warm images: a TensorFlow
+    template probe's pull evicted Jupyter on spec 270, and a buyer's Jupyter launch then timed out
+    re-downloading it (booking 381, 2026-10-10)."""
     try:
         import gpu_runtime
         refs = [r for r in gpu_runtime.wipe_image_candidates() if r]
     except Exception:                                    # noqa: BLE001 — never block a launch on it
-        return set()
-    return {i["Id"] for i in (inspect(r) for r in refs) if i}
+        refs = []
+    return {i["Id"] for i in (inspect(r) for r in [*refs, *_KEEP_WARM]) if i}
 
 
 def collect(state, *, all_owned=False):
@@ -273,6 +280,39 @@ def set_catalog(images):
     global _CATALOG
     if isinstance(images, list) and len(images) <= 64:
         _CATALOG = tuple(x for x in images if isinstance(x, str) and 0 < len(x) <= 2048)
+
+
+def set_keep_warm(images):
+    global _KEEP_WARM
+    if isinstance(images, list) and len(images) <= 8:
+        _KEEP_WARM = tuple(x for x in images if isinstance(x, str) and 0 < len(x) <= 2048)
+
+
+def _warm_one(image):
+    try:
+        prepare(image, "keep-warm", timeout=5)
+    except Exception:  # noqa: BLE001 — still downloading (the pull keeps going), or no room: retried later
+        pass
+
+
+def warm(idle):
+    """Pull a missing keep-warm image while the node is idle, so a buyer's launch finds it cached.
+    At most one attempt per image per WARM_RETRY_S, off the heartbeat thread; each holds the cache
+    lock for a few seconds only (the pull itself continues in _PULLS and the next attempt adopts it,
+    which also records the image as owned)."""
+    if not idle:
+        return
+    now = time.monotonic()
+    for image in _KEEP_WARM:
+        if now - _WARM_TRIED.get(image, float("-inf")) < WARM_RETRY_S:
+            continue
+        _WARM_TRIED[image] = now
+        try:
+            if inspect(image) is not None and image not in read().get("pending", {}):
+                continue                                 # here and its ownership is settled
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        threading.Thread(target=_warm_one, args=(image,), daemon=True, name="pb-keep-warm").start()
 
 
 def report(gateway=""):
