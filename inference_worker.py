@@ -45,9 +45,11 @@ _URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.gguf$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 # huggingface.co is unreachable from mainland China (spec 270 stepped down from both big models in
-# minutes, 2026-10-09); hf-mirror.com mirrors it path for path. Every file is sha256-pinned and checked
-# over the whole download, so a source can deliver a file, resume another's partial, but never alter it.
-HF_SOURCES = ("https://huggingface.co", "https://hf-mirror.com")
+# minutes, 2026-10-09), and so was hf-mirror.com from that node (2026-10-10). registry.petabyte.market/hf
+# serves the catalog's files from huggingface.co (deploy/registry-mirror). Every file is sha256-pinned
+# and checked over the whole download, so a source can deliver a file, resume another's partial, but
+# never alter it.
+HF_SOURCES = ("https://huggingface.co", "https://registry.petabyte.market/hf", "https://hf-mirror.com")
 # Image leases: stable-diffusion.cpp's official CUDA image, weights as .gguf or .safetensors.
 _SD_IMAGE_RE = re.compile(r"^ghcr\.io/leejet/stable-diffusion\.cpp@sha256:[0-9a-f]{64}$")
 _FILE_URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.(gguf|safetensors)$")

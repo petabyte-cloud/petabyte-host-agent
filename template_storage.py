@@ -180,9 +180,13 @@ def collect(state, *, all_owned=False):
         if docker("ps", "-aq", "--filter", "ancestor=" + image_id):
             continue
         try:
-            docker("image", "rm", image_id)
+            docker("image", "rm", image_id, timeout=180)
         except subprocess.CalledProcessError:
             # Multiple tags / a concurrent consumer: Docker's own guard wins.
+            continue
+        except subprocess.TimeoutExpired:
+            # A slow disk: leave it for the next pass. Raising here failed a whole pool lease on the
+            # 2060 with a 31 of 32 GB cache (2026-10-10).
             continue
         state["images"].pop(image_id)
 
