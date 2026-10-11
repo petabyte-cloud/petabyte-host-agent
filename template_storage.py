@@ -177,9 +177,46 @@ def save(state):
     tmp.replace(STATE)
 
 
+# Image cache budget (owner decision 2026-10-11). Automatic: 10% of the disk Docker keeps images on,
+# at least 30 GB (the old fixed default) and at most 120 GB. The fixed 30 GB made a 1 TB-free node
+# (spec 270) evict and re-download the same images. The owner can set their own size in the
+# dashboard (heartbeat image_cache_gb), which wins over PB_IMAGE_CACHE_GB set at install.
+AUTO_CACHE_SHARE, AUTO_CACHE_FLOOR_GB, AUTO_CACHE_CAP_GB = 0.10, 30, 120
+_SELLER_CACHE_GB = None      # the owner's dashboard choice; None = automatic
+_AUTO = [0.0, None]          # [monotonic time computed, bytes]
+
+
+def set_cache_gb(value):
+    global _SELLER_CACHE_GB
+    ok = isinstance(value, int) and not isinstance(value, bool) and 10 <= value <= 2000
+    _SELLER_CACHE_GB = value if ok else None
+
+
+def _auto_budget():
+    """10% of (free space + what this cache already holds), so the budget does not shrink as the
+    cache fills; clamped to 30..120 GB. Recomputed at most every 10 minutes (docker info is slow)."""
+    now = time.monotonic()
+    if _AUTO[1] is None or now - _AUTO[0] > 600:
+        try:
+            held = sum(int(x.get("bytes", 0)) for x in read().get("images", {}).values())
+            share = int(AUTO_CACHE_SHARE * (free_bytes() + held))
+        except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+            share = 0
+        _AUTO[:] = [now, min(AUTO_CACHE_CAP_GB * GIB, max(AUTO_CACHE_FLOOR_GB * GIB, share))]
+    return _AUTO[1]
+
+
 def policy():
-    return (max(0, int(os.getenv("PB_IMAGE_CACHE_GB", "30"))) * GIB,
-            max(0, int(os.getenv("PB_DISK_RESERVE_GB", "10"))) * GIB)
+    reserve = max(0, int(os.getenv("PB_DISK_RESERVE_GB", "10"))) * GIB
+    if _SELLER_CACHE_GB is not None:
+        return _SELLER_CACHE_GB * GIB, reserve
+    try:
+        env = os.getenv("PB_IMAGE_CACHE_GB", "").strip()
+        if env:
+            return max(0, int(env)) * GIB, reserve
+    except ValueError:
+        pass
+    return _auto_budget(), reserve
 
 
 def _inspect(ref):

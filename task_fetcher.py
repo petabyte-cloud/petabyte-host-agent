@@ -367,6 +367,7 @@ def heartbeat_loop():
                 template_storage.set_catalog(_body.get("template_image_catalog"))
                 # Keep Jupyter (the server's keep-warm list) cached: never evicted, pulled while idle.
                 template_storage.set_keep_warm(_body.get("keep_warm_images"))
+                template_storage.set_cache_gb(_body.get("image_cache_gb"))   # owner's size; None = automatic
                 template_storage.warm(idle=not _body.get("pause_template_probes") and not _rental_live())
                 _note_gateways(_body.get("gateways"))
                 _note_egress_gateway(_body.get("egress_gateway"))
