@@ -9,6 +9,7 @@ server on 127.0.0.1 with a fresh random API key, open our reverse tunnel to the 
 An image lease ("kind": "image", Petabyte Create) runs stable-diffusion.cpp's sd-server the same way,
 with its three pinned files (diffusion model, text encoder, VAE). sd-server has no API key, so it is
 reached only through a localhost proxy that checks the session key and passes the generation paths.
+A video lease ("mode": "vid_gen", Wan 2.2) is an image lease whose text encoder is UMT5 ("t5xxl").
 
 Nothing the server sends can make this run something else: the image must be the official llama.cpp
 (or stable-diffusion.cpp) repository pinned by digest, the weights must come from huggingface.co and
@@ -54,14 +55,18 @@ HF_SOURCES = ("https://huggingface.co", "https://registry.petabyte.market/hf", "
 _SD_IMAGE_RE = re.compile(r"^ghcr\.io/leejet/stable-diffusion\.cpp@sha256:[0-9a-f]{64}$")
 _FILE_URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.(gguf|safetensors)$")
 _ROLES = ("diffusion", "llm", "vae")
+_VIDEO_ROLES = ("diffusion", "t5xxl", "vae")          # Wan: UMT5 text encoder (sd-server --t5xxl)
 # sd-server flags a lease may set: tuning only, never a path, a port or something to serve.
 _SD_FLAGS = {"--cfg-scale", "--sampling-method", "--scheduler", "--flow-shift", "--steps"}
 _SD_SWITCHES = {"--diffusion-fa", "--offload-to-cpu", "--vae-tiling"}
 _SD_VALUE_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
-# The only sd-server paths our API calls; the proxy refuses the rest (video, upscale, the web UI).
-_IMAGE_PATHS = re.compile(r"^/(v1/images/generations|sdcpp/v1/(capabilities|img_gen|"
+# The only sd-server paths our API calls; the proxy refuses the rest (upscale, the web UI).
+_IMAGE_PATHS = re.compile(r"^/(v1/images/generations|sdcpp/v1/(capabilities|img_gen|vid_gen|"
                           r"jobs/[A-Za-z0-9_-]{1,64}(/cancel)?))$")
 IMAGE_BENCH = {"prompt": "a lighthouse on a cliff at sunset, photograph", "size": "512x512"}
+# A video model cannot make a still: its benchmark is a tiny clip (9 frames at 256x256, 4 steps).
+VIDEO_BENCH = {"prompt": "waves rolling onto a beach at sunset", "width": 256, "height": 256,
+               "video_frames": 9, "sample_params": {"sample_steps": 4}}
 
 
 class Cancelled(Exception):
@@ -106,11 +111,13 @@ def _valid_args(args, flags=_SD_FLAGS, switches=_SD_SWITCHES):
 
 def _valid_image(p):
     files = p.get("files")
+    roles = _VIDEO_ROLES if p.get("mode") == "vid_gen" else _ROLES
     return (isinstance(p.get("model"), str) and _MODEL_RE.match(p["model"])
+            and p.get("mode", "img_gen") in ("img_gen", "vid_gen")
             and isinstance(p.get("image"), str) and _SD_IMAGE_RE.match(p["image"])
-            and isinstance(files, list) and len(files) == len(_ROLES)
+            and isinstance(files, list) and len(files) == len(roles)
             and all(isinstance(f, dict) for f in files)
-            and sorted(f.get("role") or "" for f in files) == sorted(_ROLES)
+            and sorted(f.get("role") or "" for f in files) == sorted(roles)
             and all(isinstance(f.get("url"), str) and _FILE_URL_RE.match(f["url"])
                     and isinstance(f.get("sha256"), str) and _SHA_RE.match(f["sha256"])
                     and type(f.get("size")) is int and 1 <= f["size"] <= 100 * 1024 ** 3 for f in files)
@@ -225,6 +232,27 @@ def bench_image(url):
     if not (r.json().get("data") or [{}])[0].get("b64_json"):
         raise RuntimeError("the image server returned no image")
     return round(512 * 512 / 1e6 / max(time.monotonic() - t, 1e-3), 4)
+
+
+def bench_video(url, limit_s=900):
+    """Frame-megapixels per second for one tiny clip (seeds the tier; the API measures live jobs)."""
+    t = time.monotonic()
+    r = httpx.post(f"{url}/sdcpp/v1/vid_gen", json=VIDEO_BENCH, timeout=60, trust_env=False)
+    r.raise_for_status()
+    job = r.json().get("id")
+    if not isinstance(job, str):
+        raise RuntimeError("the video server did not accept the benchmark clip")
+    while time.monotonic() - t < limit_s:
+        time.sleep(3)
+        j = httpx.get(f"{url}/sdcpp/v1/jobs/{job}", timeout=60, trust_env=False).json()
+        if j.get("status") == "completed":
+            if not (j.get("result") or {}).get("b64_json"):
+                raise RuntimeError("the video server returned no clip")
+            px = VIDEO_BENCH["width"] * VIDEO_BENCH["height"] * VIDEO_BENCH["video_frames"]
+            return round(px / 1e6 / max(time.monotonic() - t, 1e-3), 4)
+        if j.get("status") in ("failed", "cancelled"):
+            raise RuntimeError(f"the benchmark clip {j['status']}: {str(j.get('error'))[:120]}")
+    raise RuntimeError("the benchmark clip did not finish")
 
 
 class AuthProxy:
@@ -462,7 +490,8 @@ class Controller:
                      for a in ("--mount", f"type=bind,src={path},dst={models[role]},readonly")],
                    "--entrypoint", "/sd-server", image,
                    "--listen-ip", "0.0.0.0", "--listen-port", "8080",
-                   "--diffusion-model", models["diffusion"], "--llm", models["llm"], "--vae", models["vae"],
+                   "--diffusion-model", models["diffusion"], "--vae", models["vae"],
+                   *(("--t5xxl", models["t5xxl"]) if "t5xxl" in models else ("--llm", models["llm"])),
                    *p.get("args", []), timeout=60)
         if r.returncode:
             raise RuntimeError(f"image server did not start: {r.stderr.strip()[:160]}")
@@ -479,7 +508,7 @@ class Controller:
                 raise RuntimeError("image server exited while loading the model")
             if time.monotonic() > deadline:
                 raise RuntimeError("image server did not become ready")
-        mps = bench_image(url)
+        mps = bench_video(url) if p.get("mode") == "vid_gen" else bench_image(url)
         self._proxy = AuthProxy(inner, key)
         self._warm_until_done(p, stop, self._proxy.port, key, dict(kind="image", bench_mps=mps))
 

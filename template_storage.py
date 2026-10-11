@@ -431,6 +431,7 @@ def report(gateway=""):
                       "minecraft_status_version": 1, "ssh_start_version": 1,
                       "inference_offload_version": 1,     # inference_worker splits big models GPU/RAM
                       "image_pool_version": 1,            # inference_worker serves image leases (sd-server)
+                      "video_pool_version": 1,            # ...and video leases (Wan 2.2: t5xxl, vid_gen)
                       "llm_args_version": 1,              # ...and passes a chat lease's allowlisted flags
                       "images": images, "cache_budget_bytes": int(budget),
                       "cache_bytes": sum(x["bytes"] for x in state["images"].values()),
