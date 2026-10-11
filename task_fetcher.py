@@ -3272,7 +3272,7 @@ def _run_template_probe(task):
     answer = template_probe.run(task["template_probe"], _run_docker, template_storage.prepare,
         _isolation_flags({"gpu": True, "memory": "4g", "cpus": 2, "pids": 256}),
         gpu_runtime.docker_gpu_args(), tid,
-        local=template_storage.local)
+        local=template_storage.local, may_download=template_storage.background_pull_ok)
     result = json.dumps(answer, separators=(",", ":"))
     status = "completed" if answer.get("status") == "completed" else "failed"
     proof = execution_receipt.make(tid, result=result, status=status)

@@ -128,7 +128,8 @@ print(json.dumps(result,separators=(",",":")))
 '''
 
 
-def run(challenge, runner, prepare, isolation_flags, gpu_flags, task_id, local=lambda image: image):
+def run(challenge, runner, prepare, isolation_flags, gpu_flags, task_id, local=lambda image: image,
+        may_download=lambda image: True):
     # Same strict bounds as the independent server checker; validate before image preparation.
     if not isinstance(challenge, dict) or challenge.get("template") not in ("pytorch", "tensorflow", "jupyter"):
         raise ValueError("unsupported template probe")
@@ -144,10 +145,14 @@ def run(challenge, runner, prepare, isolation_flags, gpu_flags, task_id, local=l
         return dict(answer, failure="CUDA_UNAVAILABLE")
     _RUNNING.set()
     try:
-        prepare(challenge["image"], task_id, timeout=120)
+        prepare(challenge["image"], task_id, timeout=120, cached_only=not may_download(challenge["image"]))
     except Exception as exc:
         reason = str(exc).lower()
         _RUNNING.clear()
+        if "not cached" in reason:
+            # Never downloaded just to be tested: checked once a rental brings the image. Ours, not a
+            # node fault, so no diagnostics report (spec 270's tensorflow CACHE_POLICY, 2026-10-10).
+            return dict(answer, failure="IMAGE_NOT_CACHED")
         # A pull that runs past its bound is a slow link (spec 267, 2026-10-03: the layers were still
         # arriving), not a missing image; the server retries TIMEOUT without penalizing the seller.
         failure = ("TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired)

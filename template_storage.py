@@ -351,6 +351,14 @@ def _warm_one(image):
         pass
 
 
+def background_pull_ok(image):
+    """May a background check (a template probe) download `image`? Only the keep-warm image, and only
+    where it fits: anything else is tested once a rental has downloaded it. The server queues probes
+    from the node's last report, so without this an image evicted since that report was downloaded
+    again just to be tested (spec 270, 2026-10-10: TensorFlow, never rented)."""
+    return image in _KEEP_WARM and _warm_ok()
+
+
 def warm(idle):
     """Pull a missing keep-warm image while the node is idle, so a buyer's launch finds it cached.
     At most one attempt per image per WARM_RETRY_S, off the heartbeat thread; each holds the cache
