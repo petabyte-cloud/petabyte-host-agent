@@ -1,9 +1,9 @@
-"""gpu_driver.py — OPT-IN NVIDIA driver updates on Ubuntu / Pop!_OS nodes, applied only while idle.
+"""gpu_driver.py — NVIDIA driver updates on Ubuntu / Pop!_OS nodes, applied only while idle.
 
-update.sh runs `gpu_driver.py upgrade` as root after gpu_toolkit.py. The seller opts in per node on
-the Petabyte dashboard ("may update the NVIDIA driver and reboot this machine when no rental is
-running"); the agent mirrors that choice into OPTIN. A driver change needs a reboot: the new user-space
-libraries don't match the loaded kernel module until then, so CUDA is down in between. With consent:
+update.sh runs `gpu_driver.py upgrade` as root after gpu_toolkit.py. ON for every node (owner's call,
+2026-10-11; opt-in before); a node's owner can turn it off on the Petabyte dashboard, and the agent
+mirrors that setting into OPTIN. A driver change needs a reboot: the new user-space libraries don't
+match the loaded kernel module until then, so CUDA is down in between. When on:
 
   1. the host must be Ubuntu or Pop!_OS with an apt-installed driver; never WSL (WSL uses the
      Windows driver), never Secure Boot (a new module needs MOK enrollment at the console), never a
