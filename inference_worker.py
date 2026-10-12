@@ -41,7 +41,7 @@ RETRY_AFTER_ERROR_S = 120
 # it at once (before_work); this only stops a single slow heartbeat from forcing a full reload.
 LEASE_GRACE_S = 20
 READY_TIMEOUT_S = 300
-_IMAGE_RE = re.compile(r"^ghcr\.io/ggml-org/llama\.cpp@sha256:[0-9a-f]{64}$")
+_IMAGE_RE = re.compile(r"^(ghcr\.io/ggml-org/llama\.cpp|docker\.io/petabytecloud/pool-llama)@sha256:[0-9a-f]{64}$")
 _URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.gguf$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -52,7 +52,7 @@ _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 # never alter it.
 HF_SOURCES = ("https://huggingface.co", "https://registry.petabyte.market/hf", "https://hf-mirror.com")
 # Image leases: stable-diffusion.cpp's official CUDA image, weights as .gguf or .safetensors.
-_SD_IMAGE_RE = re.compile(r"^ghcr\.io/leejet/stable-diffusion\.cpp@sha256:[0-9a-f]{64}$")
+_SD_IMAGE_RE = re.compile(r"^(ghcr\.io/leejet/stable-diffusion\.cpp|docker\.io/petabytecloud/pool-sd)@sha256:[0-9a-f]{64}$")
 _FILE_URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.(gguf|safetensors)$")
 _ROLES = ("diffusion", "llm", "vae")
 _VIDEO_ROLES = ("diffusion", "t5xxl", "vae")          # Wan: UMT5 text encoder (sd-server --t5xxl)
@@ -60,9 +60,16 @@ _VIDEO_ROLES = ("diffusion", "t5xxl", "vae")          # Wan: UMT5 text encoder (
 _SD_FLAGS = {"--cfg-scale", "--sampling-method", "--scheduler", "--flow-shift", "--steps"}
 _SD_SWITCHES = {"--diffusion-fa", "--offload-to-cpu", "--vae-tiling"}
 _SD_VALUE_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
-# The only sd-server paths our API calls; the proxy refuses the rest (upscale, the web UI).
-_IMAGE_PATHS = re.compile(r"^/(v1/images/generations|sdcpp/v1/(capabilities|img_gen|vid_gen|"
-                          r"jobs/[A-Za-z0-9_-]{1,64}(/cancel)?))$")
+# The only server paths our API calls; the proxy refuses the rest (upscale, web UIs, model loading).
+_IMAGE_PATHS = re.compile(r"^/(v1/images/generations|v1/audio/speech|inference|sdcpp/v1/(capabilities|img_gen|"
+                          r"vid_gen|jobs/[A-Za-z0-9_-]{1,64}(/cancel)?))$")
+# Audio leases: whisper.cpp's official CUDA image (speech to text) and Petabyte's Chatterbox image
+# (deploy/tts-server, text to speech). Each file is mounted at /models/<role>: role = the file name the
+# server loads, so it may not name a path.
+_AUDIO_IMAGE_RE = {"stt": re.compile(r"^docker\.io/petabytecloud/pool-whisper@sha256:[0-9a-f]{64}$"),
+                   "tts": re.compile(r"^docker\.io/petabytecloud/tts-chatterbox@sha256:[0-9a-f]{64}$")}
+_AUDIO_URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.(bin|pt|json|safetensors)$")
+_AUDIO_ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 IMAGE_BENCH = {"prompt": "a lighthouse on a cliff at sunset, photograph", "size": "512x512"}
 # A video model cannot make a still: its benchmark is a tiny clip (9 frames at 256x256, 4 steps).
 VIDEO_BENCH = {"prompt": "waves rolling onto a beach at sunset", "width": 256, "height": 256,
@@ -124,12 +131,27 @@ def _valid_image(p):
             and _valid_args(p.get("args", [])) and type(p.get("seconds")) is int and 1 <= p["seconds"] <= 30)
 
 
+def _valid_audio(p):
+    files, mode = p.get("files"), p.get("mode")
+    return (isinstance(p.get("model"), str) and _MODEL_RE.match(p["model"]) and mode in _AUDIO_IMAGE_RE
+            and isinstance(p.get("image"), str) and _AUDIO_IMAGE_RE[mode].match(p["image"])
+            and isinstance(files, list) and 1 <= len(files) <= 12 and all(isinstance(f, dict) for f in files)
+            and len({f.get("role") for f in files}) == len(files)
+            and all(isinstance(f.get("role"), str) and _AUDIO_ROLE_RE.match(f["role"])
+                    and isinstance(f.get("url"), str) and _AUDIO_URL_RE.match(f["url"])
+                    and isinstance(f.get("sha256"), str) and _SHA_RE.match(f["sha256"])
+                    and type(f.get("size")) is int and 1 <= f["size"] <= 20 * 1024 ** 3 for f in files)
+            and p.get("args", []) == [] and type(p.get("seconds")) is int and 1 <= p["seconds"] <= 30)
+
+
 def valid(p):
     """The lease's shape, and that it names only the allowed image and weights."""
     def num(v, lo, hi):
         return type(v) is int and lo <= v <= hi
     if isinstance(p, dict) and p.get("kind") == "image":
         return bool(_valid_image(p))
+    if isinstance(p, dict) and p.get("kind") == "audio":
+        return bool(_valid_audio(p))
     return (isinstance(p, dict) and isinstance(p.get("model"), str) and _MODEL_RE.match(p["model"])
             and isinstance(p.get("url"), str) and _URL_RE.match(p["url"])
             and isinstance(p.get("sha256"), str) and _SHA_RE.match(p["sha256"])
@@ -253,6 +275,42 @@ def bench_video(url, limit_s=900):
         if j.get("status") in ("failed", "cancelled"):
             raise RuntimeError(f"the benchmark clip {j['status']}: {str(j.get('error'))[:120]}")
     raise RuntimeError("the benchmark clip did not finish")
+
+
+def _tone_wav(seconds=4, rate=16000):
+    """A short 440 Hz tone as a WAV file: the speech-to-text benchmark input."""
+    import io
+    import math
+    import struct
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * i / rate)))
+                               for i in range(seconds * rate)))
+    return buf.getvalue()
+
+
+def bench_stt(url):
+    """Seconds of audio transcribed per second (x real time), on a 4 s tone."""
+    t = time.monotonic()
+    r = httpx.post(f"{url}/inference", files={"file": ("bench.wav", _tone_wav())},
+                   data={"response_format": "verbose_json", "language": "en"}, timeout=300, trust_env=False)
+    r.raise_for_status()
+    return round(4 / max(time.monotonic() - t, 1e-3), 2)
+
+
+def bench_tts(url):
+    """Seconds of speech made per second (x real time), on one short English sentence."""
+    t = time.monotonic()
+    r = httpx.post(f"{url}/v1/audio/speech", json={"input": "Hello from Petabyte.", "language": "en"},
+                   timeout=600, trust_env=False)
+    r.raise_for_status()
+    if r.content[:4] != b"RIFF":
+        raise RuntimeError("the speech server returned no audio")
+    return round(max(len(r.content) - 44, 0) / (24000 * 2) / max(time.monotonic() - t, 1e-3), 2)
 
 
 class AuthProxy:
@@ -405,6 +463,8 @@ class Controller:
             self._set(state="downloading", model=p["model"])
             if p.get("kind") == "image":
                 return self._serve_image(p, stop)
+            if p.get("kind") == "audio":
+                return self._serve_audio(p, stop)
             path = fetch_model(p, lambda: self._lapsed(stop))
             import template_storage                 # cache-managed, with the registry-mirror fallback
             template_storage.prepare(p["image"], 0, timeout=1800)
@@ -511,6 +571,51 @@ class Controller:
         mps = bench_video(url) if p.get("mode") == "vid_gen" else bench_image(url)
         self._proxy = AuthProxy(inner, key)
         self._warm_until_done(p, stop, self._proxy.port, key, dict(kind="image", bench_mps=mps))
+
+    def _serve_audio(self, p, stop):
+        """whisper-server (stt) or Petabyte's Chatterbox server (tts) behind AuthProxy, each lease file
+        mounted read-only at /models/<role>; raises like the other paths."""
+        targets = [_target(f) for f in p["files"]]
+        paths = {f["role"]: fetch_model(f, lambda: self._lapsed(stop), keep=targets)
+                 for f in sorted(p["files"], key=lambda f: f["size"])}
+        import template_storage
+        template_storage.prepare(p["image"], 0, timeout=1800)
+        image = template_storage.local(p["image"])
+        if self._lapsed(stop):
+            return
+        self._set(state="starting", model=p["model"])
+        stop_container()
+        inner, key = _free_port(), secrets.token_urlsafe(32)
+        stt = p["mode"] == "stt"
+        cmd = (("--entrypoint", "/app/build/bin/whisper-server", image, "-m", "/models/model.bin",
+                "--host", "0.0.0.0", "--port", "8080", "--convert", "--tmp-dir", "/tmp") if stt else (image,))
+        r = docker("run", "-d", "--rm", "--pull=never", "--name", NAME, "--label", LABEL,
+                   "--restart=no", "--gpus", "all", "-p", f"127.0.0.1:{inner}:8080",
+                   "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                   "--pids-limit=256", "--user=65534:65534", "-e", "HOME=/tmp",
+                   "--tmpfs", "/tmp:rw,noexec,nosuid,size=1024m",       # ffmpeg's WAV of a long upload
+                   "--log-opt=max-size=1m", "--log-opt=max-file=1",
+                   *[a for role, path in paths.items()
+                     for a in ("--mount", f"type=bind,src={path},dst=/models/{role},readonly")],
+                   *cmd, timeout=60)
+        if r.returncode:
+            raise RuntimeError(f"audio server did not start: {r.stderr.strip()[:160]}")
+        url, deadline = f"http://127.0.0.1:{inner}", time.monotonic() + READY_TIMEOUT_S
+        while True:
+            if stop.wait(2) or self._lapsed(stop):
+                return
+            try:
+                if httpx.get(f"{url}/health", timeout=3, trust_env=False).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            if not running():
+                raise RuntimeError("audio server exited while loading the model")
+            if time.monotonic() > deadline:
+                raise RuntimeError("audio server did not become ready")
+        speed = bench_stt(url) if stt else bench_tts(url)
+        self._proxy = AuthProxy(inner, key)
+        self._warm_until_done(p, stop, self._proxy.port, key, dict(kind="audio", bench_mps=speed))
 
     def _warm_until_done(self, p, stop, port, key, extra):
         """Open the tunnel to `port`, report warm, and watch the server until the lease ends."""
