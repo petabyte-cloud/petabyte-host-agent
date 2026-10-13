@@ -313,6 +313,16 @@ def bench_tts(url):
     return round(max(len(r.content) - 44, 0) / (24000 * 2) / max(time.monotonic() - t, 1e-3), 2)
 
 
+def _retire(image):
+    try:
+        import template_storage
+        n = template_storage.retire_superseded(image)
+        if n:
+            logging.info("inference worker: deleted %d image(s) %s replaces", n, image.split("@")[0])
+    except Exception as e:                                # noqa: BLE001 — cleanup never stops serving
+        logging.warning("inference worker: image cleanup failed: %s", e)
+
+
 class AuthProxy:
     """127.0.0.1:<port> -> sd-server. sd-server has no API key, so the gateway, and anyone who learns
     the worker's address, reaches it only through this: the session key, and only _IMAGE_PATHS."""
@@ -625,6 +635,8 @@ class Controller:
         warm = dict(state="warm", model=p["model"], tunnel_port=rp, gateway=self.gateway, key=key, **extra)
         self._set(**warm)
         logging.info("inference worker warm: %s (%s)", p["model"], extra)
+        # It works: the official images (and older digests) a petabytecloud image replaces are dead weight.
+        threading.Thread(target=_retire, args=(p["image"],), daemon=True, name="pb-retire-images").start()
         while not stop.wait(3):
                 if self._lapsed(stop):
                     return                                # no renewal: the server stopped leasing

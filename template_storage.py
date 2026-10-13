@@ -353,6 +353,42 @@ def prepare(image, task_id, *, cached_only=False, timeout=900):
         return outcome
 
 
+# The official image each Petabyte pool image repackages (deploy/pool-images). A node that runs the slim
+# one never runs the official one again (the API sends slim images to every agent that reports
+# pool_images_version), so its 2-6 GB copy is dead weight until LRU eviction would get to it.
+SUPERSEDES = ("ghcr.io/ggml-org/llama.cpp", "ghcr.io/leejet/stable-diffusion.cpp", "ghcr.io/ggml-org/whisper.cpp")
+
+
+def retire_superseded(current):
+    """`current` (a petabytecloud image, by digest) is running: delete this cache's copies it replaces,
+    the official pool images and older digests of `current`'s own repository. Only images this cache
+    downloaded, pinned by digest, that no container uses. Removed by reference, so a tag something else
+    holds (a template's :server-cuda) keeps the image; it leaves the ledger only once Docker drops it."""
+    repo = current.split("@", 1)[0]
+    if not repo.startswith("docker.io/petabytecloud/"):
+        return 0
+    removed = 0
+    with locked():
+        state = read()
+        for image_id, entry in list(state["images"].items()):
+            ref = entry.get("ref") or ""
+            if "@" not in ref or ref == current or ref.split("@", 1)[0] not in (repo, *SUPERSEDES):
+                continue
+            if docker("ps", "-aq", "--filter", "ancestor=" + image_id):
+                continue
+            for r in (ref, mirror_ref(ref)):
+                try:
+                    if r:
+                        docker("image", "rm", r, timeout=180)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    pass                                     # not here under that name, or Docker said no
+            if _inspect(image_id) is None:
+                state["images"].pop(image_id)
+                removed += 1
+        save(state)
+    return removed
+
+
 def job_violation(volume=None):
     """A soft runtime guard, not a filesystem quota. Never inspect foreign volumes."""
     if free_bytes() < policy()[1]:
