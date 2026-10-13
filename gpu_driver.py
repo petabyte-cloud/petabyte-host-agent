@@ -127,7 +127,8 @@ def busy(since):
         return True                                  # no fresh report: assume busy
     if b.get("at", 0) < since or b.get("tasks"):
         return True
-    return any(n.startswith("pb-") for n in _out(["docker", "ps", "--format", "{{.Names}}"]).split())
+    return any(n.startswith(("pb-", "petabyte-inference-inf-"))
+               for n in _out(["docker", "ps", "--format", "{{.Names}}"]).split())
 
 
 def why_not():

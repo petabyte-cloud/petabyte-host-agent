@@ -56,8 +56,9 @@ _SD_IMAGE_RE = re.compile(r"^(ghcr\.io/leejet/stable-diffusion\.cpp|docker\.io/p
 _FILE_URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.(gguf|safetensors)$")
 _ROLES = ("diffusion", "llm", "vae")
 _VIDEO_ROLES = ("diffusion", "t5xxl", "vae")          # Wan: UMT5 text encoder (sd-server --t5xxl)
+_CHECKPOINT_ROLES = ("checkpoint",)                 # complete SDXL: embedded CLIP encoders and VAE
 # sd-server flags a lease may set: tuning only, never a path, a port or something to serve.
-_SD_FLAGS = {"--cfg-scale", "--sampling-method", "--scheduler", "--flow-shift", "--steps"}
+_SD_FLAGS = {"--cfg-scale", "--sampling-method", "--scheduler", "--flow-shift", "--steps", "--clip-skip"}
 _SD_SWITCHES = {"--diffusion-fa", "--offload-to-cpu", "--vae-tiling"}
 _SD_VALUE_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 # The only server paths our API calls; the proxy refuses the rest (upscale, web UIs, model loading).
@@ -84,17 +85,27 @@ def docker(*args, timeout=30):
     return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout, check=False)
 
 
-def running():
-    r = docker("ps", "-q", "--filter", f"name=^/{NAME}$", "--filter", f"label={LABEL}")
+def running(name=NAME):
+    r = docker("ps", "-q", "--filter", f"name=^/{name}$", "--filter", f"label={LABEL}")
     return r.returncode == 0 and bool(r.stdout.strip())
 
 
-def stop_container():
+def stop_container(name=NAME):
     """Remove only our labelled server container (also an orphan from a previous agent run)."""
-    r = docker("ps", "-aq", "--filter", f"name=^/{NAME}$", "--filter", f"label={LABEL}")
+    r = docker("ps", "-aq", "--filter", f"name=^/{name}$", "--filter", f"label={LABEL}")
     for cid in r.stdout.split():
         if re.fullmatch(r"[0-9a-f]{12,64}", cid):
             docker("rm", "-f", cid)
+
+
+def stop_all_containers():
+    """Agent restart: reclaim only managed server names carrying our ownership label."""
+    r = docker("ps", "-a", "--filter", f"label={LABEL}", "--format", "{{.ID}} {{.Names}}")
+    for line in r.stdout.splitlines():
+        fields = line.split()
+        if (len(fields) == 2 and re.fullmatch(r"[0-9a-f]{12,64}", fields[0])
+                and re.fullmatch(r"petabyte-inference(?:-inf-[0-9a-f]{16})?", fields[1])):
+            docker("rm", "-f", fields[0])
 
 
 # llama-server flags a chat lease may set: tuning only (Qwen3.8's --reasoning-budget 0 turns thinking off).
@@ -118,9 +129,12 @@ def _valid_args(args, flags=_SD_FLAGS, switches=_SD_SWITCHES):
 
 def _valid_image(p):
     files = p.get("files")
-    roles = _VIDEO_ROLES if p.get("mode") == "vid_gen" else _ROLES
+    checkpoint = p.get("architecture") == "sdxl"
+    roles = _CHECKPOINT_ROLES if checkpoint else (_VIDEO_ROLES if p.get("mode") == "vid_gen" else _ROLES)
     return (isinstance(p.get("model"), str) and _MODEL_RE.match(p["model"])
             and p.get("mode", "img_gen") in ("img_gen", "vid_gen")
+            and p.get("architecture") in (None, "sdxl")
+            and (not checkpoint or p.get("mode", "img_gen") == "img_gen")
             and isinstance(p.get("image"), str) and _SD_IMAGE_RE.match(p["image"])
             and isinstance(files, list) and len(files) == len(roles)
             and all(isinstance(f, dict) for f in files)
@@ -172,7 +186,24 @@ def _target(p, root=None):
     return (root or MODELS) / (p["sha256"] + (".safetensors" if p["url"].endswith(".safetensors") else ".gguf"))
 
 
+_FETCH_LOCKS, _FETCH_LOCK = {}, threading.Lock()
+
+
 def fetch_model(p, cancelled=lambda: False, keep=(), root=None, evict=True):
+    # Shared model servers can have the same encoder/VAE. Only one writer may own a .part file.
+    identity = str(_target(p, root).resolve())
+    with _FETCH_LOCK:
+        lock = _FETCH_LOCKS.setdefault(identity, threading.Lock())
+    while not lock.acquire(timeout=1):
+        if cancelled():
+            raise Cancelled()
+    try:
+        return _fetch_model(p, cancelled, keep, root, evict)
+    finally:
+        lock.release()
+
+
+def _fetch_model(p, cancelled=lambda: False, keep=(), root=None, evict=True):
     """The pinned file on local disk, verified. Resumes a partial download. Keeps only this lease's
     files: `keep` names the lease's other files (an image model is three). A batch job passes its own
     `root` with evict=False, so it never deletes the pool's cached models."""
@@ -381,7 +412,12 @@ def _lease_key(p):
 
 
 class Controller:
-    def __init__(self):
+    def __init__(self, name=NAME, gpu_args=None, shared=False):
+        self.name = name
+        self.gpu_args = gpu_args or ["--gpus", "all"]
+        self.shared = shared
+        self.endpoint = None
+        self._resources = []
         self.lock = threading.RLock()
         self.generation = 0
         self.busy = False
@@ -413,6 +449,17 @@ class Controller:
     def _set(self, **state):
         self._state = state
 
+    def _stop_container(self):
+        stop_container() if self.name == NAME else stop_container(self.name)
+
+    def _running(self):
+        return running() if self.name == NAME else running(self.name)
+
+    def _fetch(self, p, cancelled, keep=()):
+        if self.shared:
+            return fetch_model(p, cancelled, keep, evict=False)
+        return fetch_model(p, cancelled, keep)
+
     def before_work(self):
         """A job was claimed: free the GPU NOW, before the job touches it."""
         with self.lock:
@@ -434,7 +481,8 @@ class Controller:
         self._thread, self._key = None, None
         try:
             self.close_tunnel()
-            stop_container()
+            self._stop_container()
+            self.endpoint = None
             if self._proxy:
                 self._proxy.close()
                 self._proxy = None
@@ -475,17 +523,19 @@ class Controller:
                 return self._serve_image(p, stop)
             if p.get("kind") == "audio":
                 return self._serve_audio(p, stop)
-            path = fetch_model(p, lambda: self._lapsed(stop))
+            self._resources = (["--memory", f"{p['reserved_ram_mib']}m", "--cpus", "2"]
+                               if self.shared else [])
+            path = self._fetch(p, lambda: self._lapsed(stop))
             import template_storage                 # cache-managed, with the registry-mirror fallback
             template_storage.prepare(p["image"], 0, timeout=1800)
             image = template_storage.local(p["image"])
             if self._lapsed(stop):
                 return
             self._set(state="starting", model=p["model"])
-            stop_container()
+            self._stop_container()
             port, key = _free_port(), secrets.token_urlsafe(32)
-            r = docker("run", "-d", "--rm", "--pull=never", "--name", NAME, "--label", LABEL,
-                       "--restart=no", "--gpus", "all", "-p", f"127.0.0.1:{port}:8080",
+            r = docker("run", "-d", "--rm", "--pull=never", "--name", self.name, "--label", LABEL,
+                       "--restart=no", *self.gpu_args, *self._resources, "-p", f"127.0.0.1:{port}:8080",
                        "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                        "--pids-limit=256", "--user=65534:65534", "-e", "HOME=/tmp",
                        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
@@ -507,7 +557,7 @@ class Controller:
                         break
                 except httpx.HTTPError:
                     pass
-                if not running():
+                if not self._running():
                     raise RuntimeError("inference server exited while loading the model")
                 if time.monotonic() > deadline:
                     raise RuntimeError("inference server did not become ready")
@@ -522,12 +572,23 @@ class Controller:
             self._retry_at = time.monotonic() + RETRY_AFTER_ERROR_S
             self._retry_key = _lease_key(p)
         finally:
+            if self.shared:
+                # Shared controllers have generation-specific tunnel names and their own proxy.
+                # A late benchmark/SSH attempt must still reclaim those after stop() timed out.
+                try:
+                    self.close_tunnel()
+                    if self._proxy:
+                        self._proxy.close()
+                        self._proxy = None
+                except Exception:  # noqa: BLE001 — the node's next cleanup can retry
+                    pass
             # stop() already cleaned up (and a newer worker may own the container by now); only a
             # worker that ended on its own — lease lapsed or failed — tidies up after itself.
             if not stop.is_set():
                 try:
                     self.close_tunnel()
-                    stop_container()
+                    self._stop_container()
+                    self.endpoint = None
                     if self._proxy:
                         self._proxy.close()
                         self._proxy = None
@@ -539,7 +600,9 @@ class Controller:
     def _serve_image(self, p, stop):
         """sd-server with the lease's three files, behind AuthProxy; raises like the LLM path."""
         targets = [_target(f) for f in p["files"]]
-        paths = {f["role"]: fetch_model(f, lambda: self._lapsed(stop), keep=targets)
+        self._resources = (["--memory", f"{p['reserved_ram_mib']}m", "--cpus", "2"]
+                           if self.shared else [])
+        paths = {f["role"]: self._fetch(f, lambda: self._lapsed(stop), keep=targets)
                  for f in sorted(p["files"], key=lambda f: f["size"])}
         import template_storage
         template_storage.prepare(p["image"], 0, timeout=1800)
@@ -547,11 +610,14 @@ class Controller:
         if self._lapsed(stop):
             return
         self._set(state="starting", model=p["model"])
-        stop_container()
+        self._stop_container()
         inner, key = _free_port(), secrets.token_urlsafe(32)
         models = {role: f"/models/{role}{path.suffix}" for role, path in paths.items()}
-        r = docker("run", "-d", "--rm", "--pull=never", "--name", NAME, "--label", LABEL,
-                   "--restart=no", "--gpus", "all", "-p", f"127.0.0.1:{inner}:8080",
+        model_args = (("--model", models["checkpoint"]) if p.get("architecture") == "sdxl" else
+                      ("--diffusion-model", models["diffusion"], "--vae", models["vae"],
+                       *(("--t5xxl", models["t5xxl"]) if "t5xxl" in models else ("--llm", models["llm"]))))
+        r = docker("run", "-d", "--rm", "--pull=never", "--name", self.name, "--label", LABEL,
+                   "--restart=no", *self.gpu_args, *self._resources, "-p", f"127.0.0.1:{inner}:8080",
                    "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                    "--pids-limit=256", "--user=65534:65534", "-e", "HOME=/tmp",
                    "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
@@ -560,8 +626,7 @@ class Controller:
                      for a in ("--mount", f"type=bind,src={path},dst={models[role]},readonly")],
                    "--entrypoint", "/sd-server", image,
                    "--listen-ip", "0.0.0.0", "--listen-port", "8080",
-                   "--diffusion-model", models["diffusion"], "--vae", models["vae"],
-                   *(("--t5xxl", models["t5xxl"]) if "t5xxl" in models else ("--llm", models["llm"])),
+                   *model_args,
                    *p.get("args", []), timeout=60)
         if r.returncode:
             raise RuntimeError(f"image server did not start: {r.stderr.strip()[:160]}")
@@ -574,11 +639,13 @@ class Controller:
                     break
             except httpx.HTTPError:
                 pass
-            if not running():
+            if not self._running():
                 raise RuntimeError("image server exited while loading the model")
             if time.monotonic() > deadline:
                 raise RuntimeError("image server did not become ready")
         mps = bench_video(url) if p.get("mode") == "vid_gen" else bench_image(url)
+        if self._lapsed(stop):
+            return
         self._proxy = AuthProxy(inner, key)
         self._warm_until_done(p, stop, self._proxy.port, key, dict(kind="image", bench_mps=mps))
 
@@ -586,7 +653,9 @@ class Controller:
         """whisper-server (stt) or Petabyte's Chatterbox server (tts) behind AuthProxy, each lease file
         mounted read-only at /models/<role>; raises like the other paths."""
         targets = [_target(f) for f in p["files"]]
-        paths = {f["role"]: fetch_model(f, lambda: self._lapsed(stop), keep=targets)
+        self._resources = (["--memory", f"{p['reserved_ram_mib']}m", "--cpus", "2"]
+                           if self.shared else [])
+        paths = {f["role"]: self._fetch(f, lambda: self._lapsed(stop), keep=targets)
                  for f in sorted(p["files"], key=lambda f: f["size"])}
         import template_storage
         template_storage.prepare(p["image"], 0, timeout=1800)
@@ -594,13 +663,13 @@ class Controller:
         if self._lapsed(stop):
             return
         self._set(state="starting", model=p["model"])
-        stop_container()
+        self._stop_container()
         inner, key = _free_port(), secrets.token_urlsafe(32)
         stt = p["mode"] == "stt"
         cmd = (("--entrypoint", "/app/build/bin/whisper-server", image, "-m", "/models/model.bin",
                 "--host", "0.0.0.0", "--port", "8080", "--convert", "--tmp-dir", "/tmp") if stt else (image,))
-        r = docker("run", "-d", "--rm", "--pull=never", "--name", NAME, "--label", LABEL,
-                   "--restart=no", "--gpus", "all", "-p", f"127.0.0.1:{inner}:8080",
+        r = docker("run", "-d", "--rm", "--pull=never", "--name", self.name, "--label", LABEL,
+                   "--restart=no", *self.gpu_args, *self._resources, "-p", f"127.0.0.1:{inner}:8080",
                    "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                    "--pids-limit=256", "--user=65534:65534", "-e", "HOME=/tmp",
                    "--tmpfs", "/tmp:rw,noexec,nosuid,size=1024m",       # ffmpeg's WAV of a long upload
@@ -619,20 +688,25 @@ class Controller:
                     break
             except httpx.HTTPError:
                 pass
-            if not running():
+            if not self._running():
                 raise RuntimeError("audio server exited while loading the model")
             if time.monotonic() > deadline:
                 raise RuntimeError("audio server did not become ready")
         speed = bench_stt(url) if stt else bench_tts(url)
+        if self._lapsed(stop):
+            return
         self._proxy = AuthProxy(inner, key)
         self._warm_until_done(p, stop, self._proxy.port, key, dict(kind="audio", bench_mps=speed))
 
     def _warm_until_done(self, p, stop, port, key, extra):
         """Open the tunnel to `port`, report warm, and watch the server until the lease ends."""
+        if self._lapsed(stop):
+            return  # a slow benchmark must not publish a worker that was already stopped
         rp = self.open_tunnel(port)
         if not rp:
             raise RuntimeError("could not open the reverse tunnel to the gateway")
         warm = dict(state="warm", model=p["model"], tunnel_port=rp, gateway=self.gateway, key=key, **extra)
+        self.endpoint = (f"http://127.0.0.1:{port}", key)
         self._set(**warm)
         logging.info("inference worker warm: %s (%s)", p["model"], extra)
         # It works: the official images (and older digests) a petabytecloud image replaces are dead weight.
@@ -640,7 +714,7 @@ class Controller:
         while not stop.wait(3):
                 if self._lapsed(stop):
                     return                                # no renewal: the server stopped leasing
-                if not running():
+                if not self._running():
                     raise RuntimeError("inference server exited")
                 if not self.tunnel_alive():
                     rp = self.open_tunnel(port)
@@ -649,4 +723,6 @@ class Controller:
                     self._set(**{**warm, "tunnel_port": rp})
 
 
-controller = Controller()
+from shared_inference import PoolController  # noqa: E402 — wraps the legacy Controller above
+
+controller = PoolController()

@@ -174,7 +174,9 @@ def chat(messages):
     body = json.dumps({"model": "local", "messages": messages,
                        "temperature": 0.2, "max_tokens": 2048}).encode()
     req = urllib.request.Request(args.llm.rstrip("/") + "/v1/chat/completions", data=body,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          **({"Authorization": "Bearer " + os.environ["PB_MODEL3D_LLM_KEY"]}
+                                             if os.getenv("PB_MODEL3D_LLM_KEY") else {})})
     with urllib.request.urlopen(req, timeout=600) as r:
         return json.load(r)["choices"][0]["message"]
 

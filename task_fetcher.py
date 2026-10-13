@@ -359,7 +359,8 @@ def heartbeat_loop():
                 try:
                     with _pb_vm_lock:
                         _live = any(not v.get("reported") for v in _pb_vm_watch.values())
-                    inference_worker.controller.heartbeat(_infer_ticket, _body.get("inference_worker"),
+                    inference_worker.controller.heartbeat(_infer_ticket,
+                                                          None if _draining() else _body.get("inference_worker"),
                                                           live=_live)
                 except Exception as exc:                 # noqa: BLE001 — never breaks liveness
                     logging.warning("Inference worker paused: %s", exc)
@@ -428,7 +429,8 @@ def heartbeat_loop():
                 try:
                     with _CLAIM_LOCK:
                         _fixes.handle(_body.get("fix"),
-                                      rental_live=_rental_live() or _JOB_RUNNING.is_set())
+                                      rental_live=_rental_live() or _JOB_RUNNING.is_set()
+                                      or bool(inference_worker.controller.children))
                     if _fixes.results() and _FIX_REPORT.acquire(blocking=False):
                         threading.Thread(target=_report_fix_results, daemon=True,
                                          name="pb-fix-report").start()
@@ -734,6 +736,12 @@ def _post_result_ack_retry(payload, attempts: int = 4) -> bool:
         delay = min(delay * 2, 8.0)
     logging.error("terminal result never acknowledged; task may stay 'running' server-side")
     return False
+
+
+def _refuse_pool_job(task_id):
+    report_log(task_id, "GPU job refused: managed pool workers could not be drained")
+    _set_ui(status="idle", task=None, fail=True)
+    return _post_result_ack_retry(_signed_result(task_id, status="failed", failure_cause="gpu_pool_drain_failed"))
 
 
 def report_progress(task_id, percent, message=""):
@@ -1224,6 +1232,8 @@ def _wipe_gpu_vram(tid=None):
     coverage is ~92% of free VRAM, and the real fix is MIG/MPS partitioning. Never raises, never
     blocks a job for more than the timeout."""
     import shutil, subprocess
+    if inference_worker.controller.serving():
+        return False  # never reset or memset a card while managed workers still own live allocations
     if not shutil.which("docker") or not gpu_runtime.has_gpu():
         return False
     _reset = gpu_runtime.gpu_reset_cmd()                 # (1) driver-level reset — cleanest when it works
@@ -1293,7 +1303,7 @@ def _mark_gpu_unusable(why):
     def _recheck():
         while True:
             time.sleep(600)
-            if _rental_live():
+            if _rental_live() or inference_worker.controller.serving():
                 continue                                 # never grab VRAM under a paying buyer
             if not _cuda_wipe_image():
                 _ensure_wipe_image_async()               # image missing -> (re)pull, test next round
@@ -1315,7 +1325,8 @@ def _report_fix_results():
         import diagnostics
         for fid, rc, output in _fixes.results():
             selftest = None
-            if gpu_runtime.has_gpu() and not _rental_live() and _cuda_wipe_image():
+            if (gpu_runtime.has_gpu() and not _rental_live() and not inference_worker.controller.serving()
+                    and _cuda_wipe_image()):
                 selftest = bool(_wipe_gpu_vram())
                 if selftest and _GPU_UNUSABLE.is_set():
                     _GPU_UNUSABLE.clear()
@@ -2466,6 +2477,7 @@ def _open_reverse_tunnel(host_port, tid, prefer=None, gateway=None):
         report_log(tid, "reverse tunnel: this rental's gateway is unknown to this node; not opening it")
         return None
     held = {s.get("rp") for t, s in list(_tun_rentals.items()) if t != tid}
+    held.update(rp for t, (rp, proc) in list(_tunnels.items()) if t != tid and proc.poll() is None)
     ports = [x for x in _tun_port_range() if x not in held]
     if prefer in ports:
         ports.remove(prefer)
@@ -4083,11 +4095,17 @@ def _run_model3d(task):
     tag = _uuid.uuid4().hex[:10]
     net, llm = f"pb3d-{tag}", f"pb3d-llm-{tag}"
     stop = threading.Event()
+    proxy = None
+    shared = bool(task.get("shared_pool_worker"))
     try:
         report_progress(tid, 5, "preparing the 3D model builder")
-        model = inference_worker.fetch_model(task["model"], root=pathlib.Path(MODEL3D_DIR), evict=False)
-        template_storage.prepare(task["llm_image"], tid, timeout=1800)
-        llm_image = template_storage.local(task["llm_image"])
+        endpoint = inference_worker.controller.endpoint_for_3d(task) if shared else None
+        if shared and not endpoint:
+            raise RuntimeError("the shared coder is no longer available; retry the build")
+        if not shared:
+            model = inference_worker.fetch_model(task["model"], root=pathlib.Path(MODEL3D_DIR), evict=False)
+            template_storage.prepare(task["llm_image"], tid, timeout=1800)
+            llm_image = template_storage.local(task["llm_image"])
         template_storage.prepare(task["image"], tid, timeout=1800)
         image = template_storage.local(task["image"])
         base = []
@@ -4100,28 +4118,40 @@ def _run_model3d(task):
         subprocess.run(["docker", "network", "create", "--internal", net], check=True,
                        capture_output=True, timeout=30)
         label = ["--label", f"{TASK_LABEL}={tid}"]
-        r = subprocess.run(
-            ["docker", "run", "-d", "--rm", "--pull=never", "--name", llm, "--network", net,
-             "--network-alias", "llm", *label, *gpu_runtime.docker_gpu_args(),
-             "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=256",
-             "--user=65534:65534", "-e", "HOME=/tmp", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
-             "--log-opt=max-size=1m", "--mount", f"type=bind,src={model},dst=/models/model.gguf,readonly",
-             llm_image, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
-             "-c", "8192", "--fit", "on", "--fit-target", "256"],
-            capture_output=True, text=True, timeout=60)
-        if r.returncode:
-            raise RuntimeError(f"the local LLM did not start: {r.stderr.strip()[:200]}")
+        bridge, llm_url = [], "http://llm:8080"
+        if shared:
+            from shared_inference import Model3DProxy
+            r = subprocess.run(["docker", "network", "inspect", net], capture_output=True, text=True,
+                               check=True, timeout=30)
+            gateway = json.loads(r.stdout)[0]["IPAM"]["Config"][0]["Gateway"]
+            proxy = Model3DProxy(gateway, endpoint,
+                                 active=lambda: inference_worker.controller.endpoint_for_3d(task) == endpoint)
+            bridge = ["--add-host", f"llm:{gateway}", "-e", f"PB_MODEL3D_LLM_KEY={proxy.key}"]
+            llm_url = f"http://llm:{proxy.port}"
+        else:
+            r = subprocess.run(
+                ["docker", "run", "-d", "--rm", "--pull=never", "--name", llm, "--network", net,
+                 "--network-alias", "llm", *label, *gpu_runtime.docker_gpu_args(),
+                 "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=256",
+                 "--user=65534:65534", "-e", "HOME=/tmp", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+                 "--log-opt=max-size=1m", "--mount", f"type=bind,src={model},dst=/models/model.gguf,readonly",
+                 llm_image, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
+                 "-c", "8192", "--fit", "on", "--fit-target", "256"],
+                capture_output=True, text=True, timeout=60)
+            if r.returncode:
+                raise RuntimeError(f"the local LLM did not start: {r.stderr.strip()[:200]}")
         report_progress(tid, 20, "building the model from your prompt")
         threading.Thread(target=_model3d_live_uploader, args=(tid, os.path.join(out, "live", "latest.jpg"), stop),
                          daemon=True, name="pb-model3d-live").start()
         driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model3d_driver.py")
-        cmd = ["docker", "run", "--rm", "--network", net, *_isolation_flags(task),
+        limits = {**task, "cpus": 2, "memory": "2g"} if shared else task
+        cmd = ["docker", "run", "--rm", "--network", net, *bridge, *_isolation_flags(limits),
                "-v", f"{driver}:/driver.py:ro", *base, "-v", f"{out}:/out",
                "--entrypoint", "blender", image, "-b", *(["/base.blend"] if base else []),
                # Without this Blender exits 0 when the script raises, and the crash read as "no commit".
                "--python-exit-code", "1",
                "--python", "/driver.py", "--", "--prompt", str(task.get("prompt", ""))[:2000],
-               "--out", "/out", "--llm", "http://llm:8080", *([] if base else ["--fresh"])]
+                "--out", "/out", "--llm", llm_url, *([] if base else ["--fresh"])]
         _rt = task.get("max_runtime_s")
         try:
             res = _run_docker(cmd, timeout=(int(_rt) if _rt else None), capture_output=True, text=True)
@@ -4166,7 +4196,10 @@ def _run_model3d(task):
         _set_ui(status="idle", task=None, fail=True)
     finally:
         stop.set()
-        subprocess.run(["docker", "rm", "-f", llm], capture_output=True, timeout=30, check=False)
+        if proxy:
+            proxy.close()
+        if not shared:
+            subprocess.run(["docker", "rm", "-f", llm], capture_output=True, timeout=30, check=False)
         subprocess.run(["docker", "network", "rm", net], capture_output=True, timeout=30, check=False)
         shutil.rmtree(work, ignore_errors=True)
 
@@ -4836,7 +4869,9 @@ def job_loop():
                     if _con:
                         _con.line("skip", f"outside selling hours — declined #{task.get('task_id')}")
                     continue
-                inference_worker.controller.before_work()   # a rental always gets the GPU first
+                if inference_worker.controller.before_work(task) is False:
+                    _refuse_pool_job(task["task_id"])
+                    continue
                 if (task.get("compute_mode", "STANDARD") == "CONFIDENTIAL"
                         or task.get("attestation_required") or task.get("required_gpu_confidential")
                         or task.get("required_cpu_tee")):
@@ -5012,11 +5047,11 @@ def run_agent():
     _remove_legacy_miner()
     # The inference worker publishes through this node's own reverse tunnel (default gateway).
     inference_worker.controller.attach(
-        open_tunnel=lambda port: _open_reverse_tunnel(port, "inference"),
-        close_tunnel=lambda: _kill_reverse_tunnel("inference"),
-        tunnel_alive=lambda: bool(_tunnels.get("inference")) and _tunnels["inference"][1].poll() is None)
+        open_tunnel=lambda port, worker="inference": _open_reverse_tunnel(port, worker),
+        close_tunnel=lambda worker="inference": _kill_reverse_tunnel(worker),
+        tunnel_alive=lambda worker="inference": bool(_tunnels.get(worker)) and _tunnels[worker][1].poll() is None)
     try:
-        inference_worker.stop_container()        # a server left behind by a previous agent run
+        inference_worker.stop_all_containers()  # legacy and shared servers left behind by a previous run
     except Exception:                            # noqa: BLE001 — never block startup
         pass
     _restore_vm_watch()  # recover detached rentals before the first heartbeat offers this node
