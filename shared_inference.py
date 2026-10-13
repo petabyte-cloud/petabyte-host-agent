@@ -23,8 +23,8 @@ CODER_MODEL = "qwen2.5-coder-7b-instruct"
 
 
 def supported():
-    """Opt-in native Linux pilot. WSL and non-NVIDIA nodes keep the proven legacy worker."""
-    if os.getenv("PETABYTE_SHARED_POOL", "false").lower() != "true" or sys.platform != "linux":
+    """Default-on for native Linux NVIDIA. Explicit false, WSL and other GPUs keep legacy serving."""
+    if os.getenv("PETABYTE_SHARED_POOL", "true").lower() != "true" or sys.platform != "linux":
         return False
     try:
         if "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower():
