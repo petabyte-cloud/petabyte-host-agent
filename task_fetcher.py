@@ -4562,7 +4562,8 @@ _MINER_RE = re.compile(
     r"(?i)(?:^|[/\s])(?:wildrig\S*|xmrig\S*|srbminer\S*|t-?rex|teamredminer|lolminer|nbminer|bzminer|rigel"
     r"|nanominer|phoenixminer|cryptodredge|bminer|tt-?miner|tbminer|ccminer|sgminer|ethminer|minerd"
     r"|cpuminer\S*|urx-isotope-cpuminer\S*|cgminer|bfgminer|excavator|xmr-stak\S*|miniz|verthashminer"
-    r"|gminer|onezerominer|kawpowminer|z-enemy|nheqminer|peakminer\S*)(?:\.exe)?(?:\s|$)|stratum\d?\+(?:tcp|ssl|tls)://")
+    r"|gminer|onezerominer|kawpowminer|z-enemy|nheqminer|peakminer\S*"
+    r"|[\w.]*[-_]miner)(?:\.exe)?(?:\s|$)|stratum\d?\+(?:tcp|ssl|tls)://")   # <x>-miner: pearl-miner, 2026-10-14
 _MINER_CHECK_S = 60
 
 
