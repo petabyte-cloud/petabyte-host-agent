@@ -54,6 +54,7 @@ it runs inside Blender and I send back the result and the scene. Use ONLY these 
   sphere(name, radius, location, color)
   torus(name, major_radius, minor_radius, location, color, rotation)
   remove(name)
+math and random are already imported. Calling a helper again with an existing name replaces that part.
 An object of height h standing on something whose top is at z sits at location z + h/2.
 Example, a table 1.2 x 0.8 m, 0.75 m tall, with a mug on it:
 ```python
@@ -83,6 +84,11 @@ def _mat(color, name=None):
 
 
 def _finish(obj, name, color, rotation):
+    # Same name = the same part: replace it, so re-sending a whole corrected block (what the model
+    # is told to do after an error) rebuilds the scene instead of duplicating every part as .001.
+    old = bpy.data.objects.get(name)
+    if old is not None and old is not obj:
+        bpy.data.objects.remove(old, do_unlink=True)
     obj.name = name
     obj.rotation_euler = [math.radians(a) for a in rotation]
     if color is not None:
@@ -160,8 +166,10 @@ def run_code(code):
     import bmesh
     ns = NS
     if not ns:
-        ns.update(bpy=bpy, bmesh=bmesh, mathutils=mathutils, math=math, Vector=mathutils.Vector, box=box,
-                  cylinder=cylinder, cone=cone, sphere=sphere, torus=torus, remove=remove)
+        import random
+        # `random` preloaded: Qwen scatters rocks/trees with it and forgets the import (commit #41).
+        ns.update(bpy=bpy, bmesh=bmesh, mathutils=mathutils, math=math, random=random, Vector=mathutils.Vector,
+                  box=box, cylinder=cylinder, cone=cone, sphere=sphere, torus=torus, remove=remove)
     try:
         with contextlib.redirect_stdout(buf):
             exec(compile(code, "<llm>", "exec"), ns)
@@ -268,6 +276,9 @@ FENCE = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.S)
 # is stripped before the code runs, and ends the build once that step's code has run cleanly.
 DONE_LINE = re.compile(r"^[ \t]*DONE\.?[ \t]*$", re.M)
 last_err = ""
+RERUN_HINT = ("\nThat block stopped at the error: nothing after that line ran, so any variable it would have set "
+              "later (loop counters like i, lists, positions) does not exist. Send the WHOLE corrected block "
+              "again, not just the fix; parts with the same name are replaced, not duplicated.")
 try:
     for step in range(args.max_steps):
         # The system prompt, the request and only the LATEST exchange: the whole history (every code
@@ -294,7 +305,10 @@ try:
                 last_err = (res.strip().splitlines() or [""])[-1][:300]
             log.append({"step": step, "tool": "execute_blender_code", "ok": ok, "result": res[:300]})
             print("PBSTEP", step, "code", "ok" if ok else "ERR", res[:300].replace("\n", " | "), flush=True)
-            results.append(("OK: " if ok else "ERROR: ") + res[:800])
+            # Commit #41: after a NameError the model sent only a "fix" fragment that used a loop variable
+            # from the failed block, which never ran -> NameError on every step. Say so, and ask for the
+            # whole block again (same names replace the parts that did get built).
+            results.append("OK: " + res[:800] if ok else "ERROR: " + res[:800] + RERUN_HINT)
         if finished:
             summary = "DONE"
             print("PBSTEP", step, "done: DONE", flush=True)

@@ -3032,7 +3032,16 @@ def _run_template(task):
                     timeout=params.get("max_startup_seconds", 900))
             report_log(tid, "Docker image " + outcome + "; model/work files are private to this rental")
             cmd += _template_env_flags(task, _template_env)
+            # A custom image given a command (template_params.keepalive): that command replaces the
+            # image's CMD, as with `docker run <image> <cmd>`. Hold the container open with a plain
+            # shell loop; the command itself runs as the startup script (docker exec, same user/caps).
+            _hold = (task.get("template") == "custom" and params.get("keepalive") is True
+                     and bool(params.get("startup_script")))
+            if _hold:
+                cmd += ["--entrypoint", "sh"]
             cmd += [template_storage.local(image)]        # a mirror pull runs by its mirror ref
+            if _hold:
+                cmd += ["-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done"]
             # a model delivered as a CLI arg (vllm --model, TGI --model-id, llama.cpp -hf)
             if task.get("model_arg") and model:
                 cmd += [task["model_arg"], model]

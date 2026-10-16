@@ -478,6 +478,9 @@ def report(gateway=""):
         import shared_inference
         if shared_inference.supported():
             result["shared_pool_version"] = 1
+        mig = mig_mode()
+        if mig:
+            result["mig_mode"] = mig        # capability report only; the agent never changes MIG mode
         import egress_vpn
         try:
             result["native_udp_ready"] = bool(egress_vpn.enabled() and egress_vpn.ensure_tunnel()
@@ -495,6 +498,20 @@ def report(gateway=""):
         return result
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
+
+
+def mig_mode():
+    """'enabled' / 'disabled' when an NVIDIA GPU here supports MIG hardware partitioning (A100, A30,
+    H100, ...), None when none does (GeForce, older cards) or nvidia-smi is absent. Read-only query:
+    it reports what the hardware can enforce so the marketplace never advertises a partition it
+    cannot isolate."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=mig.mode.current", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    modes = {line.strip().lower() for line in out.splitlines()}
+    return "enabled" if "enabled" in modes else "disabled" if "disabled" in modes else None
 
 
 _SNAPSHOT = (0, None)
