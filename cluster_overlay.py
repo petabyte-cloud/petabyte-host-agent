@@ -23,15 +23,28 @@ any buyer code may use it):
   * The workload runs with --cap-drop ALL, so it cannot change pbwg0's peers, addresses or routes.
   * Teardown deletes the namespace (named netns) or removes the container; the device dies with it.
 
+NAT traversal: sellers sit behind home routers, so the port a peer must send to is the router's
+public mapping of the rank's WireGuard port, not the local one. create() keeps that local port
+bound and asks two STUN servers what it maps to (STUN = RFC 5389 binding request, stdlib only).
+The rank registers the MAPPED port. A router that maps differently per destination (symmetric
+NAT) cannot be traversed this way and is refused up front. While the rank waits for the cluster,
+keepalive() re-asks every STUN_REFRESH_S seconds so the mapping stays open; attach() releases the
+socket immediately before WireGuard binds the same port, and both sides then send to each
+other's mapping, which opens each router's filter (simultaneous open; WireGuard retries every 5 s).
+
 Linux + root + iproute2 + wireguard-tools + nsenter. probe() says up front when they are missing.
 """
 import base64
 import ipaddress
 import json
 import os
+import secrets
 import shutil
+import socket
+import struct
 import subprocess
 import sys
+import time
 
 SUBNET = ipaddress.ip_network("10.77.0.0/24")   # exists only inside each rank's own namespace
 IFACE = "pbwg0"
@@ -42,10 +55,97 @@ IFACE = "pbwg0"
 FALLBACK_TUNNELS = {"tunl0": "ipip", "sit0": "sit", "ip6tnl0": "ip6tnl", "ip6gre0": "ip6gre", "gre0": "gre",
                     "gretap0": "gretap", "erspan0": "erspan", "ip_vti0": "vti", "ip6_vti0": "vti6"}
 KEEPALIVE = 25                                  # keeps NAT mappings open between home routers
+STUN_REFRESH_S = 15                             # well inside the common 30 s UDP mapping timeout
 
 
 class OverlayError(RuntimeError):
     pass
+
+
+_STUN_COOKIE = 0x2112A442
+
+
+def stun_servers():
+    """host:port list; read at call time so an operator (or a test) can point it elsewhere."""
+    raw = os.getenv("DIST_STUN_SERVERS", "stun.cloudflare.com:3478,stun.l.google.com:19302")
+    out = []
+    for item in raw.split(","):
+        host, _, port = item.strip().rpartition(":")
+        if host and port.isdigit():
+            out.append((host, int(port)))
+    return out
+
+
+def stun_parse(data, txid):
+    """(ip, port) from a STUN binding success response, or None. Pure."""
+    if len(data) < 20:
+        return None
+    mtype, mlen, cookie = struct.unpack(">HHI", data[:8])
+    if mtype != 0x0101 or cookie != _STUN_COOKIE or data[8:20] != txid:
+        return None
+    i, end, plain = 20, min(len(data), 20 + mlen), None
+    while i + 4 <= end:
+        atype, alen = struct.unpack(">HH", data[i:i + 4])
+        val = data[i + 4:i + 4 + alen]
+        if atype in (0x0020, 0x0001) and len(val) >= 8 and val[1] == 0x01:   # (XOR-)MAPPED-ADDRESS, IPv4
+            port = struct.unpack(">H", val[2:4])[0]
+            addr = val[4:8]
+            if atype == 0x0020:      # preferred: a router ALG cannot rewrite the XOR'd form
+                port ^= _STUN_COOKIE >> 16
+                addr = bytes(a ^ b for a, b in zip(addr, struct.pack(">I", _STUN_COOKIE)))
+                return socket.inet_ntoa(addr), port
+            plain = plain or (socket.inet_ntoa(addr), port)
+        i += 4 + alen + (-alen % 4)
+    return plain
+
+
+def stun_mapped(sock, server, timeout=2.0):
+    """Ask one STUN server what this socket's address looks like from outside. -> (ip, port)|None"""
+    txid = secrets.token_bytes(12)
+    try:
+        addr = socket.getaddrinfo(server[0], server[1], socket.AF_INET, socket.SOCK_DGRAM)[0][4]
+    except OSError:
+        return None
+    for _ in range(2):                                   # one retransmit: a single lost datagram
+        try:                                             # must not read as "no answer"
+            sock.sendto(struct.pack(">HHI", 0x0001, 0, _STUN_COOKIE) + txid, addr)
+        except OSError:
+            return None
+        deadline = time.monotonic() + timeout
+        while (left := deadline - time.monotonic()) > 0:
+            sock.settimeout(left)
+            try:
+                data, _src = sock.recvfrom(2048)
+            except socket.timeout:
+                break
+            except OSError:
+                return None
+            got = stun_parse(data, txid)
+            if got:
+                return got
+    return None
+
+
+def discover_mapping(sock):
+    """The public port this socket's traffic leaves with, from up to two STUN servers.
+
+    None when no server answered (no NAT information: the local port is used, as before).
+    OverlayError when two servers see different ports: the router allocates a new port per
+    destination (symmetric NAT), so the peers' packets could never reach this rank."""
+    seen = []
+    for server in stun_servers():
+        got = stun_mapped(sock, server)
+        if got:
+            seen.append(got)
+        if len(seen) == 2:
+            break
+    if not seen:
+        return None
+    if len({port for _ip, port in seen}) > 1:
+        raise OverlayError("this host's NAT gives every destination a different port (symmetric NAT); "
+                           "forward one UDP port to this machine, set DIST_WG_PORT to it and set "
+                           "DIST_STUN_SERVERS empty so the forwarded port is advertised")
+    return seen[0][1]
 
 
 def overlay_ip(rank) -> str:
@@ -146,6 +246,16 @@ def check_namespace(links, addrs, routes4, routes6, allowed_ips, rank, peers) ->
     return bad
 
 
+def unconnected(latest_handshakes, peers) -> list:
+    """Pure: the peers (by rank) with no completed WireGuard handshake yet, given
+    `wg show pbwg0 latest-handshakes` ("<pubkey>\t<unix time, 0 = never>" per line)."""
+    seen = {}
+    for line in (latest_handshakes or "").splitlines():
+        key, _, ts = line.partition("\t")
+        seen[key.strip()] = ts.strip()
+    return [p["rank"] for p in peers if seen.get(p["public_key"], "0") in ("", "0")]
+
+
 def probe():
     """(ok, reason): can this host build the overlay at all? Creates nothing."""
     if sys.platform != "linux" or os.geteuid() != 0:
@@ -175,23 +285,44 @@ class RankOverlay:
         self.netns = None
         self.exec = None
         self._tid = tid
+        self._hold = None          # the WireGuard port, held open for STUN until attach()
+        self._last_stun = 0.0
 
     def create(self, port=0):
-        """Create the device in the HOST namespace (its UDP socket stays there). -> (pubkey, port)
+        """Create the device in the HOST namespace (its UDP socket stays there).
+        -> (pubkey, public_port): the port peers must send to (the NAT mapping when there is one).
 
-        WireGuard only binds its port when the device goes up (after the move), so a 0 port
-        is chosen here rather than by the kernel; attach() confirms the kernel bound exactly it."""
-        if not int(port):
-            import socket
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.bind(("0.0.0.0", 0))
-                port = s.getsockname()[1]
-        self.port = int(port)
+        WireGuard only binds its port when the device goes up (after the move), so the port is
+        chosen and held here; attach() confirms the kernel bound exactly it."""
+        hold = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            hold.bind(("0.0.0.0", int(port)))
+        except OSError:
+            hold.close()
+            raise OverlayError("cluster overlay: the WireGuard port is already in use") from None
+        self._hold, self.port = hold, hold.getsockname()[1]
+        self.public_port = discover_mapping(hold) or self.port
+        self._last_stun = time.monotonic()
         _run(["ip", "link", "add", self.dev, "type", "wireguard"])
         priv = _run(["wg", "genkey"]).strip()
         pub = _run(["wg", "pubkey"], stdin=priv).strip()
         _run(["wg", "set", self.dev, "private-key", "/dev/stdin", "listen-port", str(self.port)], stdin=priv)
-        return pub, self.port
+        return pub, self.public_port
+
+    def keepalive(self):
+        """While waiting for the other ranks: keep the NAT mapping open, and refuse if it moved."""
+        if self._hold is None or time.monotonic() - self._last_stun < STUN_REFRESH_S:
+            return
+        self._last_stun = time.monotonic()
+        server = (stun_servers() or [None])[0]
+        got = stun_mapped(self._hold, server) if server else None
+        if got and got[1] != self.public_port:
+            raise OverlayError("this host's NAT mapping changed while the cluster formed")
+
+    def _release(self):
+        if self._hold is not None:
+            self._hold.close()
+            self._hold = None
 
     def set_peers(self, peers):
         for p in peers:
@@ -212,6 +343,7 @@ class RankOverlay:
         _run(x + ["ip", "link", "set", self.dev, "name", IFACE])
         _run(x + ["ip", "addr", "add", f"{overlay_ip(rank)}/{SUBNET.prefixlen}", "dev", IFACE])
         _run(x + ["ip", "link", "set", "lo", "up"])
+        self._release()                # WireGuard binds this port on up; the NAT mapping carries over
         _run(x + ["ip", "link", "set", IFACE, "up"])
         if _run(x + ["wg", "show", IFACE, "listen-port"]).strip() != str(self.port):
             raise OverlayError("cluster overlay: the registered WireGuard port is not the bound one")
@@ -224,6 +356,23 @@ class RankOverlay:
                                j("-6", "route", "show", "table", "all"),
                                _run(x + ["wg", "show", IFACE, "allowed-ips"]), rank, peers)
 
+    def wait_connected(self, peers, timeout=None):
+        """Every peer must complete a WireGuard handshake (persistent keepalive starts one the moment
+        pbwg0 is up) within `timeout`, else the rank refuses with a clear cause -- instead of the
+        workload waiting out NCCL/rendezvous timeouts against a mesh that never formed."""
+        timeout = float(timeout if timeout is not None else os.getenv("DIST_CONNECT_TIMEOUT", "120"))
+        deadline = time.monotonic() + timeout
+        while True:
+            missing = unconnected(_run(self.exec + ["wg", "show", IFACE, "latest-handshakes"]), peers)
+            if not missing:
+                return
+            if time.monotonic() >= deadline:
+                raise OverlayError(
+                    f"could not reach rank(s) {missing} over the overlay within {int(timeout)}s: a NAT or "
+                    "firewall blocks UDP between the machines (behind a symmetric NAT, forward a UDP port, "
+                    "set DIST_WG_PORT to it and DIST_STUN_SERVERS empty)")
+            time.sleep(1)
+
     def verify(self, rank, peers):
         bad = self.problems(rank, peers)
         if bad:
@@ -231,6 +380,7 @@ class RankOverlay:
 
     def teardown(self):
         """Best effort and idempotent. A moved device dies with its namespace."""
+        self._release()
         for args in (["ip", "link", "del", self.dev],
                      ["ip", "netns", "del", self.netns] if self.netns else None):
             if args:

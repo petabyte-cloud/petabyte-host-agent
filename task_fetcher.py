@@ -4524,8 +4524,9 @@ def _run_stitch(task):
         shutil.rmtree(outer, ignore_errors=True)
 
 
-def _wait_for_cluster(dist, tid, world):
-    """Poll the rendezvous until EVERY rank has registered its overlay identity (or fail)."""
+def _wait_for_cluster(dist, tid, world, tick=lambda: None):
+    """Poll the rendezvous until EVERY rank has registered its overlay identity (or fail).
+    `tick` runs every poll (the overlay keeps its NAT mapping open)."""
     url = dist.get("rendezvous_url") or f"/jobs/rendezvous/{dist.get('job_id')}"
     deadline = time.monotonic() + int(os.getenv("DIST_RENDEZVOUS_TIMEOUT", "2400"))
     while True:
@@ -4540,6 +4541,7 @@ def _wait_for_cluster(dist, tid, world):
             return info
         if time.monotonic() >= deadline:
             raise TimeoutError("not every rank joined the cluster in time")
+        tick()
         time.sleep(2)
 
 
@@ -4601,12 +4603,14 @@ def _run_distributed(task):
                 why = r.status_code
             raise _ov.OverlayError(f"rendezvous refused: {why}")
         report_progress(tid, 15, f"rank {rank}/{world} registered; waiting for every rank")
-        peers = _ov.parse_peers(_wait_for_cluster(dist, tid, world).get("peers"), rank, world)
+        peers = _ov.parse_peers(_wait_for_cluster(dist, tid, world, ov.keepalive).get("peers"), rank, world)
         ov.set_peers(peers)
         if selftest:
             ov.attach(rank)
             ov.verify(rank, peers)
             report_progress(tid, 30, f"overlay verified: {world - 1} peers and nothing else reachable")
+            ov.wait_connected(peers)
+            report_progress(tid, 40, f"connected to all {world - 1} peers")
             limit = int(os.getenv("DIST_SELFTEST_TIMEOUT", "180"))
             dim = int(os.getenv("DIST_SELFTEST_DIM", "8"))
             p = subprocess.run(ov.exec + [  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args -- fixed agent argv (no shell); every value is an int or the server-derived overlay address
@@ -4638,6 +4642,8 @@ def _run_distributed(task):
                         ov.attach(rank, pid=pid)
                         ov.verify(rank, peers)
                         report_progress(tid, 30, f"overlay verified: {world - 1} peers and nothing else reachable")
+                        ov.wait_connected(peers)        # no mesh: remove the container now, not at the budget
+                        report_progress(tid, 40, f"connected to all {world - 1} peers")
                         return None
                     time.sleep(0.2)
                 # Exited before the overlay was in: it never joined the cluster, whatever its exit code.

@@ -97,8 +97,48 @@ def _finish(obj, name, color, rotation):
     return obj
 
 
+# Commit #43: the model passed a tuple where cylinder() takes one number, Blender answered "Converting
+# py args to operator properties" from inside the driver, and the model repeated the same call 4 times.
+# Every argument is checked here and a wrong one names the argument and the right call.
+SIG = {"box": "box(name, size=(x, y, z), location=(x, y, z), color=(r, g, b), rotation=(rx, ry, rz))",
+       "cylinder": "cylinder(name, radius, height, location=(x, y, z), color=(r, g, b), rotation=(rx, ry, rz))",
+       "cone": "cone(name, radius_bottom, radius_top, height, location=(x, y, z), color=(r, g, b), rotation=(rx, ry, rz))",
+       "sphere": "sphere(name, radius, location=(x, y, z), color=(r, g, b))",
+       "torus": "torus(name, major_radius, minor_radius, location=(x, y, z), color=(r, g, b), rotation=(rx, ry, rz))"}
+
+
+def _num(v, fn, arg):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise TypeError(f"{fn}(): {arg} must be ONE number in meters, got {v!r}. Call it as {SIG[fn]}")
+    return float(v)
+
+
+def _vec(v, fn, arg):
+    try:
+        t = tuple(float(x) for x in v)
+    except (TypeError, ValueError):
+        t = ()
+    if len(t) != 3:
+        raise TypeError(f"{fn}(): {arg} must be 3 numbers like (x, y, z), got {v!r}. Call it as {SIG[fn]}")
+    return t
+
+
+def _color(v, fn):
+    if v is None:
+        return None
+    try:
+        t = tuple(float(x) for x in v)
+    except (TypeError, ValueError):
+        t = ()
+    if len(t) not in (3, 4):
+        raise TypeError(f"{fn}(): color must be (r, g, b) numbers 0..1, got {v!r}. Call it as {SIG[fn]}")
+    return tuple(c / 255 for c in t) if max(t) > 1 else t      # 0..255 colours are common: accept them
+
+
 def box(name, size, location, color=(0.8, 0.8, 0.8), rotation=(0, 0, 0)):
-    """size=(x, y, z) full dimensions in meters; location = center."""
+    """size=(x, y, z) full dimensions in meters (one number = a cube); location = center."""
+    size = (_num(size, "box", "size"),) * 3 if isinstance(size, (int, float)) else _vec(size, "box", "size")
+    location, rotation, color = _vec(location, "box", "location"), _vec(rotation, "box", "rotation"), _color(color, "box")
     bpy.ops.mesh.primitive_cube_add(size=1, location=location)
     o = bpy.context.object
     o.scale = size
@@ -107,23 +147,32 @@ def box(name, size, location, color=(0.8, 0.8, 0.8), rotation=(0, 0, 0)):
 
 def cylinder(name, radius, height, location, color=(0.8, 0.8, 0.8), rotation=(0, 0, 0), vertices=32):
     """Upright along Z; location = center."""
-    bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=height, location=location, vertices=vertices)
-    return _finish(bpy.context.object, name, color, rotation)
+    radius, height = _num(radius, "cylinder", "radius"), _num(height, "cylinder", "height")
+    location, rotation = _vec(location, "cylinder", "location"), _vec(rotation, "cylinder", "rotation")
+    bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=height, location=location, vertices=int(vertices))
+    return _finish(bpy.context.object, name, _color(color, "cylinder"), rotation)
 
 
 def cone(name, radius_bottom, radius_top, height, location, color=(0.8, 0.8, 0.8), rotation=(0, 0, 0), vertices=32):
-    bpy.ops.mesh.primitive_cone_add(radius1=radius_bottom, radius2=radius_top, depth=height, location=location, vertices=vertices)
-    return _finish(bpy.context.object, name, color, rotation)
+    r1, r2 = _num(radius_bottom, "cone", "radius_bottom"), _num(radius_top, "cone", "radius_top")
+    height, location = _num(height, "cone", "height"), _vec(location, "cone", "location")
+    rotation = _vec(rotation, "cone", "rotation")
+    bpy.ops.mesh.primitive_cone_add(radius1=r1, radius2=r2, depth=height, location=location, vertices=int(vertices))
+    return _finish(bpy.context.object, name, _color(color, "cone"), rotation)
 
 
 def sphere(name, radius, location, color=(0.8, 0.8, 0.8), segments=32):
+    radius, location = _num(radius, "sphere", "radius"), _vec(location, "sphere", "location")
+    segments = int(segments)
     bpy.ops.mesh.primitive_uv_sphere_add(radius=radius, location=location, segments=segments, ring_count=segments // 2)
-    return _finish(bpy.context.object, name, color, (0, 0, 0))
+    return _finish(bpy.context.object, name, _color(color, "sphere"), (0, 0, 0))
 
 
 def torus(name, major_radius, minor_radius, location, color=(0.8, 0.8, 0.8), rotation=(0, 0, 0)):
-    bpy.ops.mesh.primitive_torus_add(major_radius=major_radius, minor_radius=minor_radius, location=location)
-    return _finish(bpy.context.object, name, color, rotation)
+    major, minor = _num(major_radius, "torus", "major_radius"), _num(minor_radius, "torus", "minor_radius")
+    location, rotation = _vec(location, "torus", "location"), _vec(rotation, "torus", "rotation")
+    bpy.ops.mesh.primitive_torus_add(major_radius=major, minor_radius=minor, location=location)
+    return _finish(bpy.context.object, name, _color(color, "torus"), rotation)
 
 
 def remove(name):
@@ -174,8 +223,13 @@ def run_code(code):
         with contextlib.redirect_stdout(buf):
             exec(compile(code, "<llm>", "exec"), ns)
         return True, (buf.getvalue()[-2000:] or "ok")
-    except Exception:
-        return False, (buf.getvalue()[-500:] + traceback.format_exc(limit=3))[-2000:]
+    except Exception as e:
+        # Only the model's own line + the error, on one line: a traceback through driver internals
+        # (and Blender's multi-line operator errors) told it nothing it could act on (commit #43).
+        frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == "<llm>"]
+        line = frames[-1].lineno if frames else getattr(e, "lineno", None)
+        msg = " ".join(f"{type(e).__name__}: {e}".split())
+        return False, (buf.getvalue()[-500:] + (f"line {line} of your code: " if line else "") + msg)[-2000:]
 
 
 def chat(messages):
@@ -303,7 +357,8 @@ try:
             else:
                 finished = False                 # let the model fix it first
                 last_err = (res.strip().splitlines() or [""])[-1][:300]
-            log.append({"step": step, "tool": "execute_blender_code", "ok": ok, "result": res[:300]})
+            log.append({"step": step, "tool": "execute_blender_code", "ok": ok, "result": res[:300],
+                        **({} if ok else {"code": code[:1500]})})   # a failed block is otherwise lost
             print("PBSTEP", step, "code", "ok" if ok else "ERR", res[:300].replace("\n", " | "), flush=True)
             # Commit #41: after a NameError the model sent only a "fix" fragment that used a loop variable
             # from the failed block, which never ran -> NameError on every step. Say so, and ask for the
