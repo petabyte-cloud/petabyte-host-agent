@@ -3574,8 +3574,11 @@ def _run_container(task, attach=None):
             done.set()
             watcher.join(timeout=60)
             if any(refusal):
-                report_log(tid, next(r for r in refusal if r))
-                _post("/jobs/result", _signed_result(tid, status="failed", failure_cause="network_policy"))
+                import cluster_overlay
+                why = next(r for r in refusal if r)
+                report_log(tid, why)
+                _post("/jobs/result", _signed_result(tid, status="failed", result=cluster_overlay.public_reason(why),
+                                                     failure_cause="network_policy"))
                 _set_ui(status="idle", task=None, fail=True)
                 return
         _ef = task.pop("_env_file", None)        # docker consumed it at launch; remove the 0600 secret file
@@ -4567,8 +4570,9 @@ def _run_distributed(task):
     master, mport = _ov.overlay_ip(0), _dist.DEFAULT_RENDEZVOUS_PORT
 
     def fail(msg, cause="network_policy"):
-        report_log(tid, msg)
-        _post("/jobs/result", _signed_result(tid, status="failed", failure_cause=cause))
+        report_log(tid, msg)                             # full text: the seller's/admin's log
+        _post("/jobs/result", _signed_result(tid, status="failed", result=_ov.public_reason(msg),
+                                             failure_cause=cause))   # scrubbed: the buyer's status
         _set_ui(status="idle", task=None, fail=True)
 
     ready, why = _ov.probe()

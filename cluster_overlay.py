@@ -38,6 +38,7 @@ import base64
 import ipaddress
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -244,6 +245,30 @@ def check_namespace(links, addrs, routes4, routes6, allowed_ips, rank, peers) ->
     if got_peers != want_peers:
         bad.append("wireguard peer set differs from this job's ranks")
     return bad
+
+
+_V4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b")
+_V6 = re.compile(r"\[?(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?:%\w+)?\]?(?::\d{1,5})?")
+_PORTS = re.compile(r"(?i)\b((?:udp |tcp )?(?:listen-)?ports?\s*[:=#]?\s*)"
+                     r"(\d{1,5}(?:\s*(?:,|/|-|\bto\b|\band\b|\bor\b)\s*\d{1,5})*)\b")
+
+
+def _v6(m):
+    core = m.group(0).lstrip("[").split("]")[0].split("%")[0]
+    try:
+        ipaddress.IPv6Address(core)           # only a real IPv6 address: "HTTP:500" / "12:34:56" stay
+        return "<address>"
+    except ValueError:
+        return m.group(0)
+
+
+def public_reason(text, limit=300) -> str:
+    """A rank's failure reason as the BUYER may see it: every IPv4 address, every
+    real IPv6 address (with any :port) and every number of a stated port list is replaced,
+    so no seller, peer or LAN endpoint leaves the agent; the text is capped."""
+    flat = _V6.sub(_v6, _V4.sub("<address>", " ".join(str(text or "").split())))
+    flat = _PORTS.sub(lambda m: m.group(1) + re.sub(r"\d+", "<port>", m.group(2)), flat)
+    return flat[:limit]
 
 
 def unconnected(latest_handshakes, peers) -> list:
