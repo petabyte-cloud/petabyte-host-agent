@@ -469,6 +469,7 @@ def report(gateway=""):
                       "image_pool_version": 1,            # inference_worker serves image leases (sd-server)
                       "image_checkpoint_version": 1,      # ...and complete SDXL checkpoints with embedded CLIP/VAE
                       "video_pool_version": 1,            # ...and video leases (Wan 2.2: t5xxl, vid_gen)
+                      "video_llm_version": 1,             # ...with an llm encoder too (HunyuanVideo 1.5)
                       "audio_pool_version": 1,            # ...and audio leases (whisper-server, Chatterbox TTS)
                       "pool_images_version": 1,           # ...and Petabyte's slim pool images (deploy/pool-images)
                       "llm_args_version": 1,              # ...and passes a chat lease's allowlisted flags

@@ -9,7 +9,8 @@ server on 127.0.0.1 with a fresh random API key, open our reverse tunnel to the 
 An image lease ("kind": "image", Petabyte Create) runs stable-diffusion.cpp's sd-server the same way,
 with its three pinned files (diffusion model, text encoder, VAE). sd-server has no API key, so it is
 reached only through a localhost proxy that checks the session key and passes the generation paths.
-A video lease ("mode": "vid_gen", Wan 2.2) is an image lease whose text encoder is UMT5 ("t5xxl").
+A video lease ("mode": "vid_gen") is an image lease whose text encoder is UMT5 ("t5xxl", Wan 2.2), or
+Qwen2.5-VL ("llm") plus ByT5 ("t5xxl") for HunyuanVideo 1.5.
 
 Nothing the server sends can make this run something else: the image must be the official llama.cpp
 (or stable-diffusion.cpp) repository pinned by digest, the weights must come from huggingface.co and
@@ -55,7 +56,8 @@ HF_SOURCES = ("https://huggingface.co", "https://registry.petabyte.market/hf", "
 _SD_IMAGE_RE = re.compile(r"^(ghcr\.io/leejet/stable-diffusion\.cpp|docker\.io/petabytecloud/pool-sd)@sha256:[0-9a-f]{64}$")
 _FILE_URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.(gguf|safetensors)$")
 _ROLES = ("diffusion", "llm", "vae")
-_VIDEO_ROLES = ("diffusion", "t5xxl", "vae")          # Wan: UMT5 text encoder (sd-server --t5xxl)
+_VIDEO_ROLES = (("diffusion", "t5xxl", "vae"),        # Wan: UMT5 text encoder (sd-server --t5xxl)
+                ("diffusion", "llm", "t5xxl", "vae")) # HunyuanVideo 1.5: Qwen2.5-VL --llm + ByT5 --t5xxl
 _CHECKPOINT_ROLES = ("checkpoint",)                 # complete SDXL: embedded CLIP encoders and VAE
 # sd-server flags a lease may set: tuning only, never a path, a port or something to serve.
 _SD_FLAGS = {"--cfg-scale", "--sampling-method", "--scheduler", "--flow-shift", "--steps", "--clip-skip"}
@@ -130,7 +132,9 @@ def _valid_args(args, flags=_SD_FLAGS, switches=_SD_SWITCHES):
 def _valid_image(p):
     files = p.get("files")
     checkpoint = p.get("architecture") == "sdxl"
-    roles = _CHECKPOINT_ROLES if checkpoint else (_VIDEO_ROLES if p.get("mode") == "vid_gen" else _ROLES)
+    n = len(files) if isinstance(files, list) else 0
+    roles = (_CHECKPOINT_ROLES if checkpoint else _ROLES if p.get("mode") != "vid_gen" else
+             next((r for r in _VIDEO_ROLES if len(r) == n), _VIDEO_ROLES[0]))
     return (isinstance(p.get("model"), str) and _MODEL_RE.match(p["model"])
             and p.get("mode", "img_gen") in ("img_gen", "vid_gen")
             and p.get("architecture") in (None, "sdxl")
@@ -615,7 +619,7 @@ class Controller:
         models = {role: f"/models/{role}{path.suffix}" for role, path in paths.items()}
         model_args = (("--model", models["checkpoint"]) if p.get("architecture") == "sdxl" else
                       ("--diffusion-model", models["diffusion"], "--vae", models["vae"],
-                       *(("--t5xxl", models["t5xxl"]) if "t5xxl" in models else ("--llm", models["llm"]))))
+                       *(a for role in ("llm", "t5xxl") if role in models for a in (f"--{role}", models[role]))))
         r = docker("run", "-d", "--rm", "--pull=never", "--name", self.name, "--label", LABEL,
                    "--restart=no", *self.gpu_args, *self._resources, "-p", f"127.0.0.1:{inner}:8080",
                    "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
