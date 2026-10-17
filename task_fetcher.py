@@ -16,6 +16,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 
@@ -3535,10 +3536,14 @@ def build_container_cmd(task, name=None):
     return argv
 
 
-def _run_container(task):
+def _run_container(task, attach=None):
     """Run a single-node arbitrary buyer image+command and return its (bounded) output as the
     signed result. Hard-killed at the AUTHORIZED runtime budget (audit H1) so it can't burn more
-    of the seller's GPU than the buyer paid to authorize."""
+    of the seller's GPU than the buyer paid to authorize.
+
+    `attach(name, done)` (a distributed rank moving its overlay in) runs in a thread while the
+    container runs; a non-empty return is a refusal — it has already removed the container — and
+    the job fails with failure_cause network_policy instead of the container's exit code."""
     tid = task["task_id"]
     _set_ui(status="running", task=f"Container #{tid}")
     import shutil, uuid as _uuid
@@ -3557,10 +3562,22 @@ def _run_container(task):
     try:
         argv = build_container_cmd(task, name=name)
         report_progress(tid, 10, f"pulling & running {task.get('image')}")
+        refusal, done = [], threading.Event()
+        if attach:
+            watcher = threading.Thread(target=lambda: refusal.append(attach(name, done)), daemon=True)
+            watcher.start()
         # Streamed + bounded: never buffers the untrusted image's output unbounded in this
         # process, and kills the daemon-owned container on runtime or output-flood breach.
         rc, out, _trunc, timed_out, overflowed = _run_streamed(
             argv, name, timeout_s=(int(_rt) if _rt else None))
+        if attach:
+            done.set()
+            watcher.join(timeout=60)
+            if any(refusal):
+                report_log(tid, next(r for r in refusal if r))
+                _post("/jobs/result", _signed_result(tid, status="failed", failure_cause="network_policy"))
+                _set_ui(status="idle", task=None, fail=True)
+                return
         _ef = task.pop("_env_file", None)        # docker consumed it at launch; remove the 0600 secret file
         if _ef:
             try:
@@ -4507,12 +4524,138 @@ def _run_stitch(task):
         shutil.rmtree(outer, ignore_errors=True)
 
 
+def _wait_for_cluster(dist, tid, world):
+    """Poll the rendezvous until EVERY rank has registered its overlay identity (or fail)."""
+    url = dist.get("rendezvous_url") or f"/jobs/rendezvous/{dist.get('job_id')}"
+    deadline = time.monotonic() + int(os.getenv("DIST_RENDEZVOUS_TIMEOUT", "2400"))
+    while True:
+        r = httpx.get(f"{API_URL}{url}", headers=HEADERS, params={"task_id": tid}, timeout=15,
+                      trust_env=False)
+        r.raise_for_status()
+        info = r.json()
+        if info.get("status") != "running":
+            import cluster_overlay
+            raise cluster_overlay.OverlayError(f"cluster is {info.get('status')}; not joining")
+        if info.get("cluster_ready") and len(info.get("peers") or []) == world:
+            return info
+        if time.monotonic() >= deadline:
+            raise TimeoutError("not every rank joined the cluster in time")
+        time.sleep(2)
+
+
 def _run_distributed(task):
-    """No untrusted distributed execution until the peer-only overlay is implemented."""
+    """Run ONE rank of a distributed cluster inside the restricted peer-only overlay.
+
+      1. prove this host can build the overlay (cluster_overlay.probe) and pre-pull the image;
+      2. create this rank's WireGuard device and register its key + port (POST /jobs/rendezvous);
+         the API pairs them with the public address it observed and derives the overlay IP;
+      3. wait for every rank, and accept the peer set only if complete, distinct and public;
+      4. run — the self-test in a fresh namespace, or the buyer image under torchrun in a
+         `--network none`, no-capability container — with the overlay moved into that namespace
+         and VERIFIED (only lo + pbwg0, only this job's peers, no other route) before use;
+      5. report a signed result and tear the overlay down, whatever happened.
+    Overlay refusals report failure_cause=network_policy; any failed rank makes the server fail
+    the gang and refund every rank (main._fail_distributed_if_member)."""
+    import cluster_overlay as _ov
+    import distributed_run as _dist
     tid = task["task_id"]
-    report_log(tid, "distributed execution unavailable: isolated peer-only overlay required")
-    _post("/jobs/result", _signed_result(tid, status="failed", failure_cause="network_policy"))
-    _set_ui(status="idle", task=None, fail=True)
+    dist = task.get("distributed") or {}
+    rank, world = int(dist.get("rank", 0)), int(dist.get("world_size", 1))
+    _set_ui(status="running", task=f"Distributed rank {rank}/{world} #{tid}")
+    master, mport = _ov.overlay_ip(0), _dist.DEFAULT_RENDEZVOUS_PORT
+
+    def fail(msg, cause="network_policy"):
+        report_log(tid, msg)
+        _post("/jobs/result", _signed_result(tid, status="failed", failure_cause=cause))
+        _set_ui(status="idle", task=None, fail=True)
+
+    ready, why = _ov.probe()
+    if not ready:
+        return fail(f"distributed rank refused: {why}")
+    selftest = _dist.is_selftest(task)
+    if not selftest:
+        if not task.get("image"):
+            return fail("distributed rank refused: no image", "bad_task")
+        # A VM runtime (Kata) or gVisor's own netstack never sees a device moved in after start.
+        _flags = _isolation_flags(task)
+        if "--runtime" in _flags:
+            return fail("distributed rank refused: the cluster overlay needs Docker's default "
+                        f"runtime, not {_flags[_flags.index('--runtime') + 1]}")
+        try:
+            _run_docker(["docker", "pull", task["image"]], capture_output=True,
+                        timeout=int(os.getenv("DIST_PULL_TIMEOUT", "1800")))
+        except Exception as e:                           # noqa: BLE001
+            return fail(f"distributed rank {rank}/{world}: image pull failed ({type(e).__name__})",
+                        "node_error")
+    ov = _ov.RankOverlay(tid)
+    try:
+        pub, port = ov.create(int(os.getenv("DIST_WG_PORT", "0")))
+        r = httpx.post(f"{API_URL}{dist.get('register_url') or '/jobs/rendezvous'}", headers=HEADERS,
+                       timeout=15, trust_env=False,
+                       json=_lease_payload({"task_id": tid, "public_key": pub, "wg_port": port,
+                                            "port": mport, "slots": 1}))
+        if r.status_code != 200:                         # e.g. no public address the peers can reach
+            try:
+                why = r.json().get("detail")
+            except ValueError:
+                why = r.status_code
+            raise _ov.OverlayError(f"rendezvous refused: {why}")
+        report_progress(tid, 15, f"rank {rank}/{world} registered; waiting for every rank")
+        peers = _ov.parse_peers(_wait_for_cluster(dist, tid, world).get("peers"), rank, world)
+        ov.set_peers(peers)
+        if selftest:
+            ov.attach(rank)
+            ov.verify(rank, peers)
+            report_progress(tid, 30, f"overlay verified: {world - 1} peers and nothing else reachable")
+            limit = int(os.getenv("DIST_SELFTEST_TIMEOUT", "180"))
+            dim = int(os.getenv("DIST_SELFTEST_DIM", "8"))
+            p = subprocess.run(ov.exec + [  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args -- fixed agent argv (no shell); every value is an int or the server-derived overlay address
+                sys.executable, _dist.__file__, "selftest", "--rank", str(rank), "--world-size",
+                str(world), "--master", f"{master}:{mport}", "--bind", master,
+                "--seed", str(int(dist.get("job_id") or 0)),
+                "--dim", str(dim), "--timeout", str(limit)],
+                capture_output=True, text=True, timeout=limit + 60)
+            try:
+                out = json.loads((p.stdout or "").strip().splitlines()[-1])
+            except (IndexError, ValueError):
+                out = {"ok": False, "error": f"self-test printed no result (exit {p.returncode})"}
+            if p.returncode or not out.get("ok"):
+                return fail(f"cluster self-test rank {rank}/{world} failed: {out.get('error')}")
+            report_progress(tid, 95, f"all-reduce ok across {out.get('contributors')} ranks")
+            _post("/jobs/result", _signed_result(
+                tid, status="completed", result=f"allreduce rank {rank}/{world}: sum={out['result']}",
+                content_hash=crypto.sha256_hex(out["result"])))
+            _set_ui(status="idle", task=None, ok=True)
+            return
+
+        def attach(name, done):
+            try:
+                while not done.is_set():
+                    q = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", name],
+                                       capture_output=True, text=True, timeout=15)
+                    pid = int(q.stdout.strip() or 0) if q.returncode == 0 else 0
+                    if pid > 0:
+                        ov.attach(rank, pid=pid)
+                        ov.verify(rank, peers)
+                        report_progress(tid, 30, f"overlay verified: {world - 1} peers and nothing else reachable")
+                        return None
+                    time.sleep(0.2)
+                # Exited before the overlay was in: it never joined the cluster, whatever its exit code.
+                return "rank exited before its cluster overlay was attached and verified"
+            except Exception as e:                       # noqa: BLE001 — any failure: no overlay, no rank
+                _force_rm_container(name)
+                return f"cluster overlay attach failed: {e}"
+        _run_container(dict(task, command=_dist.build_torchrun_cmd(
+            command=task.get("command"), rank=rank, world_size=world, master_addr=master,
+            master_port=mport), env={**(task.get("env") or {}), **_dist.rank_env(
+                rank=rank, world_size=world, master_addr=master, master_port=mport,
+                backend=dist.get("backend", "nccl"))}), attach=attach)
+    except (_ov.OverlayError, TimeoutError) as e:
+        fail(f"distributed rank {rank}/{world} refused: {e}")
+    except Exception as e:                               # noqa: BLE001
+        fail(f"distributed rank {rank}/{world} failed: {type(e).__name__}: {e}"[:300], None)
+    finally:
+        ov.teardown()
 
 
 def _signed_result(tid, status="completed", result=None, content_hash=None, failure_cause=None):

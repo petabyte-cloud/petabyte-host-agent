@@ -8,8 +8,8 @@ The agent payload comes from the verified, signed bundle served at
 `https://petabyte.market/agent.tar.gz`. This README, the license and the verification public
 key are mirror metadata; they may be added or updated separately from that bundle.
 
-- **Release:** `80df94b9287c7e8a1c96cfb1e727f311634b8acc`
-- **Bundle SHA-256:** `e1d5eeabc32501b2b01328c724d88b9a805158dd6c9bce8913aa278ea721c0ba`
+- **Release:** `c55bf09592845c46622831a298b2c2f380dbe32d`
+- **Bundle SHA-256:** `c07748213cd52242051f0467b1e4b31f5cfe231ffacc8342c9a5b8568a8f4aa0`
 
 Hosts never install or update from this repository. The installer pins our release public key
 (`release_ed25519.pub`, also in this repo), and the updater (`update.sh`) refuses any bundle whose
@@ -60,6 +60,7 @@ official signed Petabyte release. Release-signing private keys are never publish
 - `install.sh` / `install.ps1` — what the installer does to your machine
 - `main.py`, `task_fetcher.py` — the agent loop and how jobs run in isolated containers
 - `network_policy.py`, `egress_vpn.py` — the network limits on buyer workloads
+- `cluster_overlay.py` — the peer-only network a distributed-compute rank runs inside
 - `update.sh` — signed-only auto-update
 
 ## Reporting a problem

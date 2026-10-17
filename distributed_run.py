@@ -4,9 +4,9 @@ The control plane (API) gang-schedules N nodes across distinct machines, assigns
 0..N-1, escrows all-or-nothing, and coordinates rendezvous. THIS module is the other half:
 what the agent actually does on the node when it claims a `distributed` task —
 
-  1. register this rank's VPN-reachable address (so the whole cluster is addressable), then
-  2. resolve the master (rank 0 IS the master; every other rank polls until rank 0 is up), then
-  3. EXECUTE:
+  1. register this rank's overlay identity (WireGuard key + port; cluster_overlay.py), then
+  2. wait until every rank has registered and build the job's peer-only overlay, then
+  3. EXECUTE inside that overlay (rank 0 at 10.77.0.1 is the master):
        * a real training run — launch the buyer's container under `torchrun` wired to the
          master address / this rank / the world size (`build_torchrun_cmd`), OR
        * the built-in CLUSTER SELF-TEST — a genuine cross-process all-reduce that proves the N
@@ -23,7 +23,7 @@ master (rank 0): every worker sends its per-rank vector to the master over a rea
 the master sums all N vectors (its own included) and broadcasts the total back, so every rank
 ends holding the identical, correct global sum. That is a true all-reduce — the same INPUT→
 OUTPUT contract NCCL's ring all-reduce provides — chosen here for its topology simplicity and
-zero dependencies. Production GPU jobs use NCCL's ring all-reduce over the WireGuard mesh; this
+zero dependencies. Production GPU jobs use NCCL's ring all-reduce over the per-job overlay; this
 built-in exists to VALIDATE the cluster wiring, not to replace NCCL.
 """
 import json
@@ -51,62 +51,36 @@ def is_selftest(task: dict) -> bool:
     return bool(dist.get("selftest"))
 
 
-def local_vpn_addr() -> str:
-    """This node's cluster-reachable address that peers use to reach it.
-
-    Preference order: an explicitly configured address (set by the VPN bring-up), then the
-    WireGuard interface address if we can read it, then the primary outbound IP. Never raises —
-    a node must always be able to name itself so the cluster can form."""
-    explicit = os.getenv("AGENT_VPN_ADDR") or os.getenv("PETABYTE_VPN_ADDR")
-    if explicit:
-        return explicit.strip()
-    try:  # the source IP the kernel would use for an outbound connection (no packet sent)
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(("10.255.255.255", 1))
-            return s.getsockname()[0]
-        finally:
-            s.close()
-    except Exception:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except Exception:
-            return "127.0.0.1"
+def build_torchrun_cmd(*, command: str, rank: int, world_size: int, master_addr: str,
+                       master_port: int, nproc_per_node: int = 1) -> str:
+    """The container command that runs THIS rank: torchrun with a static rendezvous on rank 0's
+    overlay address. The agent runs it through build_container_cmd (`--network none`, no
+    capabilities) and then moves the rank's verified overlay device into that container's
+    namespace (cluster_overlay.py), so the only addresses the rank can reach are its peers'."""
+    args = ["torchrun", f"--nnodes={int(world_size)}", f"--nproc_per_node={int(nproc_per_node)}",
+            f"--node_rank={int(rank)}", "--rdzv_backend=static",
+            f"--master_addr={master_addr}", f"--master_port={int(master_port)}"]
+    return shlex.join(["sh", "-c", OVERLAY_GATE, "pbgate", *args]) + (f" {command}" if command else "")
 
 
-def resolve_master(dist: dict, *, my_host: str, my_port: int, current: dict = None,
-                   fetch=None, sleep=None, now=None, timeout_s: int = 120) -> dict:
-    """Resolve the cluster master (rank 0's rendezvous address).
-
-    Rank 0 IS the master, so it returns its own address immediately. Every other rank joins by
-    polling the rendezvous endpoint until rank 0 has registered (or the deadline passes). `fetch`
-    is a 0-arg callable returning the rendezvous dict (GET /jobs/rendezvous/{job_id}); `sleep`,
-    `now` are injectable so this is testable without real time or a network. Raises TimeoutError
-    if the master never appears — which fails this rank, and (gang semantics) the whole cluster."""
-    rank = int(dist.get("rank", 0))
-    if dist.get("is_master") or rank == 0:
-        return {"master_addr": my_host, "master_port": my_port, "my_rank": 0, "is_master": True}
-    sleep = sleep or time.sleep
-    now = now or time.monotonic
-    info = current if (current and current.get("master_addr")) else (fetch() if fetch else {})
-    deadline = now() + max(1, int(timeout_s))
-    while True:
-        if info and info.get("master_addr"):
-            return {"master_addr": info["master_addr"], "master_port": info["master_port"],
-                    "my_rank": info.get("my_rank", rank), "is_master": False}
-        if now() >= deadline:
-            raise TimeoutError(
-                f"rank {rank}: master rendezvous not ready after {timeout_s}s (cluster cannot form)")
-        sleep(min(2.0, max(0.05, timeout_s / 60.0)))
-        info = fetch() if fetch else {}
+# The container starts with only `lo`; the agent moves the overlay in a moment later. torchrun must
+# not race it, so it is exec'd only once pbwg0 is UP (IFF_UP = bit 0 of the sysfs flags, read inside
+# the container's own netns). The agent verifies right after bringing it up and kills the container
+# on any mismatch. Needs /bin/sh in the image, like every CUDA/PyTorch base image; exit 97 = no overlay.
+OVERLAY_GATE = ("i=0; while :; do f=; read f 2>/dev/null < /sys/class/net/pbwg0/flags; "
+                "case \"$f\" in *[13579bdfBDF]) break;; esac; i=$((i+1)); "
+                "[ $i -gt 3000 ] && { echo 'cluster overlay never came up' >&2; exit 97; }; "
+                "sleep 0.1; done; exec \"$@\"")
 
 
-def build_torchrun_cmd(*, image: str, command: str, rank: int, world_size: int,
-                       master_addr: str, master_port: int, backend: str = "nccl",
-                       nproc_per_node: int = 1, gpu: bool = True, env: dict = None,
-                       isolation_flags=None, egress_flags=None, container_name: str = None):
-    """Refuse untrusted distributed launches until a restricted overlay is available."""
-    raise ValueError("distributed execution unavailable: restricted peer-only overlay required")
+def rank_env(*, rank: int, world_size: int, master_addr: str, master_port: int,
+             backend: str = "nccl") -> dict:
+    """The standard distributed env (overrides the buyer's), with NCCL/gloo pinned to the overlay
+    device — the only interface besides lo inside the rank's namespace."""
+    from cluster_overlay import IFACE
+    return {"MASTER_ADDR": master_addr, "MASTER_PORT": str(int(master_port)), "RANK": str(int(rank)),
+            "NODE_RANK": str(int(rank)), "WORLD_SIZE": str(int(world_size)), "PET_BACKEND": backend,
+            "NCCL_SOCKET_IFNAME": IFACE, "GLOO_SOCKET_IFNAME": IFACE, "NCCL_IB_DISABLE": "1"}
 
 
 # --------------------------------------------------------------------------- collective

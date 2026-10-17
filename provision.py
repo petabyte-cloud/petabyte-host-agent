@@ -8,7 +8,8 @@ your account a seller). The key's account must already be a seller.
 
 Env:
   PETABYTE_API_URL, PETABYTE_API_KEY               (required)
-  PRICE_PER_HOUR (CPU-only nodes; a GPU rents at Petabyte's price for its model), UNITS (1), MAX_HOURS (24)
+  UNITS (1), MAX_HOURS (24). PRICE_PER_HOUR is ignored: Petabyte sets every price (per GPU model,
+  or per CPU thread for a CPU-only node)
   GPU_MODEL/GPU_COUNT/VRAM_GB                       (override auto-detect)
   AGENT_ENV (default /etc/petabyte/agent.env), PETABYTE_AGENT_KEY
 """
@@ -275,24 +276,15 @@ def resolve_price(client, gpu_model):
 
     A GPU node rents at Petabyte's ONE price for its GPU model: Petabyte sets it, sellers with the
     same hardware do not undercut each other, and the server ignores any price the agent sends.
-    We ask for it only so the summary shows the real number. PRICE_PER_HOUR still applies to a
-    CPU-only node, which has no GPU model to price.
+    We ask for it only so the summary shows the real number. A CPU-only node rents at Petabyte's
+    price per CPU thread, which the server applies; PRICE_PER_HOUR is ignored for every node.
 
-    Returns (price: float | None, basis: str); None means Petabyte has not priced this GPU yet.
+    Returns (price: float | None, basis: str); None means the number comes from Petabyte later.
     """
-    raw = (os.getenv("PRICE_PER_HOUR") or "").strip()
+    if (os.getenv("PRICE_PER_HOUR") or "").strip():
+        print("PRICE_PER_HOUR is ignored: Petabyte sets every price.")
     if not gpu_model:
-        try:
-            v = float(raw) if raw else 0.0
-        except ValueError:
-            v = 0.0
-        if v > 0:
-            return v, "seller-set (CPU-only node)"
-        if raw:
-            print(f"PRICE_PER_HOUR={raw!r} is not a positive number — using the default CPU-only rate.")
-        return 1.0, "default CPU-only rate"
-    if raw:
-        print("PRICE_PER_HOUR is ignored for GPU nodes: Petabyte sets one price per GPU model.")
+        return None, "set by Petabyte per CPU thread (see your dashboard)"
     try:
         r = client.get("/pricing/suggest", params={"gpu_model": gpu_model})
         if r.status_code == 200:
