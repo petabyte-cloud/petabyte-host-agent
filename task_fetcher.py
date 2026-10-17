@@ -3942,7 +3942,7 @@ def _run_render(task):
     try:
         # 1) pull the scene via a pre-signed GET (no standing creds on the node)
         g = httpx.post(f"{API_URL}/jobs/input_url", headers=HEADERS, timeout=15,
-                       json={"task_id": tid, "ref": task.get("blend_ref", "")}, trust_env=False).json()
+                       json=_lease_payload({"task_id": tid, "ref": task.get("blend_ref", "")}), trust_env=False).json()
         with open(scene, "wb") as fh:            # streamed to disk: a project archive can be large
             safe_fetch.get(g["download_url"], timeout=1800, max_bytes=_SCENE_MAX, sink=fh)
         with open(scene, "rb") as fh:
@@ -4140,7 +4140,7 @@ def _run_model3d(task):
         base = []
         if task.get("parent_ref"):                    # continue from the previous commit's scene
             g = httpx.post(f"{API_URL}/jobs/input_url", headers=HEADERS, timeout=15,
-                           json={"task_id": tid, "ref": task["parent_ref"]}, trust_env=False).json()
+                           json=_lease_payload({"task_id": tid, "ref": task["parent_ref"]}), trust_env=False).json()
             with open(os.path.join(work, "base.blend"), "wb") as fh:
                 safe_fetch.get(g["download_url"], timeout=600, max_bytes=_SCENE_MAX, sink=fh)
             base = ["-v", f"{os.path.join(work, 'base.blend')}:/base.blend:ro"]
@@ -4263,7 +4263,7 @@ def _put_output(tid, path, name):
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
     grant = httpx.post(f"{API_URL}/jobs/output_put", headers=HEADERS, timeout=15,
-                       json={"task_id": tid, "filename": name}, trust_env=False).json()
+                       json=_lease_payload({"task_id": tid, "filename": name}), trust_env=False).json()
     with open(path, "rb") as fh:
         r = httpx.put(grant["upload_url"], content=fh, trust_env=False,
                       headers={"Content-Length": str(os.path.getsize(path))},
@@ -4424,7 +4424,7 @@ def _run_transcode(task):
     src = _os.path.join(work, "in"); dst = _os.path.join(work, f"out.{_safe_ext(task.get('container'))}")
     try:
         g = httpx.post(f"{API_URL}/jobs/input_url", headers=HEADERS, timeout=15,
-                       json={"task_id": tid, "ref": task.get("input_ref", "")}, trust_env=False).json()
+                       json=_lease_payload({"task_id": tid, "ref": task.get("input_ref", "")}), trust_env=False).json()
         open(src, "wb").write(safe_fetch.get(g["download_url"], timeout=120, max_bytes=128 * 1024 * 1024).content)
         report_progress(tid, 20, "transcoding")
         vcodec = {"h264": "h264_nvenc", "h265": "hevc_nvenc", "av1": "av1_nvenc"} \
@@ -4452,7 +4452,7 @@ def _run_transcode(task):
         _run_docker(args + ff, timeout=(int(_rt) if _rt else None))
         report_progress(tid, 80, "uploading")
         grant = httpx.post(f"{API_URL}/jobs/backup_url", headers=HEADERS, timeout=15,
-                           json={"task_id": tid, "filename": _os.path.basename(dst)}, trust_env=False).json()
+                           json=_lease_payload({"task_id": tid, "filename": _os.path.basename(dst)}), trust_env=False).json()
         from cryptography.fernet import Fernet
         raw = open(dst, "rb").read()
         enc = Fernet(grant["enc_key"].encode()).encrypt(raw)
@@ -4490,7 +4490,7 @@ def _run_stitch(task):
         with open(listfile, "w") as lf:
             for i, ref in enumerate(refs):
                 gg = httpx.post(f"{API_URL}/jobs/input_url", headers=HEADERS, timeout=15,
-                                json={"task_id": tid, "ref": ref}, trust_env=False).json()
+                                json=_lease_payload({"task_id": tid, "ref": ref}), trust_env=False).json()
                 p = _os.path.join(work, f"seg{i}.{_safe_ext(task.get('container'))}")
                 open(p, "wb").write(safe_fetch.get(gg["download_url"], timeout=120, max_bytes=128 * 1024 * 1024).content)
                 lf.write(f"file '{p}'\n")
@@ -4512,7 +4512,7 @@ def _run_stitch(task):
             with tarfile.open(out, "w") as tf:
                 tf.add(work, arcname="frames")
         grant = httpx.post(f"{API_URL}/jobs/backup_url", headers=HEADERS, timeout=15,
-                           json={"task_id": tid, "filename": _os.path.basename(out)}, trust_env=False).json()
+                           json=_lease_payload({"task_id": tid, "filename": _os.path.basename(out)}), trust_env=False).json()
         from cryptography.fernet import Fernet
         raw = open(out, "rb").read()
         enc = Fernet(grant["enc_key"].encode()).encrypt(raw)
@@ -5057,6 +5057,13 @@ def job_loop():
                     _tel.event(_tel.EVENTS.JOB_EXECUTION_STARTED, message="execution started",
                                task_type=tt)
                     try:
+                        if tt in ("after_effects", "premiere_pro", "adobe_inspect"):
+                            # Adobe jobs run only on Petabyte's own EC2 Windows instances (server-side
+                            # lumaris_api/adobe_cloud.py); a seller node never claims them. Refuse with
+                            # an infrastructure cause (refunded) instead of any local fallback.
+                            _post_result_ack_retry(_signed_result(
+                                task["task_id"], status="failed", failure_cause="adobe_runtime_unavailable"))
+                            continue
                         # SECURITY (P-2 cross-tenant VRAM residue): before running a GPU job, zero
                         # the card's free VRAM so this buyer can never read the PREVIOUS tenant's
                         # model weights/data left in device memory (NVIDIA does not clear VRAM
