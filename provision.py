@@ -136,15 +136,20 @@ def amd_gpu_rows() -> list:
         rows = []
         for m in re.finditer(r"Marketing Name:\s*(.+)", ro):
             name = m.group(1).strip()
-            if name and "cpu" not in name.lower():
+            # rocminfo lists the host CPU as an agent too ("AMD EPYC 9575F 64-Core Processor").
+            if name and not re.search(r"\b(cpu|processor)\b", name, re.I):
                 rows.append((name, "0"))
         return rows
     rows = []
     for card, info in (data.items() if isinstance(data, dict) else []):
         if not str(card).lower().startswith("card") or not isinstance(info, dict):
             continue
-        name = (info.get("Card series") or info.get("Card model")
-                or info.get("Card SKU") or "AMD GPU").strip()
+        # Key case varies by rocm-smi version ("Card series" / "Card Series"), and "Card Model" /
+        # "Card SKU" are often a PCI id ("0x75b0") or "N/A": take the first real name.
+        low = {str(k).strip().lower(): str(v).strip() for k, v in info.items()}
+        name = next((low[k] for k in ("card series", "marketing name", "card model", "card sku")
+                     if low.get(k) and low[k].upper() != "N/A" and not re.fullmatch(r"0x[0-9a-f]+", low[k], re.I)),
+                    "AMD GPU")
         vram_mib = "0"
         for k, v in info.items():
             if "vram total memory" in k.lower():
