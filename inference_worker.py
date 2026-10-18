@@ -73,6 +73,13 @@ _AUDIO_IMAGE_RE = {"stt": re.compile(r"^docker\.io/petabytecloud/pool-whisper@sh
                    "tts": re.compile(r"^docker\.io/petabytecloud/tts-chatterbox@sha256:[0-9a-f]{64}$")}
 _AUDIO_URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._/-]+\.(bin|pt|json|safetensors)$")
 _AUDIO_ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# Long speech to text (owner, 2026-10-18): the API gives the node a short-lived bucket URL for a file of
+# up to STT_MAX_BYTES and polls the job. whisper-server has no job API, so AuthProxy runs the job.
+_STT_JOB_PATH = re.compile(r"^/pb/stt/jobs(?:/([0-9a-f]{16}))?$")
+_STT_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+\.(digitaloceanspaces\.com|aliyuncs\.com)/\S+$")
+STT_MAX_BYTES = 512 * 1024 * 1024
+STT_TIMEOUT_S = 6 * 3600
+STT_KEEP_S = 3600                 # a finished job's result waits this long for the API to collect it
 IMAGE_BENCH = {"prompt": "a lighthouse on a cliff at sunset, photograph", "size": "512x512"}
 # A video model cannot make a still: its benchmark is a tiny clip (9 frames at 256x256, 4 steps).
 VIDEO_BENCH = {"prompt": "waves rolling onto a beach at sunset", "width": 256, "height": 256,
@@ -360,11 +367,76 @@ def _retire(image):
         logging.warning("inference worker: image cleanup failed: %s", e)
 
 
+class SttJobs:
+    """Speech-to-text jobs: download the buyer's upload from a short-lived bucket URL into scratch (RAM
+    when the node has it), transcribe it on whisper-server, and keep the result until the API polls it.
+    One transcription runs at a time; the rest queue."""
+
+    def __init__(self, inner_port):
+        self.inner, self.jobs = inner_port, {}
+        self.lock, self.gpu = threading.Lock(), threading.Lock()
+
+    def start(self, body):
+        """(HTTP status, reply) for POST /pb/stt/jobs {url, filename, language}."""
+        url, language = str(body.get("url") or ""), str(body.get("language") or "auto")
+        name = re.sub(r"[^A-Za-z0-9._ -]", "_", str(body.get("filename") or "audio"))[:120] or "audio"
+        if not _STT_URL_RE.match(url) or language not in ("auto", "ar", "en"):
+            return 400, {"error": "bad job"}
+        with self.lock:
+            now = time.time()
+            for jid in [j for j, v in self.jobs.items() if v.get("completed") and now - v["completed"] > STT_KEEP_S]:
+                del self.jobs[jid]
+            if sum(v["status"] in ("queued", "running") for v in self.jobs.values()) >= 4:
+                return 429, {"error": "too many jobs"}
+            jid = secrets.token_hex(8)
+            self.jobs[jid] = {"status": "queued"}
+        threading.Thread(target=self._work, args=(jid, url, name, language), daemon=True,
+                         name=f"pb-stt-{jid}").start()
+        return 202, {"id": jid, "status": "queued"}
+
+    def get(self, jid):
+        with self.lock:
+            job = self.jobs.get(jid)
+            return (200, dict(job)) if job else (404, {"error": "job not found"})
+
+    def _work(self, jid, url, name, language):
+        job, work = self.jobs[jid], None
+        with self.gpu:
+            job.update(status="running", started=int(time.time()))
+            try:
+                import agent_scratch
+                work = agent_scratch.make_scratch("pb-stt-", need_bytes=STT_MAX_BYTES)
+                path, n = os.path.join(work, "upload"), 0
+                with httpx.stream("GET", url, timeout=httpx.Timeout(60, read=300), trust_env=False) as r:
+                    if r.status_code != 200:
+                        raise RuntimeError(f"the upload could not be downloaded ({r.status_code})")
+                    with open(path, "wb") as f:
+                        for chunk in r.iter_bytes(1 << 20):
+                            n += len(chunk)
+                            if n > STT_MAX_BYTES:
+                                raise RuntimeError("the file is too large")
+                            f.write(chunk)
+                with open(path, "rb") as f:
+                    r = httpx.post(f"http://127.0.0.1:{self.inner}/inference", files={"file": (name, f)},
+                                   data={"language": language, "response_format": "verbose_json",
+                                         "temperature": "0.0"}, timeout=STT_TIMEOUT_S, trust_env=False)
+                if r.status_code != 200:
+                    raise RuntimeError(f"the speech server refused the file ({r.status_code})")
+                job.update(status="completed", result=r.json(), completed=int(time.time()))
+            except Exception as e:                        # noqa: BLE001 — reported to the API, never raised
+                job.update(status="failed", error=str(e)[:200], completed=int(time.time()))
+            finally:
+                if work:
+                    shutil.rmtree(work, ignore_errors=True)
+
+
 class AuthProxy:
     """127.0.0.1:<port> -> sd-server. sd-server has no API key, so the gateway, and anyone who learns
-    the worker's address, reaches it only through this: the session key, and only _IMAGE_PATHS."""
+    the worker's address, reaches it only through this: the session key, and only _IMAGE_PATHS.
+    A speech-to-text proxy (stt_jobs) also runs the long-file jobs itself (SttJobs, /pb/stt/jobs)."""
 
-    def __init__(self, inner_port, key):
+    def __init__(self, inner_port, key, stt_jobs=False):
+        jobs = SttJobs(inner_port) if stt_jobs else None
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
@@ -380,9 +452,12 @@ class AuthProxy:
 
             def _forward(self):
                 auth = self.headers.get("Authorization") or ""
-                if (not hmac.compare_digest(auth.encode(), f"Bearer {key}".encode())
-                        or not _IMAGE_PATHS.match(self.path.split("?", 1)[0])):
+                job = _STT_JOB_PATH.match(self.path.split("?", 1)[0]) if jobs else None
+                if not hmac.compare_digest(auth.encode(), f"Bearer {key}".encode()) or not (
+                        job or _IMAGE_PATHS.match(self.path.split("?", 1)[0])):
                     return self._reply(403, b'{"error":"forbidden"}')
+                if job:
+                    return self._job(job.group(1))
                 try:
                     n = int(self.headers.get("Content-Length") or 0)
                 except ValueError:
@@ -399,6 +474,20 @@ class AuthProxy:
                 except httpx.HTTPError:
                     return self._reply(502, b'{"error":"image server unavailable"}')
                 self._reply(r.status_code, r.content, r.headers.get("content-type") or "application/json")
+
+            def _job(self, jid):
+                if self.command == "GET" and jid:
+                    code, out = jobs.get(jid)
+                elif self.command == "POST" and not jid:
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                        body = json.loads(self.rfile.read(n) if 0 < n <= 8192 else b"null")
+                    except (ValueError, UnicodeDecodeError):
+                        body = None
+                    code, out = jobs.start(body) if isinstance(body, dict) else (400, {"error": "bad job"})
+                else:
+                    code, out = 405, {"error": "method not allowed"}
+                self._reply(code, json.dumps(out).encode())
 
             do_GET = do_POST = _forward
 
@@ -678,7 +767,8 @@ class Controller:
                    "--restart=no", *self.gpu_args, *self._resources, "-p", f"127.0.0.1:{inner}:8080",
                    "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                    "--pids-limit=256", "--user=65534:65534", "-e", "HOME=/tmp",
-                   "--tmpfs", "/tmp:rw,noexec,nosuid,size=1024m",       # ffmpeg's WAV of a long upload
+                   # the upload plus ffmpeg's WAV of it (32 KB/s): ~8 h of audio for a 500 MB file
+                   "--tmpfs", f"/tmp:rw,noexec,nosuid,size={'2048m' if stt else '1024m'}",
                    "--log-opt=max-size=1m", "--log-opt=max-file=1",
                    *[a for role, path in paths.items()
                      for a in ("--mount", f"type=bind,src={path},dst=/models/{role},readonly")],
@@ -701,7 +791,7 @@ class Controller:
         speed = bench_stt(url) if stt else bench_tts(url)
         if self._lapsed(stop):
             return
-        self._proxy = AuthProxy(inner, key)
+        self._proxy = AuthProxy(inner, key, stt_jobs=stt)
         self._warm_until_done(p, stop, self._proxy.port, key, dict(kind="audio", bench_mps=speed))
 
     def _warm_until_done(self, p, stop, port, key, extra):

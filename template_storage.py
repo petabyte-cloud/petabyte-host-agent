@@ -471,6 +471,7 @@ def report(gateway=""):
                       "video_pool_version": 1,            # ...and video leases (Wan 2.2: t5xxl, vid_gen)
                       "video_llm_version": 1,             # ...with an llm encoder too (HunyuanVideo 1.5)
                       "audio_pool_version": 1,            # ...and audio leases (whisper-server, Chatterbox TTS)
+                      "stt_jobs_version": 1,              # ...and long speech-to-text jobs from a bucket URL
                       "pool_images_version": 1,           # ...and Petabyte's slim pool images (deploy/pool-images)
                       "llm_args_version": 1,              # ...and passes a chat lease's allowlisted flags
                       "images": images, "cache_budget_bytes": int(budget),
