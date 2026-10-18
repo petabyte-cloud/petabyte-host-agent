@@ -230,16 +230,17 @@ class PoolController:
 class Model3DProxy:
     """Per-build authenticated chat-only bridge. The Blender container never gets the pool key,
     a GPU device, arbitrary upstream paths or the shared model server's management endpoints."""
-    def __init__(self, gateway, endpoint, active=lambda: True):
+    def __init__(self, gateway, endpoint=None, active=lambda: True, *, forward=None,
+                 max_tokens=2048, max_chars=24000, max_calls=8):
         host = ipaddress.ip_address(gateway)
         if host.version != 4 or not host.is_private or host.is_loopback or host.is_link_local:
             raise ValueError("the private build network has no usable gateway")
         self.key = secrets.token_urlsafe(32)
-        target, upstream_key = endpoint
+        target, upstream_key = endpoint if endpoint else (None, None)
         self.closed = threading.Event()
         self.client = httpx.Client(trust_env=False, timeout=600)
         client = self.client
-        key, quota, lock, closed = self.key, [8], threading.Lock(), self.closed
+        key, quota, lock, closed = self.key, [max_calls], threading.Lock(), self.closed
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -260,14 +261,15 @@ class Model3DProxy:
                     return self.reply(403, b'{"error":"forbidden"}')
                 try:
                     n = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < n <= 128 * 1024:
+                    # JSON may escape each content byte as six ASCII bytes (e.g. control chars).
+                    if not 0 < n <= max(128 * 1024, 6 * max_chars + 16 * 1024):
                         return self.reply(413, b'{"error":"request too large"}')
                     body = json.loads(self.rfile.read(n))
                     messages = body["messages"]
                     if (not isinstance(messages, list) or not 1 <= len(messages) <= 32
                             or any(not isinstance(m, dict) or m.get("role") not in ("system", "user", "assistant")
                                    or not isinstance(m.get("content"), str) for m in messages)
-                            or sum(len(m["content"].encode()) for m in messages) > 24000):
+                            or sum(len(m["content"].encode()) for m in messages) > max_chars):
                         return self.reply(400, b'{"error":"invalid conversation"}')
                 except (ValueError, KeyError, TypeError, OSError):
                     return self.reply(400, b'{"error":"invalid request"}')
@@ -276,16 +278,20 @@ class Model3DProxy:
                         return self.reply(429, b'{"error":"build request limit"}')
                     quota[0] -= 1
                 try:
-                    r = client.post(target + "/v1/chat/completions",
-                                   headers={"Authorization": f"Bearer {upstream_key}"},
-                                   json={"model": "local", "messages": [{"role": m["role"], "content": m["content"]}
-                                                                         for m in messages], "max_tokens": 2048,
-                                         "temperature": 0.2, "stream": False})
+                    payload = {"model": "local", "messages": [{"role": m["role"], "content": m["content"]}
+                                                               for m in messages], "max_tokens": max_tokens,
+                               "temperature": 0.3, "stream": False}
+                    r = (forward(payload) if forward else client.post(target + "/v1/chat/completions",
+                         headers={"Authorization": f"Bearer {upstream_key}"}, json=payload))
+                    if len(r.content) > 512 * 1024:
+                        return self.reply(502, b'{"error":"local coder response too large"}')
                     return self.reply(r.status_code, r.content)
                 except (httpx.HTTPError, RuntimeError):
                     return self.reply(502, b'{"error":"shared coder unavailable"}')
 
             def do_GET(self):
+                if self.path == "/health" and not closed.is_set() and active():
+                    return self.reply(200, b'{"status":"ok"}')
                 return self.reply(403, b'{"error":"forbidden"}')
 
         class Server(http.server.ThreadingHTTPServer):

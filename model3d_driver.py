@@ -11,6 +11,8 @@ import argparse, json, math, os, re, sys, time, traceback, urllib.request
 
 import bpy
 import mathutils
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from model3d_scene import PLAN_SYSTEM, BUILD_SYSTEM, parse_plan, evidence, assembly_summary
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
@@ -18,6 +20,10 @@ ap.add_argument("--prompt", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--llm", default="http://llm:8080")
 ap.add_argument("--max-steps", type=int, default=4)
+ap.add_argument("--staged", action="store_true", help="plan and verify every requested scene component")
+ap.add_argument("--max-tokens", type=int, default=3072)
+ap.add_argument("--model", default="local")
+ap.add_argument("--gpu-render", action="store_true")
 ap.add_argument("--fresh", action="store_true", help="start from an empty scene")
 args = ap.parse_args(argv)
 os.makedirs(args.out, exist_ok=True)
@@ -67,8 +73,7 @@ torus("MugHandle", 0.03, 0.008, (0.25, 0.1, 0.80), (0.8, 0.1, 0.1), rotation=(90
 ```
 Use realistic real-world sizes and enough parts that the object is recognisable. Keep existing objects
 unless asked to change them. The camera, lights, world and render settings are handled for you: never
-touch them. The request may read like an image prompt (style, mood, lighting, sky, fog, sun rays, camera,
-reflections): ignore those words and never add objects for them; build only the physical things.
+touch them in this compatibility mode. Preserve every physical subject and landscape feature in the request.
 When the request is fully done, reply with just: DONE (never put DONE inside a code block)"""
 
 
@@ -181,6 +186,108 @@ def remove(name):
         bpy.data.objects.remove(o, do_unlink=True)
 
 
+def material(name, color, metallic=0, roughness=0.5, emission=None, strength=1):
+    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    mat.use_nodes = True
+    shader = mat.node_tree.nodes.get("Principled BSDF")
+    shader.inputs["Base Color"].default_value = tuple(color[:3]) + (1,)
+    shader.inputs["Metallic"].default_value = max(0, min(1, float(metallic)))
+    shader.inputs["Roughness"].default_value = max(0.02, min(1, float(roughness)))
+    if emission is not None:
+        shader.inputs["Emission Color"].default_value = tuple(emission[:3]) + (1,)
+        shader.inputs["Emission Strength"].default_value = float(strength)
+    return mat
+
+
+def assign(obj, mat):
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+    return obj
+
+
+def beam(name, start, end, radius, color=(0.7, 0.7, 0.7)):
+    start, end = mathutils.Vector(start), mathutils.Vector(end)
+    direction = end - start
+    obj = cylinder(name, radius, direction.length, (start + end) / 2, color)
+    obj.rotation_euler = direction.to_track_quat("Z", "Y").to_euler()
+    return obj
+
+
+def ellipsoid(name, size, location, color=(0.8, 0.8, 0.8), rotation=(0, 0, 0)):
+    obj = sphere(name, 1, location, color)
+    obj.scale = [float(x) / 2 for x in size]
+    obj.rotation_euler = [math.radians(float(x)) for x in rotation]
+    return obj
+
+
+def terrain(name, size=40, resolution=80, height=2, seed=1, color=(.4, .15, .07)):
+    import random
+    resolution = max(8, min(160, int(resolution)))
+    rng = random.Random(seed)
+    phase = rng.random() * 10
+    vertices, faces = [], []
+    for y in range(resolution + 1):
+        for x in range(resolution + 1):
+            px, py = (x / resolution - .5) * size, (y / resolution - .5) * size
+            z = height * (.3 * math.sin(px * .22 + phase) * math.cos(py * .19)
+                          + .12 * math.sin(px * .8 + py * .4) + .04 * rng.random())
+            vertices.append((px, py, z))
+    for y in range(resolution):
+        for x in range(resolution):
+            a = y * (resolution + 1) + x
+            faces.append((a, a + 1, a + resolution + 2, a + resolution + 1))
+    old = bpy.data.objects.get(name)
+    if old is not None:
+        bpy.data.objects.remove(old, do_unlink=True)
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    assign(obj, _mat(color))
+    obj["pb_background"] = True
+    return obj
+
+
+def camera(location, target, lens=24):
+    for fallback in ("pb_sun", "pb_cam"):
+        old = bpy.data.objects.get(fallback)
+        if old is not None:
+            bpy.data.objects.remove(old, do_unlink=True)
+    obj = bpy.data.objects.get("pb_artist_camera")
+    if obj is None:
+        obj = bpy.data.objects.new("pb_artist_camera", bpy.data.cameras.new("pb_artist_camera"))
+        bpy.context.scene.collection.objects.link(obj)
+    obj.location = location
+    obj.rotation_euler = (mathutils.Vector(target) - obj.location).to_track_quat("-Z", "Y").to_euler()
+    obj.data.lens = max(12, min(120, float(lens)))
+    obj.data.clip_end = 5000
+    obj["pb_target"] = list(target)
+    bpy.context.scene.camera = obj
+    return obj
+
+
+def light(name, location, color=(1, 1, 1), energy=1000, size=5):
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        obj = bpy.data.objects.new(name, bpy.data.lights.new(name, "AREA"))
+        bpy.context.scene.collection.objects.link(obj)
+    obj.location, obj.data.color = location, color[:3]
+    obj.data.energy, obj.data.shape, obj.data.size = float(energy), "DISK", float(size)
+    obj.rotation_euler = (-mathutils.Vector(location)).to_track_quat("-Z", "Y").to_euler()
+    return obj
+
+
+def world(color=(0.05, 0.06, 0.08), strength=.3):
+    if bpy.context.scene.world is None:
+        bpy.context.scene.world = bpy.data.worlds.new("pb_world")
+    bg_world = bpy.context.scene.world
+    bg_world.use_nodes = True
+    background = bg_world.node_tree.nodes.get("Background")
+    background.inputs[0].default_value = tuple(color[:3]) + (1,)
+    background.inputs[1].default_value = float(strength)
+
+
 NS = {}   # one namespace per commit: a fix-up block can reuse variables from earlier blocks
 
 
@@ -188,9 +295,12 @@ def scene_objects():
     out = []
     for o in bpy.context.scene.objects:
         mat = o.active_material.name if getattr(o, "active_material", None) else None
-        out.append({"name": o.name, "type": o.type, "location": [round(v, 3) for v in o.location],
+        matrix = getattr(o, "matrix_world", None)
+        location = matrix.translation if matrix is not None else o.location
+        out.append({"name": o.name, "type": o.type, "location": [round(v, 3) for v in location],
                     "rotation": [round(v, 3) for v in o.rotation_euler], "scale": [round(v, 3) for v in o.scale],
-                    "dimensions": [round(v, 3) for v in o.dimensions], "material": mat})
+                    "dimensions": [round(v, 3) for v in o.dimensions], "material": mat,
+                    "requirement": getattr(o, "get", lambda key, default: default)("pb_requirement", "")})
     return out
 
 
@@ -218,7 +328,9 @@ def run_code(code):
         import random
         # `random` preloaded: Qwen scatters rocks/trees with it and forgets the import (commit #41).
         ns.update(bpy=bpy, bmesh=bmesh, mathutils=mathutils, math=math, random=random, Vector=mathutils.Vector,
-                  box=box, cylinder=cylinder, cone=cone, sphere=sphere, torus=torus, remove=remove)
+                  box=box, cylinder=cylinder, cone=cone, sphere=sphere, torus=torus, remove=remove,
+                  beam=beam, ellipsoid=ellipsoid, terrain=terrain, material=material, assign=assign,
+                  camera=camera, light=light, world=world)
     try:
         with contextlib.redirect_stdout(buf):
             exec(compile(code, "<llm>", "exec"), ns)
@@ -233,8 +345,8 @@ def run_code(code):
 
 
 def chat(messages):
-    body = json.dumps({"model": "local", "messages": messages,
-                       "temperature": 0.2, "max_tokens": 2048}).encode()
+    body = json.dumps({"model": args.model, "messages": messages,
+                       "temperature": 0.3, "max_tokens": max(1024, min(6144, args.max_tokens))}).encode()
     req = urllib.request.Request(args.llm.rstrip("/") + "/v1/chat/completions", data=body,
                                  headers={"Content-Type": "application/json",
                                           **({"Authorization": "Bearer " + os.environ["PB_MODEL3D_LLM_KEY"]}
@@ -245,6 +357,8 @@ def chat(messages):
 
 def frame_camera():
     """Camera + light that frame every mesh, so each commit gets a comparable preview."""
+    if getattr(bpy.context.scene.camera, "name", None) == "pb_artist_camera":
+        return
     meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
     if not meshes:
         return
@@ -330,11 +444,81 @@ FENCE = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.S)
 # is stripped before the code runs, and ends the build once that step's code has run cleanly.
 DONE_LINE = re.compile(r"^[ \t]*DONE\.?[ \t]*$", re.M)
 last_err = ""
+plan, checks = None, []
 RERUN_HINT = ("\nThat block stopped at the error: nothing after that line ran, so any variable it would have set "
               "later (loop counters like i, lists, positions) does not exist. Send the WHOLE corrected block "
               "again, not just the fix; parts with the same name are replaced, not duplicated.")
 try:
-    for step in range(args.max_steps):
+    if args.staged:
+        plan_reply = chat_live([{"role": "system", "content": PLAN_SYSTEM},
+                                {"role": "user", "content": args.prompt}]).get("content") or ""
+        plan = parse_plan(plan_reply, args.prompt)
+        print("PBSTEP plan", json.dumps(plan["requirements"]), flush=True)
+        world()
+        for requirement in plan["requirements"]:
+            for attempt in range(3):
+                if step >= args.max_steps:
+                    raise RuntimeError("Scene build budget ended before all requirements were verified")
+                before = {getattr(obj, "session_uid", obj.as_pointer()) for obj in bpy.context.scene.objects}
+                instruction = ("Full request: " + args.prompt + "\nPlan: " + json.dumps(plan["requirements"])
+                               + "\nComposition: " + plan["composition"] + "\nCurrent scene: " + scene_info()
+                               + "\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
+                               + "\nBuild ONLY this requirement now: " + json.dumps(requirement)
+                               + "\nUse enough actual mesh parts to make it recognisable."
+                               + ("\nPrevious failure: " + last_err + RERUN_HINT if attempt else ""))
+                text = chat_live([{"role": "system", "content": BUILD_SYSTEM},
+                                  {"role": "user", "content": instruction}]).get("content") or ""
+                blocks = FENCE.findall(text)
+                if not blocks:
+                    last_err = "No executable Blender code was returned for " + requirement["id"]
+                for code in blocks:
+                    code = DONE_LINE.sub("", code)
+                    ok, res = run_code(code)
+                    bpy.context.view_layer.update()
+                    for obj in bpy.context.scene.objects:
+                        if obj.type == "MESH" and (getattr(obj, "session_uid", obj.as_pointer()) not in before
+                                                  or obj.get("pb_requirement") == requirement["id"]):
+                            obj["pb_requirement"] = requirement["id"]
+                    log.append({"step": step, "requirement": requirement["id"], "ok": ok, "result": res[:500]})
+                    print("PBSTEP", step, requirement["id"], "ok" if ok else "ERR", res[:300], flush=True)
+                    if ok:
+                        diff.append(code)
+                        _snap["dirty"] = True
+                    else:
+                        last_err = res
+                step += 1
+                checks = evidence(scene_objects(), plan["requirements"])
+                current = next(c for c in checks if c["id"] == requirement["id"])
+                if blocks and all(item.get("ok") for item in log if item.get("step") == step - 1) and current["complete"]:
+                    snapshot()
+                    last_err = ""
+                    break
+                last_err = last_err or f"Only {current['parts']} parts exist; build at least {current['minimum']} detailed parts"
+            else:
+                raise RuntimeError("Incomplete scene requirement " + requirement["id"] + ": " + last_err)
+        # Composition is an explicit final pass, after all subjects exist. It must not delete them.
+        text = chat_live([{"role": "system", "content": BUILD_SYSTEM}, {"role": "user", "content":
+            "Full request: " + args.prompt + "\nExisting verified scene: " + scene_info()
+            + "\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
+            + "\nSet the final camera, PBR materials, lights and world for this composition: " + plan["composition"]
+            + "\nKeep all existing mesh objects. Use camera(location,target,lens=24) to frame the main subjects."
+            + " Return a Python code block; do not change render settings."}]).get("content") or ""
+        composition_blocks = FENCE.findall(text)
+        if not composition_blocks:
+            raise RuntimeError("The local model did not finish the scene composition")
+        for code in composition_blocks:
+            ok, res = run_code(DONE_LINE.sub("", code))
+            if not ok:
+                raise RuntimeError("Scene composition failed: " + res)
+            diff.append(code)
+        bpy.context.view_layer.update()
+        checks = evidence(scene_objects(), plan["requirements"])
+        if not all(c["complete"] for c in checks):
+            raise RuntimeError("Composition removed required scene geometry")
+        if getattr(bpy.context.scene.camera, "name", None) != "pb_artist_camera":
+            raise RuntimeError("The scene has no deliberate composition camera")
+        summary = "All planned scene components built; artistic quality awaits buyer review"
+    for step in range(0 if args.staged else args.max_steps):
         # The system prompt, the request and only the LATEST exchange: the whole history (every code
         # block plus a scene dump per step) overflowed the 8k context on a long prompt (commit #26).
         text = chat_live(messages[:2] + messages[2:][-2:]).get("content") or ""
@@ -384,13 +568,26 @@ has_mesh = any(o.type == "MESH" for o in bpy.context.scene.objects)
 sc = bpy.context.scene
 sc.render.engine = "CYCLES"
 sc.cycles.device = "CPU"
-sc.cycles.samples = 24
-sc.render.resolution_x, sc.render.resolution_y, sc.render.resolution_percentage = 640, 480, 100
+if args.gpu_render:
+    try:
+        preferences = bpy.context.preferences.addons["cycles"].preferences
+        preferences.compute_device_type = "CUDA"
+        preferences.get_devices()
+        cuda_devices = [device for device in preferences.devices if device.type == "CUDA"]
+        for device in preferences.devices:
+            device.use = device.type == "CUDA"
+        if cuda_devices:
+            sc.cycles.device = "GPU"
+    except Exception as exc:
+        log.append({"gpu_render_unavailable": type(exc).__name__})
+sc.cycles.samples = 48 if args.staged else 24
+sc.cycles.use_denoising = True
+sc.render.resolution_x, sc.render.resolution_y, sc.render.resolution_percentage = ((1280, 720, 100) if args.staged else (640, 480, 100))
 if sc.world is None:
     sc.world = bpy.data.worlds.new("pb_world")
 sc.world.use_nodes = True
 bg = sc.world.node_tree.nodes.get("Background")
-if bg:
+if bg and not args.staged:
     bg.inputs[0].default_value = (0.05, 0.06, 0.08, 1)
 sc.render.filepath = os.path.join(args.out, "preview.png")
 if has_mesh:
@@ -400,10 +597,30 @@ try:
     bpy.ops.export_scene.gltf(filepath=os.path.join(args.out, "scene.glb"), export_format="GLB")
 except Exception as e:  # noqa: BLE001
     log.append({"export_error": str(e)[:300]})
+    if args.staged:
+        error = "The completed scene could not be exported to the 3D viewer: " + str(e)[:200]
+if args.staged and not os.path.isfile(os.path.join(args.out, "scene.glb")):
+    error = error or "The scene has no exported GLB for the 3D viewer"
 with open(os.path.join(args.out, "diff.py"), "w") as f:
     f.write(f"# prompt: {args.prompt}\n\n" + "\n\n# ---\n".join(diff) + "\n")
+viewer = None
+if args.staged and getattr(sc.camera, "name", None) == "pb_artist_camera":
+    target = mathutils.Vector(sc.camera.get("pb_target", (0, 0, 0)))
+    offset = sc.camera.location - target
+    radius = offset.length
+    if radius > .01:
+        # Blender resolves AUTO/HORIZONTAL/VERTICAL sensor fit and pixel aspect for this scene.
+        frame = sc.camera.data.view_frame(scene=sc)
+        vertical_fov = 2 * math.atan((max(v.y for v in frame) - min(v.y for v in frame))
+                                     / (2 * abs(frame[0].z)))
+        # Blender is Z-up; glTF/model-viewer are Y-up: (x,y,z) -> (x,z,-y).
+        viewer = {"target": [float(target.x), float(target.z), float(-target.y)],
+                  "orbit": [math.degrees(math.atan2(offset.x, -offset.y)),
+                            math.degrees(math.acos(max(-1, min(1, offset.z / radius)))), radius],
+                  "fov": math.degrees(vertical_fov)}
 with open(os.path.join(args.out, "commit.json"), "w") as f:
-    json.dump({"prompt": args.prompt, "ok": bool(diff), "error": error, "summary": summary, "steps": log,
+    json.dump({"prompt": args.prompt, "ok": bool(diff) and (not args.staged or not error), "error": error, "summary": summary, "steps": log,
+               "model": args.model, "plan": plan, "requirements": checks, "viewer": viewer,
                "seconds": round(time.time() - t0, 1), "objects": scene_objects()}, f, indent=1)
-print("PBCOMMIT", json.dumps({"ok": bool(diff), "error": error, "summary": summary,
+print("PBCOMMIT", json.dumps({"ok": bool(diff) and (not args.staged or not error), "error": error, "summary": summary,
                               "seconds": round(time.time() - t0, 1)}))

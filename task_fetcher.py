@@ -371,6 +371,8 @@ def heartbeat_loop():
                 template_storage.set_keep_warm(_body.get("keep_warm_images"))
                 template_storage.set_cache_gb(_body.get("image_cache_gb"))   # owner's size; None = automatic
                 template_storage.warm(idle=not _body.get("pause_template_probes") and not _rental_live())
+                _MODEL3D_CACHE.warm(_body.get("model3d_prefetch"),
+                    idle=lambda: not _JOB_RUNNING.is_set() and not _rental_live() and _selling_now())
                 _note_gateways(_body.get("gateways"))
                 _note_egress_gateway(_body.get("egress_gateway"))
                 _note_agent_update(_body)       # server-requested signed self-update (job_loop)
@@ -2328,7 +2330,8 @@ def _render_capabilities():
         gpu_count = 1 if gpu_runtime.has_gpu() else 0
     # model3d: Create 3D jobs (LLM on the GPU + Blender). Needs docker + an NVIDIA GPU.
     return {"blender": True, "render_engines": engines, "headless_eevee": bool(eevee),
-            "model3d": 1 if v == "nvidia" else 0,
+            "model3d": 2 if v == "nvidia" else 0,  # staged scene builder and camera-aware artifacts
+            "model3d_cache": _MODEL3D_CACHE.report(),
             "gpu_count": gpu_count, "gpu_vendor": v, "blender_version": _EEVEE["blender_version"],
             "eevee_error": _EEVEE["error"], **_nvidia_stack()}
 
@@ -4080,6 +4083,8 @@ def _run_render(task):
 # live/latest.jpg at most every 10 s; this node uploads it on the same cadence as `live.jpg`, so the
 # buyer watches the object take shape without a remote desktop.
 MODEL3D_DIR = os.getenv("PETABYTE_MODEL3D_DIR", "/var/lib/petabyte-agent/model3d")
+from model3d_cache import ModelCache
+_MODEL3D_CACHE = ModelCache(MODEL3D_DIR)
 MODEL3D_FILES = ("preview.png", "scene.glb", "scene.blend", "diff.py", "commit.json")
 
 
@@ -4114,6 +4119,7 @@ def _model3d_live_uploader(tid, live, stop):
 
 def _run_model3d(task):
     tid = task["task_id"]
+    started = time.monotonic()
     _set_ui(status="running", task=f"Create 3D #{tid}")
     import shutil, tempfile, uuid as _uuid, pathlib
     work = tempfile.mkdtemp(prefix=f"model3d-{tid}-")
@@ -4126,13 +4132,21 @@ def _run_model3d(task):
     stop = threading.Event()
     proxy = None
     shared = bool(task.get("shared_pool_worker"))
+    remote_llm = task.get("llm_remote") is True
     try:
         report_progress(tid, 5, "preparing the 3D model builder")
         endpoint = inference_worker.controller.endpoint_for_3d(task) if shared else None
         if shared and not endpoint:
             raise RuntimeError("the shared coder is no longer available; retry the build")
-        if not shared:
-            model = inference_worker.fetch_model(task["model"], root=pathlib.Path(MODEL3D_DIR), evict=False)
+        if not shared and not remote_llm:
+            if task.get("llm_cached_required"):
+                model = _MODEL3D_CACHE.cached(task["model"])
+                if model is None:
+                    raise RuntimeError("the local coder is still preparing; retry when the GPU is ready")
+                if int(task.get("max_runtime_s") or 0) < 900:
+                    raise RuntimeError("the reservation has less than 15 minutes left for a complete scene")
+            else:
+                model = inference_worker.fetch_model(task["model"], root=pathlib.Path(MODEL3D_DIR), evict=False)
             template_storage.prepare(task["llm_image"], tid, timeout=1800)
             llm_image = template_storage.local(task["llm_image"])
         template_storage.prepare(task["image"], tid, timeout=1800)
@@ -4148,13 +4162,22 @@ def _run_model3d(task):
                        capture_output=True, timeout=30)
         label = ["--label", f"{TASK_LABEL}={tid}"]
         bridge, llm_url = [], "http://llm:8080"
-        if shared:
+        if shared or remote_llm:
             from shared_inference import Model3DProxy
             r = subprocess.run(["docker", "network", "inspect", net], capture_output=True, text=True,
                                check=True, timeout=30)
             gateway = json.loads(r.stdout)[0]["IPAM"]["Config"][0]["Gateway"]
+            def relay(payload):
+                return httpx.post(API_URL + "/jobs/model3d/chat", headers=HEADERS, trust_env=False,
+                                  timeout=min(610, int(task.get("max_runtime_s") or 610)),
+                                  json=_lease_payload({"task_id": tid, "messages": payload["messages"],
+                                                       "max_tokens": min(4096, payload["max_tokens"])}))
             proxy = Model3DProxy(gateway, endpoint,
-                                 active=lambda: inference_worker.controller.endpoint_for_3d(task) == endpoint)
+                                 active=(lambda: tid not in _KILLED and not stop.is_set()) if remote_llm
+                                 else lambda: inference_worker.controller.endpoint_for_3d(task) == endpoint,
+                                 forward=relay if remote_llm else None,
+                                 max_tokens=min(4096, int(task.get("llm_max_tokens") or 3072)),
+                                 max_chars=90000, max_calls=24)
             bridge = ["--add-host", f"llm:{gateway}", "-e", f"PB_MODEL3D_LLM_KEY={proxy.key}"]
             llm_url = f"http://llm:{proxy.port}"
         else:
@@ -4162,10 +4185,15 @@ def _run_model3d(task):
                 ["docker", "run", "-d", "--rm", "--pull=never", "--name", llm, "--network", net,
                  "--network-alias", "llm", *label, *gpu_runtime.docker_gpu_args(),
                  "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=256",
+                 "--memory", str(task.get("llm_memory") or "8g"),
+                 "--memory-swap", str(task.get("llm_memory") or "8g"),
+                 "--cpus", "4",
                  "--user=65534:65534", "-e", "HOME=/tmp", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
                  "--log-opt=max-size=1m", "--mount", f"type=bind,src={model},dst=/models/model.gguf,readonly",
                  llm_image, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
-                 "-c", "8192", "--fit", "on", "--fit-target", "256"],
+                 "-c", str(task.get("llm_context") or 16384), "--parallel", "1",
+                 "--fit", "on", "--fit-target", "768",
+                 "--flash-attn", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0"],
                 capture_output=True, text=True, timeout=60)
             if r.returncode:
                 raise RuntimeError(f"the local LLM did not start: {r.stderr.strip()[:200]}")
@@ -4173,15 +4201,24 @@ def _run_model3d(task):
         threading.Thread(target=_model3d_live_uploader, args=(tid, os.path.join(out, "live", "latest.jpg"), stop),
                          daemon=True, name="pb-model3d-live").start()
         driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model3d_driver.py")
-        limits = {**task, "cpus": 2, "memory": "2g"} if shared else task
+        limits = {**task, "cpus": 2, "memory": "2g" if shared else task.get("builder_memory") or "4g"}
+        scene_tools = os.path.join(os.path.dirname(driver), "model3d_scene.py")
         cmd = ["docker", "run", "--rm", "--network", net, *bridge, *_isolation_flags(limits),
-               "-v", f"{driver}:/driver.py:ro", *base, "-v", f"{out}:/out",
+               *(gpu_runtime.docker_gpu_args() if remote_llm and not shared else []),
+               "-v", f"{driver}:/driver.py:ro", "-v", f"{scene_tools}:/model3d_scene.py:ro", *base, "-v", f"{out}:/out",
                "--entrypoint", "blender", image, "-b", *(["/base.blend"] if base else []),
                # Without this Blender exits 0 when the script raises, and the crash read as "no commit".
                "--python-exit-code", "1",
                "--python", "/driver.py", "--", "--prompt", str(task.get("prompt", ""))[:2000],
-                "--out", "/out", "--llm", llm_url, *([] if base else ["--fresh"])]
+                "--out", "/out", "--llm", llm_url, "--staged", "--max-steps", "18",
+                "--model", str((task.get("model") or {}).get("model") or "local"),
+                "--max-tokens", str(task.get("llm_max_tokens") or 3072),
+                *(["--gpu-render"] if remote_llm and not shared else []), *([] if base else ["--fresh"])]
         _rt = task.get("max_runtime_s")
+        if _rt:
+            _rt = int(_rt) - int(time.monotonic() - started)
+            if _rt < (900 if task.get("llm_cached_required") else 1):
+                raise RuntimeError("the reservation has too little time left after preparing the builder")
         try:
             res = _run_docker(cmd, timeout=(int(_rt) if _rt else None), capture_output=True, text=True)
             # only the driver's own lines: Blender's render output after them pushed the steps out of a
@@ -4227,7 +4264,7 @@ def _run_model3d(task):
         stop.set()
         if proxy:
             proxy.close()
-        if not shared:
+        if not shared and not remote_llm:
             subprocess.run(["docker", "rm", "-f", llm], capture_output=True, timeout=30, check=False)
         subprocess.run(["docker", "network", "rm", net], capture_output=True, timeout=30, check=False)
         shutil.rmtree(work, ignore_errors=True)
