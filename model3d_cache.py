@@ -13,10 +13,27 @@ class ModelCache:
         self.running = False
         self.retry_at = 0
         self.ready = {}
+        self.pin = None
+        self.error = None
 
     def report(self):
         with self.lock:
             return self.report_unlocked()
+
+    def status(self):
+        """Public model identity and byte counts only; never paths, URLs or exception text."""
+        with self.lock:
+            if not self.pin:
+                return None
+            sha, size = self.pin['sha256'], self.pin['size']
+            ready = sha in self.report_unlocked()
+            try:
+                downloaded = size if ready else min(size, (self.root / (sha + '.part')).stat().st_size)
+            except OSError:
+                downloaded = 0
+            return {'sha256': sha, 'size': size, 'downloaded': downloaded,
+                    'state': 'ready' if ready else 'preparing' if self.running else 'error' if self.error else 'paused',
+                    'error': self.error}
 
     def cached(self, pin):
         import inference_worker
@@ -33,6 +50,8 @@ class ModelCache:
             if self.running or time.monotonic() < self.retry_at or pin["sha256"] in self.report_unlocked():
                 return
             self.running = True
+            self.pin = {'sha256': pin['sha256'], 'size': pin['size']}
+            self.error = None
 
         def prepare():
             import inference_worker
@@ -43,8 +62,14 @@ class ModelCache:
             except inference_worker.Cancelled:
                 pass
             except Exception as exc:  # optional preparation never breaks heartbeat liveness
-                logging.warning("Create 3D model preparation paused: %s", type(exc).__name__)
+                reason = str(exc)
+                error = ('insufficient_disk' if reason.startswith('not enough free disk') else
+                         'download_failed' if reason.startswith('model download failed') else
+                         'checksum_failed' if reason.startswith('inference model failed its hash check') else
+                         'preparation_failed')
+                logging.warning("Create 3D model preparation paused: %s", error)
                 with self.lock:
+                    self.error = error
                     self.retry_at = time.monotonic() + 300
             finally:
                 with self.lock:

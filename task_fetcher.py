@@ -372,7 +372,7 @@ def heartbeat_loop():
                 template_storage.set_cache_gb(_body.get("image_cache_gb"))   # owner's size; None = automatic
                 template_storage.warm(idle=not _body.get("pause_template_probes") and not _rental_live())
                 _MODEL3D_CACHE.warm(_body.get("model3d_prefetch"),
-                    idle=lambda: not _JOB_RUNNING.is_set() and not _rental_live() and _selling_now())
+                    idle=_model3d_prefetch_idle)
                 _note_gateways(_body.get("gateways"))
                 _note_egress_gateway(_body.get("egress_gateway"))
                 _note_agent_update(_body)       # server-requested signed self-update (job_loop)
@@ -2332,6 +2332,7 @@ def _render_capabilities():
     return {"blender": True, "render_engines": engines, "headless_eevee": bool(eevee),
             "model3d": 2 if v == "nvidia" else 0,  # staged scene builder and camera-aware artifacts
             "model3d_cache": _MODEL3D_CACHE.report(),
+            "model3d_preparation": _MODEL3D_CACHE.status(),
             "gpu_count": gpu_count, "gpu_vendor": v, "blender_version": _EEVEE["blender_version"],
             "eevee_error": _EEVEE["error"], **_nvidia_stack()}
 
@@ -4086,6 +4087,13 @@ MODEL3D_DIR = os.getenv("PETABYTE_MODEL3D_DIR", "/var/lib/petabyte-agent/model3d
 from model3d_cache import ModelCache
 _MODEL3D_CACHE = ModelCache(MODEL3D_DIR)
 MODEL3D_FILES = ("preview.png", "scene.glb", "scene.blend", "diff.py", "commit.json")
+
+
+def _model3d_prefetch_idle():
+    # _JOB_RUNNING also covers every empty /jobs/next poll. Cancelling an 18 GB
+    # download on those polls repeatedly rehashes the partial file. The actual
+    # task marker is set as soon as a job is claimed, before its preparation.
+    return _CURRENT_TASK['id'] is None and not _rental_live() and _selling_now()
 
 
 def _model3d_reason(output, default):

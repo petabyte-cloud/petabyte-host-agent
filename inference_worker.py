@@ -223,6 +223,8 @@ def _fetch_model(p, cancelled=lambda: False, keep=(), root=None, evict=True):
     if have:
         with open(part, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
+                if cancelled():
+                    raise Cancelled()
                 h.update(chunk)
     errors = []
     for base in HF_SOURCES:
