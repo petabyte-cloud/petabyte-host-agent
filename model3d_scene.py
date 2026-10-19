@@ -33,6 +33,8 @@ beam(name,start,end,radius,color) creates a cylinder joining two 3D points.
 ellipsoid(name,size,location,color,rotation=(0,0,0)) uses full dimensions.
 material(name,color,metallic=0,roughness=0.5,emission=None,strength=1) returns a PBR material.
 assign(obj,mat) assigns a material. Mesh helpers return the new object.
+Helper/import names are reserved: never assign to box, terrain, material, camera, random, etc.
+Use names like terrain_obj, ground_mat and scene_camera for their returned objects/materials.
 terrain(name,size=40,resolution=80,height=2,seed=1,color=(.4,.15,.07)) creates displaced rocky ground.
 camera(location,target,lens=24) sets the final artistic camera. light(name,location,color,energy,size=5)
 adds an area light. world(color,strength=.3) sets ambient light. remove(name) removes a part.

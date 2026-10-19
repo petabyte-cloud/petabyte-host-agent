@@ -22,6 +22,8 @@ ap.add_argument("--llm", default="http://llm:8080")
 ap.add_argument("--max-steps", type=int, default=4)
 ap.add_argument("--staged", action="store_true", help="plan and verify every requested scene component")
 ap.add_argument("--max-tokens", type=int, default=3072)
+ap.add_argument("--context", type=int, default=16384)
+ap.add_argument("--render-size", choices=("720p", "1080p"), default="720p")
 ap.add_argument("--model", default="local")
 ap.add_argument("--gpu-render", action="store_true")
 ap.add_argument("--fresh", action="store_true", help="start from an empty scene")
@@ -322,15 +324,15 @@ def scene_info(limit=SCENE_MAX_CHARS):
 def run_code(code):
     import io, contextlib
     buf = io.StringIO()
-    import bmesh
+    import bmesh, random
     ns = NS
-    if not ns:
-        import random
-        # `random` preloaded: Qwen scatters rocks/trees with it and forgets the import (commit #41).
-        ns.update(bpy=bpy, bmesh=bmesh, mathutils=mathutils, math=math, random=random, Vector=mathutils.Vector,
-                  box=box, cylinder=cylinder, cone=cone, sphere=sphere, torus=torus, remove=remove,
-                  beam=beam, ellipsoid=ellipsoid, terrain=terrain, material=material, assign=assign,
-                  camera=camera, light=light, world=world)
+    # Keep model variables, but never inherit a poisoned helper/import binding from an earlier
+    # block (e.g. terrain = terrain(...)). Commit52 repeated 'Object is not callable' on repair.
+    bindings = dict(bpy=bpy, bmesh=bmesh, mathutils=mathutils, math=math, random=random, Vector=mathutils.Vector,
+                    box=box, cylinder=cylinder, cone=cone, sphere=sphere, torus=torus, remove=remove,
+                    beam=beam, ellipsoid=ellipsoid, terrain=terrain, material=material, assign=assign,
+                    camera=camera, light=light, world=world)
+    ns.update(bindings)
     try:
         with contextlib.redirect_stdout(buf):
             exec(compile(code, "<llm>", "exec"), ns)
@@ -341,7 +343,38 @@ def run_code(code):
         frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == "<llm>"]
         line = frames[-1].lineno if frames else getattr(e, "lineno", None)
         msg = " ".join(f"{type(e).__name__}: {e}".split())
-        return False, (buf.getvalue()[-500:] + (f"line {line} of your code: " if line else "") + msg)[-2000:]
+        source = code.splitlines()
+        failing = (f" Code: {source[line - 1].strip()[:200]}" if line and 0 < line <= len(source) else "")
+        rebound = [name for name, value in bindings.items() if ns.get(name) is not value]
+        hint = (" Reserved helper/import names were overwritten: " + ", ".join(rebound)
+                + ". Rename object/material variables with _obj or _mat; keep helper names callable."
+                if rebound else "")
+        return False, (buf.getvalue()[-500:] + (f"line {line} of your code: " if line else "")
+                       + msg + failing + hint)[-2000:]
+    finally:
+        ns.update(bindings)
+
+
+def fits_context(messages):
+    """Conservative byte-token bound for the pinned Qwen byte-fallback tokenizers.
+
+    Reserve chat-template framing and the requested completion as well as every message's
+    UTF-8 bytes. Optional repair history is kept whole or omitted, never cut inside code.
+    """
+    prompt_bound = 256 + sum(64 + len(message["content"].encode("utf-8")) for message in messages)
+    return prompt_bound + max(1024, min(6144, args.max_tokens)) <= args.context
+
+
+def scene_messages(prefix, suffix, failure=None):
+    """Keep full art direction and assembly bounds; reduce optional object detail to fit."""
+    for limit in (SCENE_MAX_CHARS, 3000, 1000, 0):
+        messages = [{"role": "system", "content": BUILD_SYSTEM},
+                    {"role": "user", "content": prefix + "\nCurrent scene: " + scene_info(limit) + suffix}]
+        if failure is not None:
+            messages.append(failure)
+        if fits_context(messages):
+            return messages
+    return messages  # chat_live reports the mandatory instruction's explicit budget failure.
 
 
 def chat(messages):
@@ -417,6 +450,10 @@ def chat_live(messages):
     """The LLM call runs in a thread; the main thread (the only one allowed to touch bpy) keeps
     taking snapshots on the 10 s cadence while it waits."""
     import threading
+    if not fits_context(messages):
+        size = sum(len(message["content"].encode("utf-8")) for message in messages)
+        raise RuntimeError(f"Model context exceeded: {size} UTF-8 prompt bytes plus framing and "
+                           f"completion do not fit the configured {args.context} token context")
     box = {}
 
     def work():
@@ -456,21 +493,32 @@ try:
         print("PBSTEP plan", json.dumps(plan["requirements"]), flush=True)
         world()
         for requirement in plan["requirements"]:
+            previous_attempt = None
             for attempt in range(3):
                 if step >= args.max_steps:
                     raise RuntimeError("Scene build budget ended before all requirements were verified")
                 before = {getattr(obj, "session_uid", obj.as_pointer()) for obj in bpy.context.scene.objects}
-                instruction = ("Full request: " + args.prompt + "\nPlan: " + json.dumps(plan["requirements"])
-                               + "\nComposition: " + plan["composition"] + "\nCurrent scene: " + scene_info()
-                               + "\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
-                               + "\nBuild ONLY this requirement now: " + json.dumps(requirement)
-                               + "\nUse enough actual mesh parts to make it recognisable."
-                               + ("\nPrevious failure: " + last_err + RERUN_HINT if attempt else ""))
-                text = chat_live([{"role": "system", "content": BUILD_SYSTEM},
-                                  {"role": "user", "content": instruction}]).get("content") or ""
+                prefix = ("Full request: " + args.prompt + "\nPlan: " + json.dumps(plan["requirements"])
+                          + "\nComposition: " + plan["composition"])
+                suffix = ("\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
+                          + "\nBuild ONLY this requirement now: " + json.dumps(requirement)
+                          + "\nUse enough actual mesh parts to make it recognisable.")
+                failure = ({"role": "user", "content": "Previous failure: " + last_err + RERUN_HINT}
+                           if previous_attempt is not None else None)
+                build_messages = scene_messages(prefix, suffix, failure)
+                if previous_attempt is not None:
+                    retry = [*build_messages[:-1], {"role": "assistant", "content": previous_attempt}, failure]
+                    # The instruction/scene, full failure and next completion take priority over
+                    # optional history. An oversized response must not break the next repair.
+                    build_messages = retry if fits_context(retry) else build_messages
+                text = chat_live(build_messages).get("content") or ""
+                previous_attempt = text
                 blocks = FENCE.findall(text)
+                last_err = ""
                 if not blocks:
                     last_err = "No executable Blender code was returned for " + requirement["id"]
+                    log.append({"step": step, "requirement": requirement["id"], "ok": False,
+                                "result": last_err, "response": text[:8000]})
                 for code in blocks:
                     code = DONE_LINE.sub("", code)
                     ok, res = run_code(code)
@@ -479,7 +527,7 @@ try:
                         if obj.type == "MESH" and (getattr(obj, "session_uid", obj.as_pointer()) not in before
                                                   or obj.get("pb_requirement") == requirement["id"]):
                             obj["pb_requirement"] = requirement["id"]
-                    log.append({"step": step, "requirement": requirement["id"], "ok": ok, "result": res[:500]})
+                    log.append({"step": step, "requirement": requirement["id"], "ok": ok, "result": res[:2000], "code": code})
                     print("PBSTEP", step, requirement["id"], "ok" if ok else "ERR", res[:300], flush=True)
                     if ok:
                         diff.append(code)
@@ -493,16 +541,17 @@ try:
                     snapshot()
                     last_err = ""
                     break
-                last_err = last_err or f"Only {current['parts']} parts exist; build at least {current['minimum']} detailed parts"
+                if blocks and not current["complete"]:
+                    missing = f"Only {current['parts']} parts exist; build at least {current['minimum']} detailed parts"
+                    last_err = missing + ("\nExecution failure in this attempt: " + last_err if last_err else "")
             else:
                 raise RuntimeError("Incomplete scene requirement " + requirement["id"] + ": " + last_err)
         # Composition is an explicit final pass, after all subjects exist. It must not delete them.
-        text = chat_live([{"role": "system", "content": BUILD_SYSTEM}, {"role": "user", "content":
-            "Full request: " + args.prompt + "\nExisting verified scene: " + scene_info()
-            + "\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
+        text = chat_live(scene_messages("Full request: " + args.prompt,
+            "\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
             + "\nSet the final camera, PBR materials, lights and world for this composition: " + plan["composition"]
             + "\nKeep all existing mesh objects. Use camera(location,target,lens=24) to frame the main subjects."
-            + " Return a Python code block; do not change render settings."}]).get("content") or ""
+            + " Return a Python code block; do not change render settings.")).get("content") or ""
         composition_blocks = FENCE.findall(text)
         if not composition_blocks:
             raise RuntimeError("The local model did not finish the scene composition")
@@ -582,7 +631,8 @@ if args.gpu_render:
         log.append({"gpu_render_unavailable": type(exc).__name__})
 sc.cycles.samples = 48 if args.staged else 24
 sc.cycles.use_denoising = True
-sc.render.resolution_x, sc.render.resolution_y, sc.render.resolution_percentage = ((1280, 720, 100) if args.staged else (640, 480, 100))
+size = (1920, 1080, 100) if args.render_size == "1080p" else ((1280, 720, 100) if args.staged else (640, 480, 100))
+sc.render.resolution_x, sc.render.resolution_y, sc.render.resolution_percentage = size
 if sc.world is None:
     sc.world = bpy.data.worlds.new("pb_world")
 sc.world.use_nodes = True
@@ -621,6 +671,7 @@ if args.staged and getattr(sc.camera, "name", None) == "pb_artist_camera":
 with open(os.path.join(args.out, "commit.json"), "w") as f:
     json.dump({"prompt": args.prompt, "ok": bool(diff) and (not args.staged or not error), "error": error, "summary": summary, "steps": log,
                "model": args.model, "plan": plan, "requirements": checks, "viewer": viewer,
+               "render_size": f"{size[1]}p", "resolution": list(size[:2]),
                "seconds": round(time.time() - t0, 1), "objects": scene_objects()}, f, indent=1)
 print("PBCOMMIT", json.dumps({"ok": bool(diff) and (not args.staged or not error), "error": error, "summary": summary,
                               "seconds": round(time.time() - t0, 1)}))

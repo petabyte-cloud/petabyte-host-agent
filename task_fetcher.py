@@ -2330,7 +2330,7 @@ def _render_capabilities():
         gpu_count = 1 if gpu_runtime.has_gpu() else 0
     # model3d: Create 3D jobs (LLM on the GPU + Blender). Needs docker + an NVIDIA GPU.
     return {"blender": True, "render_engines": engines, "headless_eevee": bool(eevee),
-            "model3d": 2 if v == "nvidia" else 0,  # staged scene builder and camera-aware artifacts
+            "model3d": 3 if v == "nvidia" else 0,  # full art-direction prompts and optional 1080p output
             "model3d_cache": _MODEL3D_CACHE.report(),
             "model3d_preparation": _MODEL3D_CACHE.status(),
             "gpu_count": gpu_count, "gpu_vendor": v, "blender_version": _EEVEE["blender_version"],
@@ -4154,6 +4154,9 @@ def _run_model3d(task):
     shared = bool(task.get("shared_pool_worker"))
     remote_llm = task.get("llm_remote") is True
     try:
+        context = int(task.get("llm_context", 16384))
+        if context <= 0:
+            raise RuntimeError("the local coder context must be a positive token count")
         report_progress(tid, 5, "preparing the 3D model builder")
         endpoint = inference_worker.controller.endpoint_for_3d(task) if shared else None
         if shared and not endpoint:
@@ -4211,7 +4214,7 @@ def _run_model3d(task):
                  "--user=65534:65534", "-e", "HOME=/tmp", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
                  "--log-opt=max-size=1m", "--mount", f"type=bind,src={model},dst=/models/model.gguf,readonly",
                  llm_image, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
-                 "-c", str(task.get("llm_context") or 16384), "--parallel", "1",
+                 "-c", str(context), "--parallel", "1",
                  "--fit", "on", "--fit-target", "768",
                  "--flash-attn", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0"],
                 capture_output=True, text=True, timeout=60)
@@ -4229,10 +4232,12 @@ def _run_model3d(task):
                "--entrypoint", "blender", image, "-b", *(["/base.blend"] if base else []),
                # Without this Blender exits 0 when the script raises, and the crash read as "no commit".
                "--python-exit-code", "1",
-               "--python", "/driver.py", "--", "--prompt", str(task.get("prompt", ""))[:2000],
+               "--python", "/driver.py", "--", "--prompt", str(task.get("prompt", "")),
                 "--out", "/out", "--llm", llm_url, "--staged", "--max-steps", "18",
                 "--model", str((task.get("model") or {}).get("model") or "local"),
                 "--max-tokens", str(task.get("llm_max_tokens") or 3072),
+                "--context", str(context),
+                "--render-size", str(task.get("render_size") or "720p"),
                 *(["--gpu-render"] if remote_llm and not shared else []), *([] if base else ["--fresh"])]
         _rt = task.get("max_runtime_s")
         if _rt:
