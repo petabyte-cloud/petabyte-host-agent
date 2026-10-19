@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import httpx
+from model3d_scene import sampling_options
 
 WORKER_RE = re.compile(r"inf-[0-9a-f]{16}\Z")
 GPU_RE = re.compile(r"GPU-[a-fA-F0-9-]+\Z")
@@ -231,7 +232,7 @@ class Model3DProxy:
     """Per-build authenticated chat-only bridge. The Blender container never gets the pool key,
     a GPU device, arbitrary upstream paths or the shared model server's management endpoints."""
     def __init__(self, gateway, endpoint=None, active=lambda: True, *, forward=None,
-                 max_tokens=2048, max_chars=24000, max_calls=8):
+                 max_tokens=2048, max_chars=24000, max_calls=8, model="local"):
         host = ipaddress.ip_address(gateway)
         if host.version != 4 or not host.is_private or host.is_loopback or host.is_link_local:
             raise ValueError("the private build network has no usable gateway")
@@ -241,6 +242,7 @@ class Model3DProxy:
         self.client = httpx.Client(trust_env=False, timeout=600)
         client = self.client
         key, quota, lock, closed = self.key, [max_calls], threading.Lock(), self.closed
+        sampling = sampling_options(model)
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -280,7 +282,7 @@ class Model3DProxy:
                 try:
                     payload = {"model": "local", "messages": [{"role": m["role"], "content": m["content"]}
                                                                for m in messages], "max_tokens": max_tokens,
-                               "temperature": 0.3, "stream": False}
+                               **sampling, "stream": False}
                     r = (forward(payload) if forward else client.post(target + "/v1/chat/completions",
                          headers={"Authorization": f"Bearer {upstream_key}"}, json=payload))
                     if len(r.content) > 512 * 1024:

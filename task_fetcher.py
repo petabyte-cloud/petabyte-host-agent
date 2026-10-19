@@ -315,6 +315,7 @@ def heartbeat_loop():
             _hb = {"spec_id": int(SPEC_ID), "hardware_evidence": hardware_evidence.collect(),
                    "selling_now": _advertise_selling_now(),  # JIT also waits for tunnel enrollment
                    "gpu_busy": _gpu_busy_report(),           # why it is not offered (busy-GPU guard)
+                   "gpu_driver": _gpu_driver_report(),       # ...or because its NVIDIA driver is down
                    "render_capabilities": _render_capabilities(),   # engines + headless_eevee (self-tested)
                    "remote_fixes": _fixes.enabled(),  # owner allowed signed support fixes
                    "driver_update": _driver_update_report()}   # last opt-in driver update attempt
@@ -2094,7 +2095,44 @@ def _advertise_selling_now():
     scheduled = _selling_now()
     return (scheduled and (not os.getenv("PROVIDER", "").startswith("pb-jit-")
                            or _reverse_tunnel_enabled()) and not _gpu_busy_elsewhere() and _wipe_ready()
-            and not _update_running())
+            and not _update_running() and not _nvidia_driver_problem())
+
+
+_DRIVER = {"at": float("-inf"), "why": None}
+
+
+def _nvidia_driver_problem(ttl=60):
+    """None while this NVIDIA host's driver answers (`nvidia-smi -L` lists a GPU), else nvidia-smi's
+    own reason. With the kernel module not loaded, nvidia-smi is still installed and the spec still
+    names its GPU, but every GPU container dies in the NVIDIA hook ("nvml error: driver not
+    loaded", prod spec 292, 2026-10-19), so the node must not be offered. Re-probed every `ttl` s,
+    so a repaired driver puts the node back on sale without an agent restart."""
+    import shutil
+    if gpu_runtime.vendor() != "nvidia" or not shutil.which("nvidia-smi"):
+        return None
+    now = time.monotonic()
+    if now - _DRIVER["at"] < ttl:
+        return _DRIVER["why"]
+    try:
+        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20)
+        lines = [ln.strip() for ln in f"{r.stdout}\n{r.stderr}".splitlines() if ln.strip()]
+        why = (None if r.returncode == 0 and any(ln.startswith("GPU ") for ln in lines)
+               else (" ".join(lines)[:300] or f"nvidia-smi exited {r.returncode}"))
+    except Exception as e:                               # noqa: BLE001 — a hung/missing tool is a broken driver
+        why = f"nvidia-smi did not answer ({type(e).__name__})"
+    if why != _DRIVER["why"]:
+        (logging.warning if why else logging.info)(
+            f"NVIDIA driver {'not working, GPU held off sale: ' + why if why else 'working again'}")
+    _DRIVER.update(at=now, why=why)
+    return why
+
+
+def _gpu_driver_report():
+    """Heartbeat field on NVIDIA hosts: {ok} or {ok: False, reason} (shown to the seller)."""
+    why = _nvidia_driver_problem()
+    if why:
+        return {"ok": False, "reason": why}
+    return {"ok": True} if gpu_runtime.vendor() == "nvidia" else None
 
 
 _WIPE_READY = {"ok": False}
@@ -4201,7 +4239,8 @@ def _run_model3d(task):
                                  else lambda: inference_worker.controller.endpoint_for_3d(task) == endpoint,
                                  forward=relay if remote_llm else None,
                                  max_tokens=min(4096, int(task.get("llm_max_tokens") or 3072)),
-                                 max_chars=90000, max_calls=24)
+                                 max_chars=90000, max_calls=24,
+                                 model=str((task.get("model") or {}).get("model") or "local"))
             bridge = ["--add-host", f"llm:{gateway}", "-e", f"PB_MODEL3D_LLM_KEY={proxy.key}"]
             llm_url = f"http://llm:{proxy.port}"
         else:

@@ -13,7 +13,8 @@ import bpy
 import mathutils
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model3d_scene import (PLAN_SYSTEM, BUILD_SYSTEM, parse_plan, evidence, assembly_summary,
-                           runtime_api_description, validate_render_settings, completion_blocks)
+                           runtime_api_description, validate_render_settings, completion_blocks,
+                           sampling_options)
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
@@ -389,7 +390,8 @@ def scene_messages(prefix, suffix, failure=None):
 
 def chat(messages):
     body = json.dumps({"model": args.model, "messages": messages,
-                       "temperature": 0.3, "max_tokens": max(1024, min(6144, args.max_tokens))}).encode()
+                       **sampling_options(args.model),
+                       "max_tokens": max(1024, min(6144, args.max_tokens))}).encode()
     req = urllib.request.Request(args.llm.rstrip("/") + "/v1/chat/completions", data=body,
                                  headers={"Content-Type": "application/json",
                                           **({"Authorization": "Bearer " + os.environ["PB_MODEL3D_LLM_KEY"]}

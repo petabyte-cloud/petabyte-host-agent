@@ -92,6 +92,12 @@ def detect():
             if len(group) < len(rows):
                 print(f"Mixed GPUs detected ({', '.join(names)}); listing only the "
                       f"{gpu_count}x {gpu_model} this host can honestly offer.")
+        else:
+            import shutil
+            if shutil.which("nvidia-smi"):
+                print("!! nvidia-smi is installed but cannot reach the NVIDIA driver (is its kernel module "
+                      "loaded? run `nvidia-smi`): this node registers WITHOUT a GPU, and the agent keeps it "
+                      "off sale until `nvidia-smi` lists the GPU. Fix the driver, reboot, and re-run the installer.")
     return cpu, ram, gpu_model, gpu_count, vram
 
 

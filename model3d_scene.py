@@ -36,7 +36,9 @@ torus(name,major_radius,minor_radius,location,color,rotation=(rx,ry,rz))
 beam(name,start,end,radius,color) creates a cylinder joining two 3D points.
 ellipsoid(name,size,location,color,rotation=(0,0,0)) uses full dimensions.
 material(name,color,metallic=0,roughness=0.5,emission=None,strength=1) returns a PBR material.
-assign(obj,mat) assigns a material. Mesh helpers return the new object.
+assign(obj,mat) assigns a material. Mesh helpers return the new object, already linked to the scene.
+Do not link helper objects again. There is no predefined scene variable; scene.objects.link is an
+obsolete Blender API. Only a brand-new bpy.data object needs bpy.context.collection.objects.link(obj).
 Helper/import names are reserved: never assign to box, terrain, material, camera, random, etc.
 Use names like terrain_obj, ground_mat and scene_camera for their returned objects/materials.
 terrain(name,size=40,resolution=80,height=2,seed=1,color=(.4,.15,.07)) creates displaced rocky ground.
@@ -52,6 +54,17 @@ Keep each reply compact (at most 80 lines), finish the Python block and close it
 and loops over repeated boilerplate. An assembly pass must defer camera, lights and world to the final
 composition pass. Never output DONE instead of building an unfinished requirement.
 """
+
+
+def sampling_options(model):
+    """Trusted local sampler defaults; generated code cannot choose unbounded penalty windows."""
+    if model.lower().rsplit("/", 1)[-1] == "qwen2.5-coder-7b-instruct":
+        # Qwen's generation_config.json specifies these values (the GGUF does not apply it).
+        # llama.cpp calls repetition_penalty repeat_penalty; use a bounded recent-token window.
+        # https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct/blob/main/generation_config.json
+        return {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
+                "repeat_penalty": 1.1, "repeat_last_n": 256}
+    return {"temperature": 0.3}
 
 
 def completion_blocks(reply, label):
