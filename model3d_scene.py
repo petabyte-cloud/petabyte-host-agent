@@ -38,7 +38,9 @@ torus(name,major_radius,minor_radius,location,color,rotation=(rx,ry,rz))
 beam(name,start,end,radius,color) creates a cylinder joining two 3D points.
 ellipsoid(name,size,location,color,rotation=(0,0,0)) uses full dimensions.
 material(name,color,metallic=0,roughness=0.5,emission=None,strength=1) returns a PBR material.
-assign(obj,mat) assigns a material. Mesh helpers return the new object, already linked to the scene.
+material(name) retrieves an existing material unchanged; a new material always needs numeric RGB.
+assign(obj,mat) accepts a material object or an existing material's name. Mesh helpers return the new
+object, already linked to the scene.
 Do not link helper objects again. There is no predefined scene variable; scene.objects.link is an
 obsolete Blender API. Only a brand-new bpy.data object needs bpy.context.collection.objects.link(obj).
 Helper/import names are reserved: never assign to box, terrain, material, camera, random, etc.
@@ -79,6 +81,20 @@ def completion_blocks(reply, label):
                     "use helpers and loops and leave remaining parts for another pass.")
     blocks = re.findall(r"```(?:python|py)?[ \t]*\n(.*?)```", text, re.S)
     return blocks, "" if blocks else "No executable Blender code was returned for " + label
+
+
+def execution_hint(message, source):
+    """Correct observed Blender API mistakes at the failing line, without changing/executing code."""
+    if ("scene.objects.link" in source and
+            (message.startswith("NameError:") or message.startswith("AttributeError:"))):
+        return (" Remove scene.objects.link(...): mesh helpers already link their objects and scene is not a "
+                "predefined variable. Only brand-new bpy.data objects need bpy.context.collection.objects.link(obj).")
+    if ".objects.link(" in source and "already in collection" in message:
+        return " Do not link that object again: helper meshes are already in the scene collection."
+    if ("bmesh.ops.bevel" in source and message.startswith("TypeError:") and "thickness" in message):
+        return (" bmesh.ops.bevel does not accept thickness. Use a mesh BEVEL modifier with width and segments; "
+                "apply the mesh's scale for a consistent bevel width.")
+    return ""
 
 
 def runtime_api_description(bpy):

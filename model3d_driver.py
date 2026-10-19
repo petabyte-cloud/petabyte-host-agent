@@ -14,7 +14,7 @@ import mathutils
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model3d_scene import (BUILD_SYSTEM, request_plan, evidence, assembly_summary,
                            runtime_api_description, validate_render_settings, completion_blocks,
-                           sampling_options)
+                           sampling_options, execution_hint)
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
@@ -190,8 +190,15 @@ def remove(name):
         bpy.data.objects.remove(o, do_unlink=True)
 
 
-def material(name, color, metallic=0, roughness=0.5, emission=None, strength=1):
-    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+def material(name, color=None, metallic=0, roughness=0.5, emission=None, strength=1):
+    mat = bpy.data.materials.get(name)
+    if color is None:
+        if mat is None:
+            raise ValueError(f"material({name!r}): no existing material; first create it with material(name, (r, g, b))")
+        if metallic != 0 or roughness != 0.5 or emission is not None or strength != 1:
+            raise ValueError("material(): supply color=(r, g, b) when changing material properties")
+        return mat
+    mat = mat or bpy.data.materials.new(name)
     mat.use_nodes = True
     shader = mat.node_tree.nodes.get("Principled BSDF")
     shader.inputs["Base Color"].default_value = tuple(color[:3]) + (1,)
@@ -204,6 +211,10 @@ def material(name, color, metallic=0, roughness=0.5, emission=None, strength=1):
 
 
 def assign(obj, mat):
+    if isinstance(mat, str):
+        mat = material(mat)
+    if not isinstance(mat, bpy.types.Material):
+        raise TypeError("assign(): pass a material object or the name of an existing material")
     obj.data.materials.clear()
     obj.data.materials.append(mat)
     return obj
@@ -354,8 +365,9 @@ def run_code(code):
         hint = (" Reserved helper/import names were overwritten: " + ", ".join(rebound)
                 + ". Rename object/material variables with _obj or _mat; keep helper names callable."
                 if rebound else "")
+        api_hint = execution_hint(msg, source[line - 1] if line and 0 < line <= len(source) else "")
         return False, (buf.getvalue()[-500:] + (f"line {line} of your code: " if line else "")
-                       + msg + failing + hint)[-2000:]
+                       + msg + failing + hint + api_hint)[-2000:]
     finally:
         ns.update(bindings)
 
