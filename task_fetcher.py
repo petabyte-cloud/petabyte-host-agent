@@ -3522,6 +3522,8 @@ def build_container_cmd(task, name=None):
     if task.get("task_id") is not None:                  # findable by an admin kill (_kill_tasks)
         argv += ["--label", f"{TASK_LABEL}={task['task_id']}"]
     argv += ["--network", "none"]
+    if task.get("_pull_never"):                          # a distributed rank pre-pulled its image
+        argv += ["--pull=never"]
     argv += _isolation_flags(task)
     env = task.get("env") or {}
     if task.get("gpu"):
@@ -3565,7 +3567,7 @@ def _run_container(task, attach=None):
     _rt = task.get("max_runtime_s")
     try:
         argv = build_container_cmd(task, name=name)
-        report_progress(tid, 10, f"pulling & running {task.get('image')}")
+        report_progress(tid, 10, f"{'starting' if attach else 'pulling & running'} {task.get('image')}")
         refusal, done = [], threading.Event()
         if attach:
             watcher = threading.Thread(target=lambda: refusal.append(attach(name, done)), daemon=True)
@@ -3579,10 +3581,20 @@ def _run_container(task, attach=None):
             watcher.join(timeout=60)
             if any(refusal):
                 import cluster_overlay
-                why = next(r for r in refusal if r)
+                why, cause = next(r for r in refusal if r), "network_policy"
+                if why == RANK_EXITED_EARLY:
+                    # The container ended before the agent could move the overlay in. Its own output
+                    # says why (docker's start error, or the image's): name it, don't hide it.
+                    last = next((ln.strip() for ln in reversed(_to_str(out).splitlines()) if ln.strip()), "")
+                    if _trunc:                           # only the first CONTAINER_OUTPUT_CAP bytes were kept
+                        last = f"[output truncated; last kept line] {last}"
+                    if rc in (125, 126, 127):            # docker could not create/start it at all
+                        why, cause = f"rank container could not start (docker exit {rc}): {last[:240]}", "node_error"
+                    else:
+                        why = f"{why} (exit {rc}): {last[:240]}"
                 report_log(tid, why)
                 _post("/jobs/result", _signed_result(tid, status="failed", result=cluster_overlay.public_reason(why),
-                                                     failure_cause="network_policy"))
+                                                     failure_cause=cause))
                 _set_ui(status="idle", task=None, fail=True)
                 return
         _ef = task.pop("_env_file", None)        # docker consumed it at launch; remove the 0600 secret file
@@ -4572,6 +4584,9 @@ def _run_stitch(task):
         shutil.rmtree(outer, ignore_errors=True)
 
 
+RANK_EXITED_EARLY = "rank exited before its cluster overlay was attached and verified"
+
+
 def _wait_for_cluster(dist, tid, world, tick=lambda: None):
     """Poll the rendezvous until EVERY rank has registered its overlay identity (or fail).
     `tick` runs every poll (the overlay keeps its NAT mapping open)."""
@@ -4632,9 +4647,20 @@ def _run_distributed(task):
         if "--runtime" in _flags:
             return fail("distributed rank refused: the cluster overlay needs Docker's default "
                         f"runtime, not {_flags[_flags.index('--runtime') + 1]}")
+        # Pulled BEFORE the overlay exists or the rank registers: a slow pull spends only its own
+        # budget (the peers' rendezvous wait, DIST_RENDEZVOUS_TIMEOUT, is longer), and the run below
+        # is --pull=never, so the container can never sit in a second, unbounded pull.
+        pull_s = int(os.getenv("DIST_PULL_TIMEOUT", "1800"))
+        report_progress(tid, 5, f"rank {rank}/{world}: pulling {task['image']}")
         try:
-            _run_docker(["docker", "pull", task["image"]], capture_output=True,
-                        timeout=int(os.getenv("DIST_PULL_TIMEOUT", "1800")))
+            _run_docker(["docker", "pull", task["image"]], capture_output=True, text=True, timeout=pull_s)
+        except subprocess.TimeoutExpired:
+            return fail(f"distributed rank {rank}/{world}: image pull did not finish in {pull_s // 60} min",
+                        "node_error")
+        except subprocess.CalledProcessError as e:
+            last = next((ln.strip() for ln in reversed((e.stderr or "").splitlines()) if ln.strip()),
+                        f"exit {e.returncode}")
+            return fail(f"distributed rank {rank}/{world}: image pull failed: {last[:240]}", "node_error")
         except Exception as e:                           # noqa: BLE001
             return fail(f"distributed rank {rank}/{world}: image pull failed ({type(e).__name__})",
                         "node_error")
@@ -4696,11 +4722,11 @@ def _run_distributed(task):
                         return None
                     time.sleep(0.2)
                 # Exited before the overlay was in: it never joined the cluster, whatever its exit code.
-                return "rank exited before its cluster overlay was attached and verified"
+                return RANK_EXITED_EARLY
             except Exception as e:                       # noqa: BLE001 — any failure: no overlay, no rank
                 _force_rm_container(name)
                 return f"cluster overlay attach failed: {e}"
-        _run_container(dict(task, command=_dist.build_torchrun_cmd(
+        _run_container(dict(task, _pull_never=True, command=_dist.build_torchrun_cmd(
             command=task.get("command"), rank=rank, world_size=world, master_addr=master,
             master_port=mport), env={**(task.get("env") or {}), **_dist.rank_env(
                 rank=rank, world_size=world, master_addr=master, master_port=mport,
