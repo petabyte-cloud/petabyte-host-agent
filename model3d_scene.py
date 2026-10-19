@@ -16,6 +16,8 @@ Do not replace a detailed scene with a generic object. Set min_parts to a realis
 (1-40), e.g. articulated people and mechanical vehicles need many separate parts. Requirements
 will be built in order. Establish essential supports and the main subjects' shared pose/scale early;
 leave repetitive background decoration until after the main subjects. Keep it concise.
+Use valid JSON literals only: double-quoted strings, integer min_parts, no Python expressions,
+comments or trailing commas. Keep composition a concise string, not Blender code.
 """
 
 BUILD_SYSTEM = """You are a skilled Blender environment artist. Build the requested scene in small passes,
@@ -209,6 +211,43 @@ def parse_plan(text, prompt):
         clean.append({"id": key, "description": description[:1200], "min_parts": minimum})
     return {"requirements": clean, "composition": str(plan.get("composition", ""))[:1800],
             "request": prompt}
+
+
+def request_plan(prompt, ask, fits_context, attempts):
+    """Repair at most three invalid plans in the existing job; never execute a plan reply."""
+    base = [{"role": "system", "content": PLAN_SYSTEM}, {"role": "user", "content": prompt}]
+    previous, error = None, ""
+    for attempt in range(3):
+        messages = base
+        if error:
+            feedback = {"role": "user", "content": (
+                "The previous scene plan was invalid: " + error
+                + "\nReturn the WHOLE corrected JSON object, with all requested subjects."
+                + " Use only requirements (id, description, integer min_parts) and a concise composition string."
+                + " No code, expressions, comments or trailing commas. Finish the JSON object.")}
+            messages = [*base, feedback]
+            history = [*base, {"role": "assistant", "content": previous}, feedback]
+            # Previous output is optional. Keep the full request, diagnostic and completion budget.
+            if fits_context(history):
+                messages = history
+        reply = ask(messages)  # chat_live checks the exact final context before making the call.
+        text = reply.get("content") or ""
+        record = {"attempt": attempt, "response": text, "finish_reason": reply.get("finish_reason"), "ok": False}
+        attempts.append(record)
+        try:
+            if reply.get("finish_reason") == "length":
+                raise ValueError("The plan completion was cut off; return a shorter complete plan")
+            if not isinstance(text, str):
+                raise ValueError("The plan response must be JSON text")
+            plan = parse_plan(text, prompt)
+        except ValueError as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            record["error"] = error
+            previous = text if isinstance(text, str) else ""
+            continue
+        record["ok"] = True
+        return plan
+    raise RuntimeError("Scene planning failed after 3 attempts: " + error)
 
 
 def evidence(objects, requirements):

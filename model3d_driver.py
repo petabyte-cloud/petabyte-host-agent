@@ -12,7 +12,7 @@ import argparse, json, math, os, re, sys, time, traceback, urllib.request
 import bpy
 import mathutils
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model3d_scene import (PLAN_SYSTEM, BUILD_SYSTEM, parse_plan, evidence, assembly_summary,
+from model3d_scene import (BUILD_SYSTEM, request_plan, evidence, assembly_summary,
                            runtime_api_description, validate_render_settings, completion_blocks,
                            sampling_options)
 
@@ -494,15 +494,13 @@ FENCE = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.S)
 # is stripped before the code runs, and ends the build once that step's code has run cleanly.
 DONE_LINE = re.compile(r"^[ \t]*DONE\.?[ \t]*$", re.M)
 last_err = ""
-plan, checks = None, []
+plan, checks, plan_attempts = None, [], []
 RERUN_HINT = ("\nThat block stopped at the error: nothing after that line ran, so any variable it would have set "
               "later (loop counters like i, lists, positions) does not exist. Send the WHOLE corrected block "
               "again, not just the fix; parts with the same name are replaced, not duplicated.")
 try:
     if args.staged:
-        plan_reply = chat_live([{"role": "system", "content": PLAN_SYSTEM},
-                                {"role": "user", "content": args.prompt}]).get("content") or ""
-        plan = parse_plan(plan_reply, args.prompt)
+        plan = request_plan(args.prompt, chat_live, fits_context, plan_attempts)
         print("PBSTEP plan", json.dumps(plan["requirements"]), flush=True)
         world()
         for requirement in plan["requirements"]:
@@ -697,7 +695,8 @@ if args.staged and getattr(sc.camera, "name", None) == "pb_artist_camera":
                   "fov": math.degrees(vertical_fov)}
 with open(os.path.join(args.out, "commit.json"), "w") as f:
     json.dump({"prompt": args.prompt, "ok": bool(diff) and (not args.staged or not error), "error": error, "summary": summary, "steps": log,
-               "model": args.model, "plan": plan, "requirements": checks, "viewer": viewer,
+               "model": args.model, "plan": plan, "plan_attempts": plan_attempts,
+               "requirements": checks, "viewer": viewer,
                "render_size": f"{size[1]}p", "resolution": list(size[:2]),
                "seconds": round(time.time() - t0, 1), "objects": scene_objects()}, f, indent=1)
 print("PBCOMMIT", json.dumps({"ok": bool(diff) and (not args.staged or not error), "error": error, "summary": summary,
