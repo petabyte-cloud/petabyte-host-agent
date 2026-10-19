@@ -13,7 +13,7 @@ import bpy
 import mathutils
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model3d_scene import (PLAN_SYSTEM, BUILD_SYSTEM, parse_plan, evidence, assembly_summary,
-                           runtime_api_description, validate_render_settings)
+                           runtime_api_description, validate_render_settings, completion_blocks)
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
@@ -395,7 +395,8 @@ def chat(messages):
                                           **({"Authorization": "Bearer " + os.environ["PB_MODEL3D_LLM_KEY"]}
                                              if os.getenv("PB_MODEL3D_LLM_KEY") else {})})
     with urllib.request.urlopen(req, timeout=600) as r:
-        return json.load(r)["choices"][0]["message"]
+        choice = json.load(r)["choices"][0]
+        return {**choice["message"], "finish_reason": choice.get("finish_reason")}
 
 
 def frame_camera():
@@ -503,32 +504,35 @@ try:
         print("PBSTEP plan", json.dumps(plan["requirements"]), flush=True)
         world()
         for requirement in plan["requirements"]:
-            previous_attempt = None
-            for attempt in range(3):
+            previous_attempt, feedback, failures = None, None, 0
+            while failures < 3:
                 if step >= args.max_steps:
                     raise RuntimeError("Scene build budget ended before all requirements were verified")
                 before = {getattr(obj, "session_uid", obj.as_pointer()) for obj in bpy.context.scene.objects}
+                parts_before = evidence(scene_objects(), [requirement])[0]["parts"]
                 prefix = ("Full request: " + args.prompt + "\nPlan: " + json.dumps(plan["requirements"])
                           + "\nComposition: " + plan["composition"])
                 suffix = ("\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
                           + "\nBuild ONLY this requirement now: " + json.dumps(requirement)
-                          + "\nUse enough actual mesh parts to make it recognisable.")
-                failure = ({"role": "user", "content": "Previous failure: " + last_err + RERUN_HINT}
-                           if previous_attempt is not None else None)
+                          + f"\nThis assembly currently has {parts_before} verified mesh parts."
+                          + " Add a compact batch of missing details; another pass can finish it."
+                          + " Keep all existing assemblies. Defer camera, lights, world and all other subjects."
+                          + " Do not render, export or write render/Cycles settings.")
+                failure = {"role": "user", "content": feedback} if feedback else None
                 build_messages = scene_messages(prefix, suffix, failure)
                 if previous_attempt is not None:
                     retry = [*build_messages[:-1], {"role": "assistant", "content": previous_attempt}, failure]
                     # The instruction/scene, full failure and next completion take priority over
                     # optional history. An oversized response must not break the next repair.
                     build_messages = retry if fits_context(retry) else build_messages
-                text = chat_live(build_messages).get("content") or ""
+                reply = chat_live(build_messages)
+                text = reply.get("content") or ""
                 previous_attempt = text
-                blocks = FENCE.findall(text)
-                last_err = ""
+                blocks, last_err = completion_blocks(reply, requirement["id"])
                 if not blocks:
-                    last_err = "No executable Blender code was returned for " + requirement["id"]
                     log.append({"step": step, "requirement": requirement["id"], "ok": False,
-                                "result": last_err, "response": text[:8000]})
+                                "result": last_err, "response": text,
+                                "finish_reason": reply.get("finish_reason")})
                 for code in blocks:
                     code = DONE_LINE.sub("", code)
                     ok, res = run_code(code)
@@ -537,7 +541,8 @@ try:
                         if obj.type == "MESH" and (getattr(obj, "session_uid", obj.as_pointer()) not in before
                                                   or obj.get("pb_requirement") == requirement["id"]):
                             obj["pb_requirement"] = requirement["id"]
-                    log.append({"step": step, "requirement": requirement["id"], "ok": ok, "result": res[:2000], "code": code})
+                    log.append({"step": step, "requirement": requirement["id"], "ok": ok, "result": res[:2000],
+                                "code": code, "finish_reason": reply.get("finish_reason")})
                     print("PBSTEP", step, requirement["id"], "ok" if ok else "ERR", res[:300], flush=True)
                     if ok:
                         diff.append(code)
@@ -547,24 +552,34 @@ try:
                 step += 1
                 checks = evidence(scene_objects(), plan["requirements"])
                 current = next(c for c in checks if c["id"] == requirement["id"])
-                if blocks and all(item.get("ok") for item in log if item.get("step") == step - 1) and current["complete"]:
+                successful = bool(blocks) and all(item.get("ok") for item in log if item.get("step") == step - 1)
+                if successful and current["complete"]:
                     snapshot()
                     last_err = ""
                     break
+                if successful and current["parts"] > parts_before:
+                    # A bounded reply may build only part of a detailed subject. Keep that real
+                    # progress without spending a repair attempt; the global step budget still caps it.
+                    feedback = (f"Assembly progress: {current['parts']} of at least {current['minimum']} parts exist. "
+                                "Keep those parts. Add the remaining details for ONLY this requirement in a compact block.")
+                    previous_attempt = None
+                    continue
                 if blocks and not current["complete"]:
                     missing = f"Only {current['parts']} parts exist; build at least {current['minimum']} detailed parts"
                     last_err = missing + ("\nExecution failure in this attempt: " + last_err if last_err else "")
+                failures += 1
+                feedback = "Previous failure: " + last_err + RERUN_HINT
             else:
                 raise RuntimeError("Incomplete scene requirement " + requirement["id"] + ": " + last_err)
         # Composition is an explicit final pass, after all subjects exist. It must not delete them.
-        text = chat_live(scene_messages("Full request: " + args.prompt,
+        composition_reply = chat_live(scene_messages("Full request: " + args.prompt,
             "\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
             + "\nSet the final camera, PBR materials, lights and world for this composition: " + plan["composition"]
             + "\nKeep all existing mesh objects. Use camera(location,target,lens=24) to frame the main subjects."
-            + " Return a Python code block; do not change render settings.")).get("content") or ""
-        composition_blocks = FENCE.findall(text)
+            + " Return a Python code block; do not change render settings."))
+        composition_blocks, composition_error = completion_blocks(composition_reply, "scene composition")
         if not composition_blocks:
-            raise RuntimeError("The local model did not finish the scene composition")
+            raise RuntimeError(composition_error)
         for code in composition_blocks:
             ok, res = run_code(DONE_LINE.sub("", code))
             if not ok:

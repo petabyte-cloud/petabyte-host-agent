@@ -18,13 +18,15 @@ will be built in order. Establish essential supports and the main subjects' shar
 leave repetitive background decoration until after the main subjects. Keep it concise.
 """
 
-BUILD_SYSTEM = """You are a skilled Blender environment artist. Build the requested complete scene,
+BUILD_SYSTEM = """You are a skilled Blender environment artist. Build the requested scene in small passes,
 with recognisable detailed subjects, coherent scale, foreground depth and the requested atmosphere.
 Use Python with bpy, bmesh, mathutils, math, random and Vector, which are already imported. Reply
 with ONE complete ```python block. Code runs inside an isolated Blender container. No internet,
 external assets, subprocesses, package installs or file access. Use procedural meshes and materials.
-Do not simplify a complex prompt to a cube. Build the current requirement thoroughly; retain earlier
-requirements. Use stable, descriptive object names; calling a helper with the same name replaces it.
+Do not simplify a complex prompt to a cube. In an assembly pass, build ONLY the named requirement.
+Add a manageable batch of detailed parts; further passes can finish that same assembly. Retain all
+existing parts and earlier requirements. Never clear the scene or build other subjects in this pass.
+Use stable, descriptive object names; calling a helper with the same name replaces it.
 Available helpers (units meters, Z up, location = center, rotation in degrees):
 box(name,size,location,color=(r,g,b),rotation=(rx,ry,rz))
 cylinder(name,radius,height,location,color,rotation=(rx,ry,rz),vertices=32)
@@ -45,9 +47,23 @@ Follow the requested lighting, sky, fog, reflections, lens and composition with 
 equivalents. Protect the foreground composition: distant planets and scenery must not force the
 camera to frame the entire world. Use a deliberate camera looking at the main subjects.
 No text labels or captions as substitutes for geometry. Do not alter render resolution, engine,
-sample counts or output paths; the driver controls rendering and exports. Keep each block complete
-and bounded (under 350 lines). Never output DONE instead of building an unfinished requirement.
+sample counts or output paths; never call render or export operators. The driver renders and exports.
+Keep each reply compact (at most 80 lines), finish the Python block and close its fence. Prefer helpers
+and loops over repeated boilerplate. An assembly pass must defer camera, lights and world to the final
+composition pass. Never output DONE instead of building an unfinished requirement.
 """
+
+
+def completion_blocks(reply, label):
+    """Reject incomplete output as a whole; never execute a prefix of a cut-off response."""
+    text = reply.get("content") or ""
+    fences = re.findall(r"(?m)^[ \t]*```[^\n]*$", text)
+    if reply.get("finish_reason") == "length" or len(fences) % 2:
+        return [], ("Incomplete Python response for " + label + ": the completion ended before the reply was finished. "
+                    "No code from this reply ran. Return one compact, closed Python block for ONLY the current pass; "
+                    "use helpers and loops and leave remaining parts for another pass.")
+    blocks = re.findall(r"```(?:python|py)?[ \t]*\n(.*?)```", text, re.S)
+    return blocks, "" if blocks else "No executable Blender code was returned for " + label
 
 
 def runtime_api_description(bpy):
@@ -107,6 +123,10 @@ def validate_render_settings(code, scene_aliases=()):
 
     class Writes(ast.NodeVisitor):
         def visit_Call(self, node):
+            parts = path(node.func)
+            if parts[:2] == ("bpy", "ops") and len(parts) > 2 and parts[2] in ("render", "export_scene", "export_mesh"):
+                raise ValueError(f"Rendering and exports are driver-owned (line {node.lineno}). "
+                                 "Remove render/export calls; return only the current scene-building pass.")
             if isinstance(node.func, ast.Name) and node.func.id in ("setattr", "delattr") and len(node.args) >= 2:
                 attribute = node.args[1].value if isinstance(node.args[1], ast.Constant) else ""
                 check(node.args[0], attribute=attribute)
