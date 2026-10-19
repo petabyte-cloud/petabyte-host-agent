@@ -12,7 +12,8 @@ import argparse, json, math, os, re, sys, time, traceback, urllib.request
 import bpy
 import mathutils
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model3d_scene import PLAN_SYSTEM, BUILD_SYSTEM, parse_plan, evidence, assembly_summary
+from model3d_scene import (PLAN_SYSTEM, BUILD_SYSTEM, parse_plan, evidence, assembly_summary,
+                           runtime_api_description, validate_render_settings)
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
@@ -290,6 +291,7 @@ def world(color=(0.05, 0.06, 0.08), strength=.3):
     background.inputs[1].default_value = float(strength)
 
 
+RUNTIME_API = runtime_api_description(bpy)
 NS = {}   # one namespace per commit: a fix-up block can reuse variables from earlier blocks
 
 
@@ -334,6 +336,8 @@ def run_code(code):
                     camera=camera, light=light, world=world)
     ns.update(bindings)
     try:
+        validate_render_settings(code, [name for name, value in ns.items()
+                                        if value is bpy.context.scene])
         with contextlib.redirect_stdout(buf):
             exec(compile(code, "<llm>", "exec"), ns)
         return True, (buf.getvalue()[-2000:] or "ok")
@@ -366,14 +370,20 @@ def fits_context(messages):
 
 
 def scene_messages(prefix, suffix, failure=None):
-    """Keep full art direction and assembly bounds; reduce optional object detail to fit."""
-    for limit in (SCENE_MAX_CHARS, 3000, 1000, 0):
-        messages = [{"role": "system", "content": BUILD_SYSTEM},
-                    {"role": "user", "content": prefix + "\nCurrent scene: " + scene_info(limit) + suffix}]
-        if failure is not None:
-            messages.append(failure)
-        if fits_context(messages):
-            return messages
+    """Keep every mandatory instruction; budget runtime guidance and object detail as optional.
+
+    A runtime socket catalogue must not make a request that fit the base instruction fail.
+    Prefer the catalogue with less object detail, then omit it whole if the mandatory request
+    and completion fit only without it. chat_live still validates the exact final messages.
+    """
+    for runtime in (RUNTIME_API, ""):
+        for limit in (SCENE_MAX_CHARS, 3000, 1000, 0):
+            messages = [{"role": "system", "content": BUILD_SYSTEM + ("\n" + runtime if runtime else "")},
+                        {"role": "user", "content": prefix + "\nCurrent scene: " + scene_info(limit) + suffix}]
+            if failure is not None:
+                messages.append(failure)
+            if fits_context(messages):
+                return messages
     return messages  # chat_live reports the mandatory instruction's explicit budget failure.
 
 

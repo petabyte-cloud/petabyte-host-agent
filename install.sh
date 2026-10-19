@@ -91,7 +91,11 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
     > /etc/apt/sources.list.d/nvidia-container-toolkit.list
   apt-get update -y && apt-get install -y nvidia-container-toolkit
-  nvidia-ctk runtime configure --runtime=docker && systemctl restart docker || true
+  # dockerd registers its GPU driver (`--gpus`) only at startup, when nvidia-container-runtime-hook is
+  # on its PATH. Restart it even if `configure` fails: otherwise every GPU container on this node is
+  # refused with 'could not select device driver "" with capabilities: [[gpu]]' (prod jobs 56/57).
+  nvidia-ctk runtime configure --runtime=docker || true
+  systemctl restart docker || true
 elif command -v rocminfo >/dev/null 2>&1 || command -v rocm-smi >/dev/null 2>&1; then
   echo "==> AMD ROCm GPU detected; containers get the GPU via /dev/kfd + /dev/dri (no extra toolkit)"
   # ROCm exposes the GPU through device files, not a container runtime shim, so no

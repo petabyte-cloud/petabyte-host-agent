@@ -3530,9 +3530,9 @@ def build_container_cmd(task, name=None):
         argv += [*gpu_runtime.docker_gpu_args()]
     # Platform Python batch jobs override an image's service/audit entrypoint.
     if task.get("entrypoint"):
-        if task["entrypoint"] != "python3":
+        if task["entrypoint"] not in ("python3", "sh"):
             raise ValueError("unsupported batch entrypoint")
-        argv += ["--entrypoint", "python3"]
+        argv += ["--entrypoint", task["entrypoint"]]
     argv += [task.get("image")]
     command = task.get("command")
     if command:
@@ -3589,12 +3589,13 @@ def _run_container(task, attach=None):
                     if _trunc:                           # only the first CONTAINER_OUTPUT_CAP bytes were kept
                         last = f"[output truncated; last kept line] {last}"
                     if rc in (125, 126, 127):            # docker could not create/start it at all
-                        why, cause = f"rank container could not start (docker exit {rc}): {last[:240]}", "node_error"
+                        why, cause = (f"rank container could not start (docker exit {rc}): "
+                                      f"{_docker_error(out)}"), "node_error"
                     else:
                         why = f"{why} (exit {rc}): {last[:240]}"
+                why = cluster_overlay.public_reason(why, limit=2400)   # no addresses/ports, bounded
                 report_log(tid, why)
-                _post("/jobs/result", _signed_result(tid, status="failed", result=cluster_overlay.public_reason(why),
-                                                     failure_cause=cause))
+                _post("/jobs/result", _signed_result(tid, status="failed", result=why, failure_cause=cause))
                 _set_ui(status="idle", task=None, fail=True)
                 return
         _ef = task.pop("_env_file", None)        # docker consumed it at launch; remove the 0600 secret file
@@ -4592,6 +4593,17 @@ def _run_stitch(task):
 RANK_EXITED_EARLY = "rank exited before its cluster overlay was attached and verified"
 
 
+def _docker_error(text, limit=2000):
+    """Docker's own error from a failed `docker run`, every line, without the generic
+    "Run 'docker run --help'" hint docker appends to EVERY exit-125 failure (daemon errors
+    included), which is all a last-line capture ever showed (prod jobs 56/57). Bounded, and
+    with every address and port scrubbed, for the agent log and the buyer's result alike."""
+    lines = [ln.strip() for ln in _to_str(text or "").splitlines()
+             if ln.strip() and not ln.strip().startswith("Run 'docker run --help'")]
+    import cluster_overlay                               # scrubbed here, so the seller log never has them either
+    return cluster_overlay.public_reason(" | ".join(lines)[-limit:], limit=limit)   # no addresses/ports
+
+
 def _wait_for_cluster(dist, tid, world, tick=lambda: None):
     """Poll the rendezvous until EVERY rank has registered its overlay identity (or fail).
     `tick` runs every poll (the overlay keeps its NAT mapping open)."""
@@ -4636,7 +4648,7 @@ def _run_distributed(task):
 
     def fail(msg, cause="network_policy"):
         report_log(tid, msg)                             # full text: the seller's/admin's log
-        _post("/jobs/result", _signed_result(tid, status="failed", result=_ov.public_reason(msg),
+        _post("/jobs/result", _signed_result(tid, status="failed", result=_ov.public_reason(msg, limit=2400),
                                              failure_cause=cause))   # scrubbed: the buyer's status
         _set_ui(status="idle", task=None, fail=True)
 
@@ -4669,6 +4681,36 @@ def _run_distributed(task):
         except Exception as e:                           # noqa: BLE001
             return fail(f"distributed rank {rank}/{world}: image pull failed ({type(e).__name__})",
                         "node_error")
+        if task.get("gpu") and gpu_runtime.docker_gpu_args():
+            # Prod jobs 56/57: Docker on both fresh T4 hosts refused the rank's container (exit 125)
+            # after the cluster had formed, so the other ranks were booked and waited for nothing.
+            # The usual cause is a host whose Docker cannot hand a container the GPU ("could not
+            # select device driver": the NVIDIA hook missing, or dockerd started before it was
+            # installed). Start the same image under the rank's own isolation profile, with `true`
+            # as the only process, and fail now -- before any overlay or rendezvous -- if it can't.
+            # The image's `sh` is the buyer's binary: its output goes through the same bounded reader
+            # as any buyer container (never buffered whole in the agent), and the watchdog removes it.
+            import uuid as _uuid
+            pname = "pb-task-" + _uuid.uuid4().hex[:12]
+            try:
+                prc, pout, _ptrunc, ptimed, pflood = _run_streamed(
+                    build_container_cmd(dict(task, env={}, entrypoint="sh", command="-c true", _pull_never=True),
+                                        name=pname), pname, timeout_s=120, keep_cap=16384, drain_cap=1024 * 1024)
+            except OSError as e:                         # docker missing/unrunnable: still a signed failure
+                return fail(f"distributed rank {rank}/{world}: the GPU container check could not run docker "
+                            f"({type(e).__name__})", "node_error")
+            if ptimed:
+                return fail(f"distributed rank {rank}/{world}: the GPU container check did not finish "
+                            "in 2 min", "node_error")
+            if prc in (126, 127) and 'exec: "sh":' in _to_str(pout):
+                # The image itself has no runnable /bin/sh, which every rank needs (the overlay start
+                # gate is an sh loop): the buyer's image, not this node. Only docker's explicit exec
+                # failure for sh counts; other 126/127 start errors stay node_error below.
+                return fail(f"distributed rank {rank}/{world}: the image has no runnable /bin/sh, which a "
+                            f"distributed rank needs: {_docker_error(pout)}", "bad_task")
+            if prc or pflood:
+                return fail(f"distributed rank {rank}/{world}: this node's Docker cannot start a GPU "
+                            f"container: {_docker_error(pout) or f'exit {prc}'}", "node_error")
     ov = _ov.RankOverlay(tid)
     try:
         pub, port = ov.create(int(os.getenv("DIST_WG_PORT", "0")))

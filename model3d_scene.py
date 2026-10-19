@@ -1,4 +1,5 @@
 """Scene planning and evidence checks shared by the sandboxed Blender driver and its tests."""
+import ast
 import json
 import math
 import re
@@ -13,7 +14,8 @@ Requirements are physical mesh assemblies. Camera, lighting and material-only wo
 the composition field, not a requirement with no geometry.
 Do not replace a detailed scene with a generic object. Set min_parts to a realistic assembly size
 (1-40), e.g. articulated people and mechanical vehicles need many separate parts. Requirements
-will be built in order, so put terrain first and detailed foreground subjects last. Keep it concise.
+will be built in order. Establish essential supports and the main subjects' shared pose/scale early;
+leave repetitive background decoration until after the main subjects. Keep it concise.
 """
 
 BUILD_SYSTEM = """You are a skilled Blender environment artist. Build the requested complete scene,
@@ -46,6 +48,109 @@ No text labels or captions as substitutes for geometry. Do not alter render reso
 sample counts or output paths; the driver controls rendering and exports. Keep each block complete
 and bounded (under 350 lines). Never output DONE instead of building an unfinished requirement.
 """
+
+
+def runtime_api_description(bpy):
+    """Describe sockets from this container, rather than guessing a Blender release's API."""
+    version = getattr(bpy.app, "version_string", "unknown")
+    version = version if isinstance(version, str) else "unknown"
+    lines = ["Running Blender: " + version]
+    probe = bpy.data.materials.new("pb_api_contract_probe")
+    try:
+        probe.use_nodes = True
+        for kind in ("ShaderNodeBsdfPrincipled", "ShaderNodeVolumePrincipled"):
+            node = probe.node_tree.nodes.new(kind)
+            for direction in ("inputs", "outputs"):
+                sockets = [f"{socket.name} ({socket.type})" for socket in getattr(node, direction)]
+                lines.append(kind + "." + direction + ": " + ", ".join(sockets))
+    finally:
+        bpy.data.materials.remove(probe)
+    lines.append("Use actual socket names, never numeric indices; inspect node.inputs.keys() "
+                 "before linking/setting sockets. Do not assume an older Blender API. "
+                 "Use string values for STRING sockets, scalar numbers for VALUE sockets, "
+                 "and RGBA tuples for RGBA sockets. Render/Cycles settings, including denoising, "
+                 "are driver-owned; omit them from generated code.")
+    return "\n".join(lines)
+
+
+def validate_render_settings(code, scene_aliases=()):
+    """Reject direct renderer writes before a block can partially modify the scene.
+
+    This is an ownership check for generated scene code, not a Python security sandbox.
+    Track common aliases so `sc = bpy.context.scene; sc.cycles.samples = ...` gets the same
+    actionable feedback as the fully qualified form.
+    """
+    aliases = {"bpy": ("bpy",), **{name: ("bpy", "context", "scene") for name in scene_aliases}}
+
+    def path(node):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, ())
+        if isinstance(node, ast.Attribute):
+            parent = path(node.value)
+            return (*parent, node.attr) if parent else ()
+        return ()
+
+    def check(target, attribute=None):
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for item in target.elts:
+                check(item)
+            return
+        if attribute is None and not isinstance(target, ast.Attribute):
+            return  # Rebinding/deleting a local alias never writes to its referenced object.
+        parts = path(target)
+        if (parts[:3] == ("bpy", "context", "scene")
+                and ((len(parts) > 3 and parts[3] in ("render", "cycles"))
+                     or (len(parts) == 3 and attribute in ("render", "cycles")))):
+            raise ValueError(f"Render/Cycles settings are driver-owned (line {target.lineno}). "
+                             "Remove all render/Cycles assignments from this block; the driver "
+                             "sets the requested resolution, Cycles engine, samples, denoising and output paths.")
+
+    class Writes(ast.NodeVisitor):
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Name) and node.func.id in ("setattr", "delattr") and len(node.args) >= 2:
+                attribute = node.args[1].value if isinstance(node.args[1], ast.Constant) else ""
+                check(node.args[0], attribute=attribute)
+            self.generic_visit(node)
+
+        def visit_Assign(self, node):
+            for target in node.targets:
+                check(target)
+            self.visit(node.value)
+            value = path(node.value)
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    if value:
+                        aliases[target.id] = value
+                    else:
+                        aliases.pop(target.id, None)
+
+        def visit_AnnAssign(self, node):
+            self.visit_Assign(ast.Assign(targets=[node.target], value=node.value or ast.Constant(None)))
+
+        def visit_AugAssign(self, node):
+            check(node.target)
+            self.visit(node.value)
+            if isinstance(node.target, ast.Name):
+                aliases.pop(node.target.id, None)
+
+        def visit_Delete(self, node):
+            for target in node.targets:
+                check(target)
+                if isinstance(target, ast.Name):
+                    aliases.pop(target.id, None)
+
+        def visit_FunctionDef(self, node):
+            saved = aliases.copy()
+            # A function's parameter may shadow a scene alias from the outer block.
+            for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
+                             *([node.args.vararg] if node.args.vararg else []),
+                             *([node.args.kwarg] if node.args.kwarg else [])):
+                aliases.pop(argument.arg, None)
+            self.generic_visit(node)
+            aliases.clear()
+            aliases.update(saved)
+
+    Writes().visit(ast.parse(code, filename="<llm>", mode="exec"))
 
 
 def parse_plan(text, prompt):
