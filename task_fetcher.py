@@ -4230,6 +4230,29 @@ def _model3d_reason(output, default):
     return (f"{default}: {last}" if last else default)[:300]
 
 
+def _model3d_coder_address(name, network):
+    """The dedicated coder's private address on this job's exact network, never another peer."""
+    import ipaddress
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", name],
+            capture_output=True, text=True, timeout=5, check=True)
+        peer = json.loads(result.stdout)[network]
+        address, prefix = peer["IPAddress"], peer["IPPrefixLen"]
+        if not isinstance(address, str) or type(prefix) is not int or not 8 <= prefix <= 30:
+            raise ValueError("invalid private peer")
+        ip = ipaddress.IPv4Address(address)
+        subnet = ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
+        private = (ipaddress.IPv4Network(cidr) for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+        if (not any(subnet.subnet_of(block) for block in private)
+                or ip in (subnet.network_address, subnet.broadcast_address)):
+            raise ValueError("invalid private peer")
+        return str(ip)
+    except Exception as exc:
+        # Docker stderr and malformed metadata may contain credentials: report only the fixed reason.
+        raise RuntimeError("the local coder has no valid private address on this job's network") from exc
+
+
 def _model3d_llm_diagnostics(name):
     """Bounded, masked evidence from this task's local coder before its container is removed."""
     state = "state unavailable"
@@ -4354,6 +4377,10 @@ def _run_model3d(task):
             if r.returncode:
                 raise RuntimeError(f"the local LLM did not start: {r.stderr.strip()[:200]}")
             local_llm_started = True
+            # The sandbox may have its own kernel (Kata). Give it the exact job peer through
+            # /etc/hosts instead of depending on Docker's host-namespace embedded DNS resolver.
+            # The private network, selected sandbox runtime and firewall remain unchanged.
+            bridge = ["--add-host", f"llm:{_model3d_coder_address(llm, net)}"]
         report_progress(tid, 20, "building the model from your prompt")
         threading.Thread(target=_model3d_live_uploader, args=(tid, os.path.join(out, "live", "latest.jpg"), stop),
                          daemon=True, name="pb-model3d-live").start()

@@ -60,6 +60,21 @@ def _llm_health_failure(error):
         label += "/" + type(reason).__name__
     if isinstance(reason, OSError) and isinstance(reason.errno, int):
         label += f" errno={reason.errno}"
+    # The original exception retains standard-library frames even when urllib wraps it.
+    # Emit only a fixed phase label, never frame locals, source text, addresses or messages.
+    phase, tb = None, reason.__traceback__ if isinstance(reason, BaseException) else None
+    while tb is not None:
+        module, function = tb.tb_frame.f_globals.get("__name__"), tb.tb_frame.f_code.co_name
+        if module == "socket" and function == "getaddrinfo":
+            phase = "dns"
+            break
+        if module == "socket" and function == "create_connection":
+            phase = "connect"
+        elif module == "http.client" and function == "_read_status":
+            phase = "response"
+        tb = tb.tb_next
+    if phase:
+        label += f" phase={phase}"
     return label[:120]
 
 
