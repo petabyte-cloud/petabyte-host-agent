@@ -27,6 +27,7 @@ import safe_fetch
 import gpu_runtime
 import disk_quota
 import template_storage
+import mig
 
 import crypto
 import agent_scratch
@@ -330,6 +331,9 @@ def heartbeat_loop():
             if _storage is not None:
                 if _SEAL_PUB:                            # can unseal rental secrets into /run/secrets
                     _storage["secrets_version"] = 1
+                _mig = mig.report()
+                if _mig:                                 # GPUs in MIG mode: sellable as per-rental slices
+                    _storage["mig_slices"] = _mig
                 _hb["template_storage"] = _storage
             try:
                 _hb["workload"] = _workload_report()     # admin abuse view; None when idle
@@ -411,6 +415,10 @@ def heartbeat_loop():
                     _reap_orphan_templates(_body.get("active_vm_tasks"))
                 except Exception as _re:             # noqa: BLE001 — never break a heartbeat over GC
                     logging.debug(f"orphan reap skipped: {_re}")
+                try:
+                    mig.gc()                         # slices whose rental container is gone
+                except Exception as _me:             # noqa: BLE001
+                    logging.debug(f"MIG slice GC skipped: {_me}")
                 # GRACEFUL PREEMPTION: the server flagged these spot VMs for reclaim. Checkpoint NOW
                 # so the resumed job loses as little work as possible, then let periodic backups
                 # stop. The server hard-kills + finalizes at the grace deadline regardless, and the
@@ -1229,20 +1237,21 @@ def _cuda_wipe_image():
     return found[0] if found else None
 
 
-def _wipe_gpu_vram(tid=None):
+def _wipe_gpu_vram(tid=None, gpu_args=None):
     """Best-effort: zero the GPU's FREE VRAM so residual data from the previous tenant cannot be
     read by the next one (P-2). Strategy: (1) try `nvidia-smi --gpu-reset` (fast, no image) which
     clears memory when no compute clients are attached; (2) else run a short torch memset in a
     LOCALLY-CACHED CUDA image (--rm --gpus all --network none, time-bounded). Limits (documented in
     docs/SECURITY_AUDIT_PEER_TO_PEER.md): it cannot clear memory another live process still holds,
     coverage is ~92% of free VRAM, and the real fix is MIG/MPS partitioning. Never raises, never
-    blocks a job for more than the timeout."""
+    blocks a job for more than the timeout. `gpu_args` (a MIG slice's flags) wipes only that slice:
+    no card reset, which would hit every other tenant on the GPU."""
     import shutil, subprocess
-    if inference_worker.controller.serving():
+    if gpu_args is None and inference_worker.controller.serving():
         return False  # never reset or memset a card while managed workers still own live allocations
     if not shutil.which("docker") or not gpu_runtime.has_gpu():
         return False
-    _reset = gpu_runtime.gpu_reset_cmd()                 # (1) driver-level reset — cleanest when it works
+    _reset = gpu_runtime.gpu_reset_cmd() if gpu_args is None else None   # (1) driver-level reset
     if _reset:
         try:
             if subprocess.run(_reset, capture_output=True, timeout=60).returncode == 0:
@@ -1260,7 +1269,7 @@ def _wipe_gpu_vram(tid=None):
     # the VRAM really wasn't clean — so it is NOT retried and fails closed immediately.
     for attempt in range(2):
         try:
-            result = subprocess.run(["docker", "run", "--rm", *gpu_runtime.docker_gpu_args(), "--network", "none",
+            result = subprocess.run(["docker", "run", "--rm", *(gpu_args or gpu_runtime.docker_gpu_args()), "--network", "none",
                             "--label", (f"pb.task={tid}" if tid else "pb.kind=vram-wipe"),
                             img, "python", "-c", _VRAM_WIPE_PY],
                            capture_output=True, timeout=int(os.getenv("VRAM_WIPE_TIMEOUT_S", "180")))
@@ -1293,6 +1302,42 @@ def _refuse_unclean_vram(task):
                                          failure_cause="vram_wipe_unverified"))
     _set_ui(status="idle", task=None, fail=True)
     _mark_gpu_unusable("mandatory VRAM wipe failed")
+
+
+def _mig_refusal(task):
+    """(message, failure_cause) when this node must refuse the task because of MIG, else None. A slice
+    is only ever an interactive template; a whole-card GPU job never runs on a card in MIG mode (CUDA
+    has no device there, and its wipe/reset would land on the other tenants' slices)."""
+    if task.get("mig") and task.get("task_type") != "template":
+        return "Refused: MIG slices are only offered for interactive rentals.", "mig_unsupported_task"
+    # A benchmark carries no gpu flag but runs `--gpus all` (_measure_fp16_tflops): whole-card too.
+    if (task.get("gpu") or task.get("task_type") == "benchmark") and not task.get("mig") and mig.gpus():
+        return ("Refused: this node's GPUs are in MIG mode and are sold as hardware slices only; "
+                "a whole-card job cannot run here."), "mig_mode_whole_card"
+    return None
+
+
+def _refuse_mig(task, msg, cause):
+    tid = task.get("task_id")
+    try:
+        report_log(tid, msg)
+    except Exception:                                    # noqa: BLE001
+        pass
+    _post("/jobs/result", _signed_result(tid, status="failed", result=msg, failure_cause=cause))
+    _set_ui(status="idle", task=None, fail=True)
+
+
+def _attach_mig_slice(tid, placement):
+    """Create this rental's MIG slice, wipe it, and return the docker flags that expose ONLY it.
+    Raises mig.Unverified (the launch is refused and the slice destroyed by cleanup) on any doubt."""
+    gpu, profile = (placement or {}).get("gpu_index"), (placement or {}).get("profile")
+    uuid = mig.create(tid, gpu, profile)
+    args = mig.docker_args(uuid)
+    if not _wipe_gpu_vram(tid, gpu_args=args) \
+            and os.getenv("AGENT_ALLOW_UNVERIFIED_VRAM", "false").lower() != "true":
+        raise mig.Unverified("the new slice's memory could not be verified clear")
+    report_log(tid, f"MIG slice {profile} created on GPU {gpu}; the rental sees only this slice")
+    return args, uuid
 
 
 def _mark_gpu_unusable(why):
@@ -1371,6 +1416,8 @@ def _gpu_startup_selftest():
     if (os.getenv("AGENT_ALLOW_UNVERIFIED_VRAM", "false").lower() == "true"
             or not gpu_runtime.has_gpu() or not _cuda_wipe_image() or _rental_live()):
         return                                           # a restored live rental owns the GPU
+    if mig.gpus():
+        return    # a MIG-mode card runs no whole-card CUDA; each slice is wiped and checked at attach
     if not _wipe_gpu_vram():
         _mark_gpu_unusable("startup GPU container self-test failed")
 
@@ -1606,6 +1653,10 @@ def _cleanup_job_resources(tid, name=None):
         if removed.returncode == 0:
             import network_policy
             network_policy.cleanup(tid)
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        mig.destroy(tid)        # after the container is gone; a failure is retried by mig.gc()
     except Exception:                                    # noqa: BLE001
         pass
 
@@ -3109,8 +3160,9 @@ def _run_template(task):
             return
         cmd += ["--network", net]
         cmd += _dns_flags()                    # pin the resolver so the host can't DNS-lie (P-3)
-    if task.get("gpu"):
+    if task.get("gpu") and not task.get("mig"):    # a slice gets only its own device, added below
         cmd += [*gpu_runtime.docker_gpu_args()]
+    _slice = None
     if task.get("cache"):
         # SECURITY (CRITICAL — cross-tenant data): the cache/work dir is a PER-TASK named volume,
         # never a shared pb-cache-<template>. A shared volume handed buyer B a fresh rental mounted
@@ -3144,6 +3196,12 @@ def _run_template(task):
                     cached_only=bool(params.get("cached_image_only", False)),
                     timeout=params.get("max_startup_seconds", 900))
             report_log(tid, "Docker image " + outcome + "; model/work files are private to this rental")
+            if task.get("mig"):                   # created after the (slow) pull, right before run
+                _mig_args, _slice = _attach_mig_slice(tid, task["mig"])
+                cmd += _mig_args
+                # The buyer's env must not widen the device set the --gpus flag asked for.
+                _template_env = {k: v for k, v in _template_env.items()
+                                 if not str(k).upper().startswith(("NVIDIA_", "CUDA_VISIBLE"))}
             cmd += _template_env_flags(task, _template_env)
             # A custom image given a command (template_params.keepalive): that command replaces the
             # image's CMD, as with `docker run <image> <cmd>`. Hold the container open with a plain
@@ -3171,6 +3229,9 @@ def _run_template(task):
             cid = run.stdout.strip()
         finally:
             _remove_env_file(task)
+        if _slice:
+            mig.verify_container(name, _slice)    # raises -> refused + torn down below
+            mig.launched(tid)
         if _secrets is not None:                  # before the startup script, which may read them
             _deliver_secrets(tid, name, _secrets)
             _secrets = None
@@ -5352,7 +5413,11 @@ def job_loop():
                         # model weights/data left in device memory (NVIDIA does not clear VRAM
                         # between processes). Done at START (not teardown) so a crashed/killed prior
                         # job can't skip it. Best-effort + time-bounded; never blocks the job.
-                        if task.get("gpu") and not _wipe_gpu_vram(task.get("task_id")) \
+                        _mig_why = _mig_refusal(task)
+                        if _mig_why:
+                            _refuse_mig(task, *_mig_why)
+                            continue
+                        if task.get("gpu") and not task.get("mig") and not _wipe_gpu_vram(task.get("task_id")) \
                                 and os.getenv("AGENT_ALLOW_UNVERIFIED_VRAM", "false").lower() != "true":
                             # MANDATORY VRAM wipe (P-2): we could NOT verify the previous tenant's
                             # residual device memory was cleared, so running the next tenant here
@@ -5497,6 +5562,10 @@ def run_agent():
     except Exception:                                    # noqa: BLE001 — never block startup
         pass
     _remove_orphan_job_containers()   # before this run starts any container of its own
+    try:
+        mig.gc()                      # slices a crashed run left behind (their container is gone)
+    except Exception:                                    # noqa: BLE001 — never block startup
+        pass
     for _bg in (_ensure_wipe_image_async, _ensure_tunnel_async):
         try:
             _bg()

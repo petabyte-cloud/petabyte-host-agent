@@ -156,6 +156,7 @@ SIG = {"box": "box(name, size=(x, y, z), location=(x, y, z), color=(r, g, b), ro
        "cylinder": "cylinder(name, radius, height, location=(x, y, z), color=(r, g, b), rotation=(rx, ry, rz))",
        "cone": "cone(name, radius_bottom, radius_top, height, location=(x, y, z), color=(r, g, b), rotation=(rx, ry, rz))",
        "sphere": "sphere(name, radius, location=(x, y, z), color=(r, g, b))",
+       "ellipsoid": "ellipsoid(name, size=(x, y, z), location=(x, y, z), color=(r, g, b), rotation=(rx, ry, rz))",
        "torus": "torus(name, major_radius, minor_radius, location=(x, y, z), color=(r, g, b), rotation=(rx, ry, rz))"}
 
 
@@ -201,30 +202,34 @@ def cylinder(name, radius, height, location, color=(0.8, 0.8, 0.8), rotation=(0,
     """Upright along Z; location = center."""
     radius, height = _num(radius, "cylinder", "radius"), _num(height, "cylinder", "height")
     location, rotation = _vec(location, "cylinder", "location"), _vec(rotation, "cylinder", "rotation")
+    color = _color(color, "cylinder")
     bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=height, location=location, vertices=int(vertices))
-    return _finish(bpy.context.object, name, _color(color, "cylinder"), rotation)
+    return _finish(bpy.context.object, name, color, rotation)
 
 
 def cone(name, radius_bottom, radius_top, height, location, color=(0.8, 0.8, 0.8), rotation=(0, 0, 0), vertices=32):
     r1, r2 = _num(radius_bottom, "cone", "radius_bottom"), _num(radius_top, "cone", "radius_top")
     height, location = _num(height, "cone", "height"), _vec(location, "cone", "location")
     rotation = _vec(rotation, "cone", "rotation")
+    color = _color(color, "cone")
     bpy.ops.mesh.primitive_cone_add(radius1=r1, radius2=r2, depth=height, location=location, vertices=int(vertices))
-    return _finish(bpy.context.object, name, _color(color, "cone"), rotation)
+    return _finish(bpy.context.object, name, color, rotation)
 
 
 def sphere(name, radius, location, color=(0.8, 0.8, 0.8), segments=32):
     radius, location = _num(radius, "sphere", "radius"), _vec(location, "sphere", "location")
     segments = int(segments)
+    color = _color(color, "sphere")
     bpy.ops.mesh.primitive_uv_sphere_add(radius=radius, location=location, segments=segments, ring_count=segments // 2)
-    return _finish(bpy.context.object, name, _color(color, "sphere"), (0, 0, 0))
+    return _finish(bpy.context.object, name, color, (0, 0, 0))
 
 
 def torus(name, major_radius, minor_radius, location, color=(0.8, 0.8, 0.8), rotation=(0, 0, 0)):
     major, minor = _num(major_radius, "torus", "major_radius"), _num(minor_radius, "torus", "minor_radius")
     location, rotation = _vec(location, "torus", "location"), _vec(rotation, "torus", "rotation")
+    color = _color(color, "torus")
     bpy.ops.mesh.primitive_torus_add(major_radius=major, minor_radius=minor, location=location)
-    return _finish(bpy.context.object, name, _color(color, "torus"), rotation)
+    return _finish(bpy.context.object, name, color, rotation)
 
 
 def remove(name):
@@ -272,9 +277,13 @@ def beam(name, start, end, radius, color=(0.7, 0.7, 0.7)):
 
 
 def ellipsoid(name, size, location, color=(0.8, 0.8, 0.8), rotation=(0, 0, 0)):
+    # Validate the wrapper's inputs before sphere() allocates anything. A failed color or
+    # transform must not leave an unnamed mesh for the next generated repair to inherit.
+    size, location = _vec(size, "ellipsoid", "size"), _vec(location, "ellipsoid", "location")
+    rotation, color = _vec(rotation, "ellipsoid", "rotation"), _color(color, "ellipsoid")
     obj = sphere(name, 1, location, color)
-    obj.scale = [float(x) / 2 for x in size]
-    obj.rotation_euler = [math.radians(float(x)) for x in rotation]
+    obj.scale = [x / 2 for x in size]
+    obj.rotation_euler = [math.radians(x) for x in rotation]
     return obj
 
 
