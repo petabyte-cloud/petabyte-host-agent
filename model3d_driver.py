@@ -30,6 +30,8 @@ ap.add_argument("--model", default="local")
 ap.add_argument("--gpu-render", action="store_true")
 ap.add_argument("--fresh", action="store_true", help="start from an empty scene")
 args = ap.parse_args(argv)
+if not args.prompt.strip():
+    raise SystemExit("PBERROR the 3D task has no scene request; execution was refused")
 os.makedirs(args.out, exist_ok=True)
 
 if args.fresh:
