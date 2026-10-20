@@ -97,14 +97,28 @@ def installed():
     return None, None
 
 
-def target(dist):
-    """(install-package, driver-package, candidate version) the distro offers now, or Nones."""
+def _flavor(pkg):
+    """The branch of a driver package: '' (desktop), '-server', '-open' or '-server-open'."""
+    return re.sub(r"^nvidia-driver-\d+", "", pkg or "")
+
+
+def target(dist, installed_pkg=None):
+    """(install-package, driver-package, candidate version) the distro offers now, or Nones.
+
+    Only within the INSTALLED driver's branch. ubuntu-drivers recommends the desktop/open branch, and
+    following it moved freshly provisioned Alibaba T4s from the server driver (595.91.07) to
+    nvidia-driver-595 (595.99.02, DKMS): the module never loaded, nvidia-smi could not reach the driver,
+    and the nodes were never offered (specs 292/294/295, 2026-10-19)."""
     if dist == "pop":
         dep = re.search(r"Depends:\s*(nvidia-driver-\S+)", _out(["apt-cache", "depends", "system76-driver-nvidia"]))
         pkg, inst = (dep.group(1) if dep else None), "system76-driver-nvidia"
     else:
-        rec = re.search(r"driver\s*:\s*(nvidia-driver-\S+).*recommended", _out(["ubuntu-drivers", "devices"], 120))
-        pkg = inst = rec.group(1) if rec else None
+        rows = re.findall(r"driver\s*:\s*(nvidia-driver-\S+)([^\n]*)", _out(["ubuntu-drivers", "devices"], 120))
+        if installed_pkg:
+            rows = [r for r in rows if _flavor(r[0]) == _flavor(installed_pkg)]
+        rec = next((p for p, rest in rows if "recommended" in rest), None)
+        pkg = inst = rec or max((p for p, _ in rows), key=lambda p: int(re.search(r"\d+", p).group()),
+                                default=None)
     if not pkg:
         return None, None, None
     cand = re.search(r"Candidate:\s*(\S+)", _out(["apt-cache", "policy", pkg]))
@@ -170,10 +184,10 @@ def upgrade():
     st = {"at": int(time.time()), "before": old_ver, "target": None, "ok": False}
     if reason is None:
         _run(["apt-get", "update"], timeout=600)
-        inst, pkg, want = target(distro())
+        inst, pkg, want = target(distro(), old_pkg)
         st["target"] = want
         if not want:
-            reason = "the distro offers no NVIDIA driver for this GPU"
+            reason = f"the distro offers no driver of the installed branch ({old_pkg}) for this GPU"
         elif not _newer(want, old_ver):                  # current, or a newer driver the seller chose
             st["ok"], reason = True, None
         elif last.get("target") == want and last.get("failed"):

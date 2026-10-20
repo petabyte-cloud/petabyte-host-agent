@@ -312,8 +312,10 @@ def heartbeat_loop():
         try:
             _ensure_seal_keypair()
             import hardware_evidence
+            _not_selling = _not_selling_reasons()
             _hb = {"spec_id": int(SPEC_ID), "hardware_evidence": hardware_evidence.collect(),
-                   "selling_now": _advertise_selling_now(),  # JIT also waits for tunnel enrollment
+                   "selling_now": not _not_selling,          # JIT also waits for tunnel enrollment
+                   "not_selling": _not_selling,              # ...and WHY not, as machine-readable codes
                    "gpu_busy": _gpu_busy_report(),           # why it is not offered (busy-GPU guard)
                    "gpu_driver": _gpu_driver_report(),       # ...or because its NVIDIA driver is down
                    "render_capabilities": _render_capabilities(),   # engines + headless_eevee (self-tested)
@@ -2072,6 +2074,7 @@ _tun_sup_started = threading.Event()
 # before claiming work: a JIT droplet is booked seconds after it registers, and enrollment takes ~70s
 # (API + the gateway's 60s key sync), so claiming at once refused its first serving job.
 _TUN_SETTLED = threading.Event()
+_TUN_STATUS = {"detail": "enrolling the browser tunnel"}        # why JIT is not enrolled yet
 
 
 def _reverse_tunnel_enabled():
@@ -2092,10 +2095,40 @@ def _advertise_selling_now():
     task fail with network_policy and refunds the buyer. Ordinary sellers retain
     their chosen selling schedule and existing tunnel policy.
     """
-    scheduled = _selling_now()
-    return (scheduled and (not os.getenv("PROVIDER", "").startswith("pb-jit-")
-                           or _reverse_tunnel_enabled()) and not _gpu_busy_elsewhere() and _wipe_ready()
-            and not _update_running() and not _nvidia_driver_problem())
+    return not _not_selling_reasons()
+
+
+def _not_selling_reasons():
+    """Every reason this node is not offered right now, as [{code, detail?}]; [] when it is.
+
+    The heartbeat sends it with selling_now, so a node that never offers itself always says why:
+    two fresh Alibaba T4s (specs 294/295, 2026-10-19) reported selling_now=False for a whole paid
+    window with nothing in their logs or on their spec row to tell which hold it was."""
+    out = []
+
+    def add(code, detail=None):
+        out.append({"code": code, **({"detail": str(detail)[:200]} if detail else {})})
+    if not _selling_now():                               # the same gate job claims use; name which part
+        if _GPU_UNUSABLE.is_set():
+            add("gpu_unusable", "GPU containers failed the mandatory VRAM-wipe self-test; re-tested every 10 min")
+        if _fixes.pending():
+            add("support_fix_pending")
+        if _draining():
+            add("driver_update_draining")
+        if not out:
+            add("outside_selling_hours")
+    if os.getenv("PROVIDER", "").startswith("pb-jit-") and not _reverse_tunnel_enabled():
+        add("tunnel_not_enrolled", _TUN_STATUS.get("detail"))
+    if _gpu_busy_elsewhere():
+        add("gpu_busy_elsewhere")
+    if not _wipe_ready():
+        add("vram_wipe_image_missing", "the mandatory VRAM-wipe image is still downloading")
+    if _update_running():
+        add("agent_updating")
+    why = _nvidia_driver_problem()
+    if why:
+        add("nvidia_driver", why)
+    return out
 
 
 _DRIVER = {"at": float("-inf"), "why": None}
@@ -2117,14 +2150,41 @@ def _nvidia_driver_problem(ttl=60):
         r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20)
         lines = [ln.strip() for ln in f"{r.stdout}\n{r.stderr}".splitlines() if ln.strip()]
         why = (None if r.returncode == 0 and any(ln.startswith("GPU ") for ln in lines)
-               else (" ".join(lines)[:300] or f"nvidia-smi exited {r.returncode}"))
+               else (" ".join(lines)[:160] or f"nvidia-smi exited {r.returncode}"))
     except Exception as e:                               # noqa: BLE001 — a hung/missing tool is a broken driver
         why = f"nvidia-smi did not answer ({type(e).__name__})"
+    if why:
+        why = f"{why} | {_nvidia_versions()}"[:300]
     if why != _DRIVER["why"]:
         (logging.warning if why else logging.info)(
             f"NVIDIA driver {'not working, GPU held off sale: ' + why if why else 'working again'}")
     _DRIVER.update(at=now, why=why)
     return why
+
+
+_NV_LOADED = "/sys/module/nvidia/version"               # present only while the module is LOADED
+
+
+def _nvidia_versions():
+    """'loaded <v> | on disk <v> for <kernel> | userspace <v>': the evidence for a driver that won't
+    answer. Loaded comes from the running kernel; on disk (modinfo) can already be a newer package's
+    module before a reboot, so the two are reported apart: none loaded, nothing built for this kernel,
+    or a loaded module that doesn't match the installed libraries each read differently."""
+    import glob
+    kernel = os.uname().release
+    try:
+        with open(_NV_LOADED) as f:
+            loaded = f.read().strip()
+    except OSError:
+        loaded = ""
+    try:
+        disk = subprocess.run(["modinfo", "-k", kernel, "-F", "version", "nvidia"], capture_output=True,
+                              text=True, timeout=15).stdout.strip()
+    except Exception:                                    # noqa: BLE001
+        disk = ""
+    libs = sorted(glob.glob("/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*.*") + glob.glob("/usr/lib64/libnvidia-ml.so.*.*"))
+    user = libs[-1].split("libnvidia-ml.so.", 1)[1] if libs else "none"
+    return f"loaded {loaded or 'none'} | on disk {disk or 'none'} for {kernel} | userspace {user}"
 
 
 def _gpu_driver_report():
@@ -2601,7 +2661,9 @@ def _ensure_tunnel_async():
         except Exception as e:                                # noqa: BLE001 — never crash the agent
             logging.warning(f"reverse tunnel: could not create a key: {e}")
             return
-        for _ in range(40):                                   # ~20 min: enroll + the gateway key sync
+        tries = 0
+        while True:
+            tries += 1
             try:
                 r = httpx.post(f"{API_URL}/node/tunnel", headers=HEADERS, timeout=20, trust_env=False,
                                json={"spec_id": int(SPEC_ID), "public_key": pub})
@@ -2611,20 +2673,28 @@ def _ensure_tunnel_async():
                     if _tunnel_key_accepted(gw, int(ports.split("-")[0])):
                         _TUN_KEY, _TUN_PORTS = _TUN_STATE_KEY, ports
                         _TUN_GW = gw                          # set LAST: it is what enables serving
+                        _TUN_STATUS["detail"] = None
                         logging.warning(f"reverse tunnel enrolled: {gw} ports {ports}")
                         return
+                    _TUN_STATUS["detail"] = "registered; waiting for the gateway to accept this node's key"
                 elif r.status_code in (400, 403, 404):        # refused: stop asking
+                    _TUN_STATUS["detail"] = f"enrollment refused ({r.status_code}): {r.text[:150]}"
                     logging.warning(f"reverse tunnel enrollment refused ({r.status_code}): {r.text[:200]}")
                     return
-                elif r.status_code == 503:
-                    # Not offered RIGHT NOW (e.g. the server's TUNNEL_GATEWAY briefly missing after a
-                    # deploy on 2026-09-24/25). Keep asking: giving up here left the node unservable
-                    # until someone restarted its agent.
-                    logging.warning(f"reverse tunnel enrollment not offered yet (503); retrying: {r.text[:200]}")
+                else:
+                    # 503: not offered RIGHT NOW (e.g. the server's TUNNEL_GATEWAY briefly missing after
+                    # a deploy, 2026-09-24/25); 409: the node is not attested yet. Either clears on its
+                    # own, so keep asking -- giving up left a node unsellable until its agent restarted.
+                    _TUN_STATUS["detail"] = f"enrollment not offered yet ({r.status_code}): {r.text[:150]}"
+                    logging.warning(f"reverse tunnel enrollment not offered yet ({r.status_code}); "
+                                    f"retrying: {r.text[:200]}")
             except Exception as e:                            # noqa: BLE001
+                _TUN_STATUS["detail"] = f"enrollment request failed ({type(e).__name__}); retrying"
                 logging.debug(f"reverse tunnel enrollment retry: {e}")
-            time.sleep(30)
-        logging.warning("reverse tunnel: the gateway never accepted this node's key")
+            if tries == 40:                                   # ~20 min: say so once, then keep trying slower
+                logging.warning("reverse tunnel: the gateway has not accepted this node's key after 20 min; "
+                                f"still retrying every 5 min ({_TUN_STATUS['detail']})")
+            time.sleep(30 if tries < 40 else 300)
     threading.Thread(target=_run, daemon=True, name="pb-tunnel-enroll").start()
 
 
@@ -4160,6 +4230,26 @@ def _model3d_reason(output, default):
     return (f"{default}: {last}" if last else default)[:300]
 
 
+def _model3d_llm_diagnostics(name):
+    """Bounded, masked evidence from this task's local coder before its container is removed."""
+    state = "state unavailable"
+    try:
+        result = subprocess.run(["docker", "inspect", "--format", "{{json .State}}", name],
+                                capture_output=True, text=True, timeout=5, check=False)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            status = data.get("Status")
+            if status not in ("created", "restarting", "running", "removing", "paused", "exited", "dead"):
+                status = "unknown"
+            code = data.get("ExitCode")
+            code = code if isinstance(code, int) else "unknown"
+            state = f"status={status}, exit_code={code}, oom_killed={data.get('OOMKilled') is True}"
+    except Exception:                                    # noqa: BLE001 — diagnostics must not replace the failure
+        pass
+    tail = _container_log_tail(name, lines=40)
+    return f"Local 3D coder diagnostics: {state}" + ("\n" + tail if tail else "")
+
+
 def _model3d_live_uploader(tid, live, stop):
     """Upload live/latest.jpg whenever it changes, at most every 10 s, until `stop` is set."""
     last = 0.0
@@ -4190,6 +4280,7 @@ def _run_model3d(task):
     net, llm = f"pb3d-{tag}", f"pb3d-llm-{tag}"
     stop = threading.Event()
     proxy = None
+    local_llm_started = False
     shared = bool(task.get("shared_pool_worker"))
     remote_llm = task.get("llm_remote") is True
     try:
@@ -4245,7 +4336,9 @@ def _run_model3d(task):
             llm_url = f"http://llm:{proxy.port}"
         else:
             r = subprocess.run(
-                ["docker", "run", "-d", "--rm", "--pull=never", "--name", llm, "--network", net,
+                # Keep an exited coder until finally: --rm erased startup/OOM evidence before
+                # Blender's readiness timeout could report it. Cleanup still removes this exact name.
+                ["docker", "run", "-d", "--pull=never", "--name", llm, "--network", net,
                  "--network-alias", "llm", *label, *gpu_runtime.docker_gpu_args(),
                  "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=256",
                  "--memory", str(task.get("llm_memory") or "8g"),
@@ -4260,6 +4353,7 @@ def _run_model3d(task):
                 capture_output=True, text=True, timeout=60)
             if r.returncode:
                 raise RuntimeError(f"the local LLM did not start: {r.stderr.strip()[:200]}")
+            local_llm_started = True
         report_progress(tid, 20, "building the model from your prompt")
         threading.Thread(target=_model3d_live_uploader, args=(tid, os.path.join(out, "live", "latest.jpg"), stop),
                          daemon=True, name="pb-model3d-live").start()
@@ -4322,6 +4416,11 @@ def _run_model3d(task):
         _set_ui(status="idle", task=None, ok=True)
     except Exception as e:                              # noqa: BLE001
         reason = str(e)[:600] or "the 3D build did not finish on this node"
+        if local_llm_started and not os.path.exists(os.path.join(out, "commit.json")):
+            try:
+                report_log(tid, _model3d_llm_diagnostics(llm))
+            except Exception:                            # noqa: BLE001 — preserve the original failure and cleanup
+                logging.debug("local 3D coder diagnostics unavailable")
         report_log(tid, f"create 3d failed: {reason}")
         _post("/jobs/result", _signed_result(tid, status="failed", result=reason))
         _set_ui(status="idle", task=None, fail=True)
@@ -5311,6 +5410,11 @@ def _remove_orphan_job_containers():
         for prefix in ("pb-task-", "pb-run-"):
             ids += subprocess.run(["docker", "ps", "-q", "--filter", f"name=^{prefix}"],
                                   capture_output=True, text=True, timeout=15, check=False).stdout.split()
+        # A crash between local-coder exit and its finally cleanup can leave only diagnostic
+        # metadata. Match stopped, task-labelled 3D coders; never match live coders or rentals.
+        ids += subprocess.run(["docker", "ps", "-aq", "--filter", "status=exited",
+                               "--filter", "name=^pb3d-llm-", "--filter", f"label={TASK_LABEL}"],
+                              capture_output=True, text=True, timeout=15, check=False).stdout.split()
         for cid in ids:
             if re.fullmatch(r"[0-9a-f]{12,64}", cid):
                 subprocess.run(["docker", "rm", "-f", cid], capture_output=True, timeout=30, check=False)
