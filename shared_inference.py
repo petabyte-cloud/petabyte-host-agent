@@ -9,6 +9,8 @@ import json
 import os
 import re
 import secrets
+import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -232,10 +234,14 @@ class Model3DProxy:
     """Per-build authenticated chat-only bridge. The Blender container never gets the pool key,
     a GPU device, arbitrary upstream paths or the shared model server's management endpoints."""
     def __init__(self, gateway, endpoint=None, active=lambda: True, *, forward=None,
-                 max_tokens=2048, max_chars=24000, max_calls=8, model="local"):
-        host = ipaddress.ip_address(gateway)
-        if host.version != 4 or not host.is_private or host.is_loopback or host.is_link_local:
-            raise ValueError("the private build network has no usable gateway")
+                 max_tokens=2048, max_chars=24000, max_calls=8, model="local", unix_socket=None):
+        if unix_socket is not None:
+            if gateway is not None or endpoint is not None or forward is None or not os.path.isabs(unix_socket):
+                raise ValueError("the private relay requires only its own Unix forwarder")
+        else:
+            host = ipaddress.ip_address(gateway)
+            if host.version != 4 or not host.is_private or host.is_loopback or host.is_link_local:
+                raise ValueError("the private build network has no usable gateway")
         self.key = secrets.token_urlsafe(32)
         target, upstream_key = endpoint if endpoint else (None, None)
         self.closed = threading.Event()
@@ -296,7 +302,7 @@ class Model3DProxy:
                     return self.reply(200, b'{"status":"ok"}')
                 return self.reply(403, b'{"error":"forbidden"}')
 
-        class Server(http.server.ThreadingHTTPServer):
+        class BoundedRequests:
             """Generated code cannot create unlimited host threads with partial HTTP requests."""
             def __init__(self, address):
                 self.connections = threading.BoundedSemaphore(2)
@@ -323,9 +329,21 @@ class Model3DProxy:
                 finally:
                     self.connections.release()
 
-        self.server = Server((gateway, 0))
+        class Server(BoundedRequests, http.server.ThreadingHTTPServer):
+            pass
+
+        class UnixServer(BoundedRequests, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            pass
+
+        self.unix_socket = unix_socket
+        self.server = UnixServer(unix_socket) if unix_socket else Server((gateway, 0))
         self.server.daemon_threads = True
-        self.port = self.server.server_address[1]
+        # Only the trusted, non-root relay container mounts this task-specific directory.
+        # Its read-only mount permits connecting, never replacing/unlinking the socket. Every
+        # chat still needs the existing per-build key, quota and current prepaid task lease.
+        if unix_socket:
+            os.chmod(unix_socket, 0o666)
+        self.port = None if unix_socket else self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True, name="pb-3d-pool-proxy").start()
 
     def close(self):
@@ -333,3 +351,5 @@ class Model3DProxy:
         self.client.close()
         self.server.shutdown()
         self.server.server_close()
+        if self.unix_socket:
+            Path(self.unix_socket).unlink(missing_ok=True)

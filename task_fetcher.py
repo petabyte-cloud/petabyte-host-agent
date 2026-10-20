@@ -4305,8 +4305,8 @@ def _model3d_reason(output, default):
     return (f"{default}: {last}" if last else default)[:300]
 
 
-def _model3d_coder_address(name, network):
-    """The dedicated coder's private address on this job's exact network, never another peer."""
+def _model3d_coder_address(name, network, *, role="local coder"):
+    """A dedicated peer's private address on this job's exact network, never another peer."""
     import ipaddress
     try:
         result = subprocess.run(
@@ -4325,7 +4325,7 @@ def _model3d_coder_address(name, network):
         return str(ip)
     except Exception as exc:
         # Docker stderr and malformed metadata may contain credentials: report only the fixed reason.
-        raise RuntimeError("the local coder has no valid private address on this job's network") from exc
+        raise RuntimeError(f"the {role} has no valid private address on this job's network") from exc
 
 
 def _model3d_llm_diagnostics(name):
@@ -4381,6 +4381,7 @@ def _run_model3d(task):
     net, llm = f"pb3d-{tag}", f"pb3d-llm-{tag}"
     stop = threading.Event()
     proxy = None
+    relay_name = None
     local_llm_started = False
     shared = bool(task.get("shared_pool_worker"))
     remote_llm = task.get("llm_remote") is True
@@ -4429,15 +4430,43 @@ def _run_model3d(task):
                                   timeout=min(610, int(task.get("max_runtime_s") or 610)),
                                   json=_lease_payload({"task_id": tid, "messages": payload["messages"],
                                                        "max_tokens": min(4096, payload["max_tokens"])}))
-            proxy = Model3DProxy(gateway, endpoint,
+            paired_builder = remote_llm and (task.get("model3d_peer") or {}).get("role") == "builder"
+            socket_path = None
+            if paired_builder:
+                relay_dir = os.path.join(work, "relay")
+                os.mkdir(relay_dir, 0o755)
+                socket_path = os.path.join(relay_dir, "bridge.sock")
+            proxy = Model3DProxy(None if paired_builder else gateway, endpoint,
                                  active=(lambda: tid not in _KILLED and not stop.is_set()) if remote_llm
                                  else lambda: inference_worker.controller.endpoint_for_3d(task) == endpoint,
                                  forward=relay if remote_llm else None,
                                  max_tokens=min(4096, int(task.get("llm_max_tokens") or 3072)),
                                  max_chars=90000, max_calls=24,
-                                 model=str((task.get("model") or {}).get("model") or "local"))
+                                 model=str((task.get("model") or {}).get("model") or "local"),
+                                 **({"unix_socket": socket_path} if paired_builder else {}))
             bridge = ["--add-host", f"llm:{gateway}", "-e", f"PB_MODEL3D_LLM_KEY={proxy.key}"]
             llm_url = f"http://llm:{proxy.port}"
+            if paired_builder:
+                relay_name = f"pb3d-relay-{tag}"  # exact name retained even if launch reports an error
+                relay_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model3d_relay.py")
+                result = subprocess.run(["docker", "run", "-d", "--pull=never", "--name", relay_name,
+                    "--network", net, *label, "--runtime=runc", "--read-only", "--cap-drop=ALL",
+                    "--security-opt=no-new-privileges", "--user=65534:65534", "--pids-limit=64",
+                    "--memory=512m", "--memory-swap=512m", "--cpus=0.5", "-e", "HOME=/tmp",
+                    "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--log-opt=max-size=1m",
+                    "-v", f"{relay_dir}:/relay:ro", "-v", f"{relay_script}:/relay.py:ro",
+                    "--entrypoint", "blender", image, "--background", "--factory-startup",
+                    "--disable-autoexec", "--python-exit-code", "1", "--python", "/relay.py"],
+                    capture_output=True, timeout=60)
+                if result.returncode:
+                    raise RuntimeError("the private job relay did not start")
+                relay_address = _model3d_coder_address(relay_name, net, role="private job relay")
+                import model3d_relay
+                model3d_relay.wait_ready(f"http://{relay_address}:8080",
+                                        lambda: tid not in _KILLED and not stop.is_set())
+                bridge = ["--add-host", f"llm:{relay_address}",
+                          "-e", f"PB_MODEL3D_LLM_KEY={proxy.key}"]
+                llm_url = "http://llm:8080"
         else:
             r = subprocess.run(
                 # Keep an exited coder until finally: --rm erased startup/OOM evidence before
@@ -4536,6 +4565,8 @@ def _run_model3d(task):
         stop.set()
         if proxy:
             proxy.close()
+        if relay_name:
+            subprocess.run(["docker", "rm", "-f", relay_name], capture_output=True, timeout=30, check=False)
         if not shared and not remote_llm:
             subprocess.run(["docker", "rm", "-f", llm], capture_output=True, timeout=30, check=False)
         subprocess.run(["docker", "network", "rm", net], capture_output=True, timeout=30, check=False)
