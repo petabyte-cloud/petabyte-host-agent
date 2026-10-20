@@ -8,6 +8,7 @@ block that runs is part of the commit's diff. Outputs in --out:
 The container has no internet: its only network peer is the LLM container.
 """
 import argparse, json, math, os, re, sys, time, traceback, urllib.request
+import urllib.error
 
 import bpy
 import mathutils
@@ -41,18 +42,34 @@ if args.fresh:
     bpy.context.scene.world = bpy.data.worlds.new("World")
 
 
+def _llm_health_failure(error):
+    """Classify a probe failure without copying URLs, credentials, bodies or exception messages."""
+    if isinstance(error, urllib.error.HTTPError) and isinstance(error.code, int):
+        return f"HTTP{error.code}"[:120]
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    label = type(error).__name__
+    if reason is not error:
+        label += "/" + type(reason).__name__
+    if isinstance(reason, OSError) and isinstance(reason.errno, int):
+        label += f" errno={reason.errno}"
+    return label[:120]
+
+
 def wait_for_llm(limit_s=600):
     """The LLM container starts alongside this one and loads a ~5 GB model first."""
     end = time.time() + limit_s
+    attempts, last = 0, "no response"
     while time.time() < end:
+        attempts += 1
         try:
             with urllib.request.urlopen(args.llm.rstrip("/") + "/health", timeout=5) as r:
                 if r.status == 200:
                     return
-        except Exception:  # noqa: BLE001 - not up yet
-            pass
+                last = f"HTTP{r.status}" if isinstance(r.status, int) else "non-HTTP response"
+        except Exception as error:  # noqa: BLE001 - not up yet; retain only safe classification
+            last = _llm_health_failure(error)
         time.sleep(2)
-    raise SystemExit("PBERROR the local LLM did not become ready")
+    raise SystemExit(f"PBERROR the local LLM did not become ready (health attempts={attempts}; last={last})")
 
 
 wait_for_llm()
