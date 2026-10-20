@@ -125,24 +125,56 @@ def target(dist, installed_pkg=None):
     return inst, pkg, (cand.group(1) if cand and cand.group(1) != "(none)" else None)
 
 
-def module_version():
-    """Version of the nvidia kernel module built for the RUNNING kernel ('570.181'), or ''."""
-    kernel = os.uname().release
-    return _out(["modinfo", "-k", kernel, "-F", "version", "nvidia"]).strip()
+def module_version(kernel=None):
+    """Version of the nvidia kernel module built for `kernel` (default: the RUNNING one), or ''."""
+    return _out(["modinfo", "-k", kernel or os.uname().release, "-F", "version", "nvidia"]).strip()
+
+
+def installed_kernels():
+    """Every kernel this machine can boot (each /boot/vmlinuz-<k>, with or without /lib/modules/<k>:
+    a boot image whose modules are missing is exactly one the NVIDIA module check must catch), and
+    always the running one: an empty listing must never make "no kernel lacks the module" true."""
+    try:
+        found = {e[len("vmlinuz-"):] for e in os.listdir("/boot") if e.startswith("vmlinuz-")}
+    except OSError:
+        found = set()
+    return sorted(found | {os.uname().release})
+
+
+def kernels_without(upstream):
+    """The bootable kernels with no `upstream` nvidia module: rebooting may land on any of them (an
+    install that pulled a newer kernel becomes GRUB's default -- spec 296, 2026-10-20, came back on
+    5.15.0-1032-realtime with no module and was never offered)."""
+    return [k for k in installed_kernels() if not module_version(k).startswith(upstream)]
 
 
 def busy(since):
-    """Unless the agent reported AFTER `since` that it runs no task (render/batch jobs carry no
-    container label, so its own list is the source of truth), or a pb-* container still runs."""
+    """What keeps the node from being idle, or None. Unless the agent reported AFTER `since` that it
+    runs no task (render/batch jobs carry no container label, so its own list is the source of truth),
+    or a pb-* job / the platform's shared inference worker still runs. Named, not lumped together as
+    "a buyer job or rental": spec 297 (2026-10-20) said that with no job at all."""
     try:
         with open(BUSY) as f:
             b = json.load(f)
     except (OSError, ValueError):
-        return True                                  # no fresh report: assume busy
-    if b.get("at", 0) < since or b.get("tasks"):
-        return True
-    return any(n.startswith(("pb-", "petabyte-inference-inf-"))
-               for n in _out(["docker", "ps", "--format", "{{.Names}}"]).split())
+        return "the agent has not reported what it runs (is it running?)"
+    if b.get("at", 0) < since:
+        return "the agent's report of what it runs is stale (is it running?)"
+    if b.get("tasks"):
+        return f"a buyer job or rental is running (task {', '.join(map(str, b['tasks'][:3]))})"
+    try:
+        ps = _run(["docker", "ps", "--format", "{{.Names}}"], timeout=60)
+    except Exception:                                    # noqa: BLE001 — unknown is busy, never idle
+        ps = None
+    if ps is None or ps.returncode != 0:
+        # With live-restore, containers keep running while the daemon is down: unknown is not idle.
+        return "Docker did not answer, so running containers cannot be ruled out"
+    names = ps.stdout.split()
+    if any(n.startswith("pb-") for n in names):
+        return "a Petabyte job container is running"
+    if any(n.startswith("petabyte-inference-inf-") for n in names):
+        return "the shared inference worker is serving"
+    return None
 
 
 def why_not():
@@ -208,14 +240,16 @@ def upgrade():
 
 def _apply(inst, want, old_pkg, old_ver, st):
     """Drain, install, verify, or roll back. -> (reason or None, reboot?)."""
-    if busy(time.time() - 90):
-        return "a buyer job or rental is running; will retry when the node is idle", False
+    why = busy(time.time() - 90)
+    if why:
+        return f"{why}; will retry when the node is idle", False
     t0 = time.time()
     open(DRAIN, "w").close()                                       # the agent stops claiming jobs
     try:
         time.sleep(DRAIN_WAIT_S)
-        if busy(t0):
-            return "a job started while draining; will retry when the node is idle", False
+        why = busy(t0)
+        if why:
+            return f"{why} (it started while draining); will retry when the node is idle", False
         ok, why = _simulate_ok(inst)
         if not ok:
             st["failed"] = True
@@ -224,7 +258,8 @@ def _apply(inst, want, old_pkg, old_ver, st):
         r = _run(["apt-get", "install", "-y", "-o", "DPkg::Lock::Timeout=300",
                   "-o", "Dpkg::Options::=--force-confold", inst], timeout=3600)
         upstream = want.split("-")[0].split(":")[-1]
-        if r.returncode == 0 and module_version().startswith(upstream):
+        missing = kernels_without(upstream) if r.returncode == 0 else []
+        if r.returncode == 0 and not missing:
             st["ok"] = True
             return None, True
         # Never reboot into a driver whose module isn't there: put the previous driver back.
@@ -232,7 +267,7 @@ def _apply(inst, want, old_pkg, old_ver, st):
         rb = _run(["apt-get", "install", "-y", "--allow-downgrades", "-o", "Dpkg::Options::=--force-confold",
                    f"{old_pkg}={old_ver}"], timeout=3600)
         _run(["systemctl", "start", "petabyte-agent"], timeout=120)
-        why = ("the new driver's kernel module was not built for this kernel" if r.returncode == 0
+        why = (f"the new driver's kernel module was not built for kernel {', '.join(missing)}" if r.returncode == 0
                else "install failed: " + (r.stderr or r.stdout).strip()[-200:])
         if rb.returncode != 0 or not module_version().startswith(old_ver.split("-")[0].split(":")[-1]):
             return why + "; ROLLBACK FAILED: reinstall the NVIDIA driver on this machine before rebooting", False
