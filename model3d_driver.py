@@ -14,7 +14,7 @@ import mathutils
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model3d_scene import (BUILD_SYSTEM, request_plan, evidence, assembly_summary,
                            runtime_api_description, validate_render_settings, completion_blocks,
-                           sampling_options, execution_hint)
+                           sampling_options, execution_hint, validate_observation_names)
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
@@ -348,6 +348,7 @@ def run_code(code):
                     camera=camera, light=light, world=world)
     ns.update(bindings)
     try:
+        validate_observation_names(code)
         validate_render_settings(code, [name for name, value in ns.items()
                                         if value is bpy.context.scene])
         with contextlib.redirect_stdout(buf):
@@ -524,7 +525,7 @@ try:
                 parts_before = evidence(scene_objects(), [requirement])[0]["parts"]
                 prefix = ("Full request: " + args.prompt + "\nPlan: " + json.dumps(plan["requirements"])
                           + "\nComposition: " + plan["composition"])
-                suffix = ("\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
+                suffix = ("\nMeasured extents (read-only text, not Python state): " + json.dumps(assembly_summary(scene_objects()))
                           + "\nBuild ONLY this requirement now: " + json.dumps(requirement)
                           + f"\nThis assembly currently has {parts_before} verified mesh parts."
                           + " Add a compact batch of missing details; another pass can finish it."
@@ -585,7 +586,7 @@ try:
                 raise RuntimeError("Incomplete scene requirement " + requirement["id"] + ": " + last_err)
         # Composition is an explicit final pass, after all subjects exist. It must not delete them.
         composition_reply = chat_live(scene_messages("Full request: " + args.prompt,
-            "\nAssembly bounds: " + json.dumps(assembly_summary(scene_objects()))
+            "\nMeasured extents (read-only text, not Python state): " + json.dumps(assembly_summary(scene_objects()))
             + "\nSet the final camera, PBR materials, lights and world for this composition: " + plan["composition"]
             + "\nKeep all existing mesh objects. Use camera(location,target,lens=24) to frame the main subjects."
             + " Return a Python code block; do not change render settings."))

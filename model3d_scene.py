@@ -37,6 +37,7 @@ sphere(name,radius,location,color,segments=32)
 torus(name,major_radius,minor_radius,location,color,rotation=(rx,ry,rz))
 beam(name,start,end,radius,color) creates a cylinder joining two 3D points.
 ellipsoid(name,size,location,color,rotation=(0,0,0)) uses full dimensions.
+Mesh helper color arguments are numeric RGB, not material objects; assign PBR materials afterward.
 material(name,color,metallic=0,roughness=0.5,emission=None,strength=1) returns a PBR material.
 material(name) retrieves an existing material unchanged; a new material always needs numeric RGB.
 assign(obj,mat) accepts a material object or an existing material's name. Mesh helpers return the new
@@ -45,6 +46,8 @@ Do not link helper objects again. There is no predefined scene variable; scene.o
 obsolete Blender API. Only a brand-new bpy.data object needs bpy.context.collection.objects.link(obj).
 Helper/import names are reserved: never assign to box, terrain, material, camera, random, etc.
 Use names like terrain_obj, ground_mat and scene_camera for their returned objects/materials.
+Measured extents and part counts are read-only text, not Python variables. Never use assembly_bounds
+or write completion/count metadata; the driver computes that evidence from actual meshes.
 terrain(name,size=40,resolution=80,height=2,seed=1,color=(.4,.15,.07)) creates displaced rocky ground.
 camera(location,target,lens=24) sets the final artistic camera. light(name,location,color,energy,size=5)
 adds an area light. world(color,strength=.3) sets ambient light. remove(name) removes a part.
@@ -94,7 +97,29 @@ def execution_hint(message, source):
     if ("bmesh.ops.bevel" in source and message.startswith("TypeError:") and "thickness" in message):
         return (" bmesh.ops.bevel does not accept thickness. Use a mesh BEVEL modifier with width and segments; "
                 "apply the mesh's scale for a consistent bevel width.")
+    if "primitive_ellipsoid_add" in source and message.startswith("AttributeError:"):
+        return (" Blender has no primitive_ellipsoid_add operator. Use the provided "
+                "ellipsoid(name, size, location, color=(r,g,b)) helper, which returns a linked mesh.")
+    if message.startswith("ValueError:") and "no existing material" in message and "material(" in source:
+        return (" Material names are not predefined colors. First create the material with numeric RGB, "
+                "then use its returned material object or look it up by that same name.")
+    if message.startswith("TypeError:") and "color must be" in message and "bpy.data.materials[" in message:
+        return (" A material object is not an RGB color. Pass numeric RGB to the mesh helper, then "
+                "apply the material with assign(the_returned_mesh, the_material).")
     return ""
+
+
+def validate_observation_names(code):
+    """Reject invented bookkeeping state before any statement in this block runs.
+
+    The prompt's measured extents are text, not a mutable object in the execution namespace.
+    This narrowly checks a known mistaken name; it is not a Python security sandbox.
+    """
+    for node in ast.walk(ast.parse(code, filename="<llm>", mode="exec")):
+        if isinstance(node, ast.Name) and node.id == "assembly_bounds":
+            raise ValueError(f"assembly_bounds is read-only observation text, not a Python variable "
+                             f"(line {node.lineno}). Remove that bookkeeping code; build actual meshes. "
+                             "The driver measures extents and counts parts itself. No code in this block ran.")
 
 
 def runtime_api_description(bpy):
