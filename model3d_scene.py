@@ -147,6 +147,26 @@ def validate_material_assignments(code):
                          "Mesh-helper color arguments still take numeric RGB. No code in this block ran.")
 
 
+def validate_reserved_definitions(code, reserved_names):
+    """Reject explicit replacement helpers before any statement can mutate Blender.
+
+    Runtime binding restoration still handles other assignments. This narrow definition
+    check enforces the existing helper contract; it is not a Python security sandbox.
+    """
+    names = set(reserved_names)
+    definitions = sorted((node.lineno, node.name)
+                         for node in ast.walk(ast.parse(code, filename="<llm>", mode="exec"))
+                         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                         and node.name in names)
+    if definitions:
+        label = ", ".join(f"{name} (line {line})" for line, name in definitions[:8])
+        if len(definitions) > 8:
+            label += f" (+{len(definitions) - 8} more)"
+        raise ValueError("Reserved helper/import definitions are not allowed: " + label
+                         + ". Use the provided helpers directly; do not redefine or recreate them. "
+                         "Give custom functions/classes different names. No code in this block ran.")
+
+
 def runtime_api_description(bpy):
     """Describe sockets from this container, rather than guessing a Blender release's API."""
     version = getattr(bpy.app, "version_string", "unknown")

@@ -2463,6 +2463,18 @@ def _eevee_probe_bg():
     threading.Thread(target=run, daemon=True, name="pb-eevee-probe").start()
 
 
+def _model3d_host_identity():
+    # Host boot identity is shared across this machine's agent processes. Hash before sending;
+    # no hostname, network address or machine secret is exposed. Unsupported hosts fail closed.
+    try:
+        import pathlib
+        boot = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        import uuid
+        return hashlib.sha256(str(uuid.UUID(boot)).encode()).hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
 def _render_capabilities():
     """What this node can render, for the marketplace. `headless_eevee` is only true after a real
     EEVEE self-test passed here; `render_engines` always includes Cycles on a GPU node."""
@@ -2480,6 +2492,8 @@ def _render_capabilities():
     # model3d: Create 3D jobs (LLM on the GPU + Blender). Needs docker + an NVIDIA GPU.
     return {"blender": True, "render_engines": engines, "headless_eevee": bool(eevee),
             "model3d": 3 if v == "nvidia" else 0,  # full art-direction prompts and optional 1080p output
+            "model3d_peer": 1 if v == "nvidia" else 0,
+            "model3d_host": _model3d_host_identity(),
             "model3d_cache": _MODEL3D_CACHE.report(),
             "model3d_preparation": _MODEL3D_CACHE.status(),
             "gpu_count": gpu_count, "gpu_vendor": v, "blender_version": _EEVEE["blender_version"],
@@ -4351,6 +4365,9 @@ def _model3d_live_uploader(tid, live, stop):
 
 
 def _run_model3d(task):
+    if (task.get("model3d_peer") or {}).get("role") == "coder":
+        import model3d_peer
+        return model3d_peer.run(sys.modules[__name__], task)
     tid = task["task_id"]
     started = time.monotonic()
     _set_ui(status="running", task=f"Create 3D #{tid}")
@@ -4372,6 +4389,9 @@ def _run_model3d(task):
         if context <= 0:
             raise RuntimeError("the local coder context must be a positive token count")
         report_progress(tid, 5, "preparing the 3D model builder")
+        if task.get("model3d_peer"):
+            import model3d_peer
+            model3d_peer.wait_ready(sys.modules[__name__], task, started)
         endpoint = inference_worker.controller.endpoint_for_3d(task) if shared else None
         if shared and not endpoint:
             raise RuntimeError("the shared coder is no longer available; retry the build")

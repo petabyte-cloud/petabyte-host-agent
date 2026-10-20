@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model3d_scene import (BUILD_SYSTEM, request_plan, evidence, assembly_summary,
                            runtime_api_description, validate_render_settings, completion_blocks,
                            sampling_options, execution_hint, validate_observation_names,
-                           validate_material_assignments)
+                           validate_material_assignments, validate_reserved_definitions)
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
@@ -400,6 +400,7 @@ def run_code(code):
                     camera=camera, light=light, world=world)
     ns.update(bindings)
     try:
+        validate_reserved_definitions(code, bindings)
         validate_observation_names(code)
         validate_material_assignments(code)
         validate_render_settings(code, [name for name, value in ns.items()
@@ -454,6 +455,9 @@ def scene_messages(prefix, suffix, failure=None):
     return messages  # chat_live reports the mandatory instruction's explicit budget failure.
 
 
+_observed_local_peers = []
+
+
 def chat(messages):
     body = json.dumps({"model": args.model, "messages": messages,
                        **sampling_options(args.model),
@@ -463,7 +467,11 @@ def chat(messages):
                                           **({"Authorization": "Bearer " + os.environ["PB_MODEL3D_LLM_KEY"]}
                                              if os.getenv("PB_MODEL3D_LLM_KEY") else {})})
     with _llm_http.open(req, timeout=600) as r:
-        choice = json.load(r)["choices"][0]
+        reply = json.load(r)
+        choice = reply["choices"][0]
+        peer = reply.get("petabyte_local_peer")
+        if isinstance(peer, dict) and peer not in _observed_local_peers:
+            _observed_local_peers.append(peer)
         return {**choice["message"], "finish_reason": choice.get("finish_reason")}
 
 
@@ -761,7 +769,8 @@ if args.staged and getattr(sc.camera, "name", None) == "pb_artist_camera":
                   "fov": math.degrees(vertical_fov)}
 with open(os.path.join(args.out, "commit.json"), "w") as f:
     json.dump({"prompt": args.prompt, "ok": bool(diff) and (not args.staged or not error), "error": error, "summary": summary, "steps": log,
-               "model": args.model, "plan": plan, "plan_attempts": plan_attempts,
+               "model": args.model, "local_peer_responses": _observed_local_peers,
+               "plan": plan, "plan_attempts": plan_attempts,
                "requirements": checks, "viewer": viewer,
                "render_size": f"{size[1]}p", "resolution": list(size[:2]),
                "seconds": round(time.time() - t0, 1), "objects": scene_objects()}, f, indent=1)
