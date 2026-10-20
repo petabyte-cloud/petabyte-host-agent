@@ -122,6 +122,31 @@ def validate_observation_names(code):
                              "The driver measures extents and counts parts itself. No code in this block ran.")
 
 
+def validate_material_assignments(code):
+    """Reject known-invalid literal colors at every assign call before scene mutation.
+
+    This is a narrow helper-contract check, not a type checker or a Python security sandbox.
+    Material objects, existing names and computed values retain their runtime validation.
+    """
+    lines = set()
+    for node in ast.walk(ast.parse(code, filename="<llm>", mode="exec")):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "assign"):
+            continue
+        values = ([node.args[1]] if len(node.args) > 1 else [])
+        values += [kw.value for kw in node.keywords if kw.arg == "mat"]
+        if any(isinstance(value, (ast.Tuple, ast.List)) for value in values):
+            lines.add(node.lineno)
+    if lines:
+        ordered = sorted(lines)
+        label = ", ".join(str(line) for line in ordered[:8])
+        if len(ordered) > 8:
+            label += f" (+{len(ordered) - 8} more)"
+        raise ValueError("assign() needs a material object or an existing material name, not RGB tuples/lists "
+                         f"(lines {label}). Fix ALL these calls: create a material with "
+                         "material('name', (r,g,b)), then pass its returned handle to assign(obj, mat). "
+                         "Mesh-helper color arguments still take numeric RGB. No code in this block ran.")
+
+
 def runtime_api_description(bpy):
     """Describe sockets from this container, rather than guessing a Blender release's API."""
     version = getattr(bpy.app, "version_string", "unknown")
@@ -250,6 +275,11 @@ def parse_plan(text, prompt):
             raise ValueError("The local model supplied an invalid scene requirement")
         seen.add(key)
         clean.append({"id": key, "description": description[:1200], "min_parts": minimum})
+    setup = sorted(seen.intersection({"camera_setup", "lighting_setup"}))
+    if setup:
+        raise ValueError("Camera and lighting setup belong in composition, not physical mesh requirements: "
+                         + ", ".join(setup) + ". Keep every requested physical subject as a requirement; "
+                         "the final composition pass handles camera and lighting after those meshes exist.")
     return {"requirements": clean, "composition": str(plan.get("composition", ""))[:1800],
             "request": prompt}
 

@@ -15,7 +15,8 @@ import mathutils
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model3d_scene import (BUILD_SYSTEM, request_plan, evidence, assembly_summary,
                            runtime_api_description, validate_render_settings, completion_blocks,
-                           sampling_options, execution_hint, validate_observation_names)
+                           sampling_options, execution_hint, validate_observation_names,
+                           validate_material_assignments)
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
@@ -391,6 +392,7 @@ def run_code(code):
     ns.update(bindings)
     try:
         validate_observation_names(code)
+        validate_material_assignments(code)
         validate_render_settings(code, [name for name, value in ns.items()
                                         if value is bpy.context.scene])
         with contextlib.redirect_stdout(buf):
