@@ -42,6 +42,14 @@ if args.fresh:
     bpy.context.scene.world = bpy.data.worlds.new("World")
 
 
+def _llm_peer_opener():
+    """Talk directly to the job's coder or agent relay, without environment proxy routing."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+_llm_http = _llm_peer_opener()
+
+
 def _llm_health_failure(error):
     """Classify a probe failure without copying URLs, credentials, bodies or exception messages."""
     if isinstance(error, urllib.error.HTTPError) and isinstance(error.code, int):
@@ -62,7 +70,7 @@ def wait_for_llm(limit_s=600):
     while time.time() < end:
         attempts += 1
         try:
-            with urllib.request.urlopen(args.llm.rstrip("/") + "/health", timeout=5) as r:
+            with _llm_http.open(args.llm.rstrip("/") + "/health", timeout=5) as r:
                 if r.status == 200:
                     return
                 last = f"HTTP{r.status}" if isinstance(r.status, int) else "non-HTTP response"
@@ -428,7 +436,7 @@ def chat(messages):
                                  headers={"Content-Type": "application/json",
                                           **({"Authorization": "Bearer " + os.environ["PB_MODEL3D_LLM_KEY"]}
                                              if os.getenv("PB_MODEL3D_LLM_KEY") else {})})
-    with urllib.request.urlopen(req, timeout=600) as r:
+    with _llm_http.open(req, timeout=600) as r:
         choice = json.load(r)["choices"][0]
         return {**choice["message"], "finish_reason": choice.get("finish_reason")}
 
