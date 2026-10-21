@@ -1045,13 +1045,15 @@ def _select_runtime(available_runtimes: str, is_gpu: bool):
     namespaces, no runtime socket, no host filesystem, a per-job firewalled network — a hardened
     container on the host kernel, not a VM. (2026-10-06 audit: earlier comments here and on the
     /security page wrongly described gVisor as the fallback; it was never installed.)
-    Selection:
-      * AGENT_RUNTIME=runc                                      -> docker default (no extra runtime)
-      * AGENT_RUNTIME=gvisor|runsc, or AGENT_KATA_ENABLED=false -> registered runsc, else Docker default
-      * default / AGENT_RUNTIME=kata -> Kata when installed AND (CPU job, or GPU job with
-        AGENT_KATA_GPU=true); otherwise registered runsc if available, then Docker's
-        default runtime. Never run a GPU job on Kata without GPU passthrough. GPU-in-VM stays gated on
-        AGENT_KATA_GPU because most nodes lack VFIO.
+    Selection is ENFORCED, not seller-discretionary: when Kata can run the job it is used, and the
+    AGENT_RUNTIME / AGENT_KATA_ENABLED downgrade knobs are ignored (a seller cannot weaken a
+    Kata-capable node below the VM boundary).
+      * Kata installed, NOT WSL2, and (CPU job OR GPU job with AGENT_KATA_GPU=true) -> Kata.
+      * WSL2 node -> no Kata: the Hyper-V WSL2 VM is itself the boundary; the hardened container
+        runs inside it. (Kata cannot nest inside the WSL2 VM -- it fails to boot the container.)
+      * No Kata installed, or a GPU without VFIO -> registered runsc if present, else Docker's
+        hardened default runtime (all caps dropped, no-new-privileges, seccomp, private namespaces).
+      GPU-in-VM stays gated on AGENT_KATA_GPU because most nodes lack VFIO.
 
     `available_runtimes` is the `docker info --format {{.Runtimes}}` string; the Kata runtime is
     registered under one of several names depending on the install (kata / kata-runtime / …)."""
@@ -1071,17 +1073,18 @@ def _select_runtime(available_runtimes: str, is_gpu: bool):
         # existed: every non-GPU container then died at `docker run` (seller 308's Fedora KDE
         # rentals, 2026-10-13..20) while GPU jobs, which never use Kata, worked.
         kata = None
-    pref = (os.getenv("AGENT_RUNTIME") or "auto").strip().lower()
-    if pref == "runc":
-        return None
-    # Opt out of Kata via either control; runsc is selected only if registered.
-    if pref in ("gvisor", "runsc") or os.getenv("AGENT_KATA_ENABLED", "").strip().lower() in ("0", "false", "no", "off"):
-        return gvisor
-    # DEFAULT: prefer Kata (VM per container) whenever it is available. A GPU job still needs
-    # AGENT_KATA_GPU (VFIO) or it falls back to registered runsc, then Docker's default.
+    # ENFORCED (owner policy 2026-10-21): when Kata can actually run this job -- installed, NOT
+    # WSL2, and either a CPU job or a GPU job with VFIO (AGENT_KATA_GPU) -- it is used no matter
+    # what AGENT_RUNTIME / AGENT_KATA_ENABLED say. A seller cannot downgrade a Kata-capable node to
+    # a weaker runtime. Where Kata genuinely can't run -- a WSL2 node (the Hyper-V WSL2 VM already
+    # isolates the buyer container from the Windows host), no Kata installed, or a GPU without VFIO
+    # -- fall back to gVisor if an operator registered it, else Docker's hardened default runtime.
+    # ponytail: a node with Kata REGISTERED but unable to boot it now fails jobs loudly (the launch
+    # error names why, #1033) instead of silently downgrading; add a kata boot probe to
+    # isolation.selftest() if such nodes show up.
     if kata and (not is_gpu or _env_true("AGENT_KATA_GPU")):
         return kata
-    return gvisor   # Kata unavailable / GPU without VFIO: registered runsc, else Docker default
+    return gvisor
 
 
 def _isolation_flags(task):
