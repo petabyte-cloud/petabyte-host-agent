@@ -27,8 +27,10 @@ NAT traversal: sellers sit behind home routers, so the port a peer must send to 
 public mapping of the rank's WireGuard port, not the local one. create() keeps that local port
 bound and asks two STUN servers what it maps to (STUN = RFC 5389 binding request, stdlib only).
 The rank registers the MAPPED port. A router that maps differently per destination (symmetric
-NAT) cannot be traversed this way and is refused up front. While the rank waits for the cluster,
-keepalive() re-asks every STUN_REFRESH_S seconds so the mapping stays open; attach() releases the
+NAT) cannot be traversed this way and is refused up front, unless the seller forwarded the pinned
+DIST_WG_PORT: that port is then advertised as-is. nat_reachable() asks the same question ahead of
+time, for the heartbeat, so placement never picks a host every rank would refuse on. While the
+rank waits for the cluster, keepalive() re-asks every STUN_REFRESH_S seconds so the mapping stays open; attach() releases the
 socket immediately before WireGuard binds the same port, and both sides then send to each
 other's mapping, which opens each router's filter (simultaneous open; WireGuard retries every 5 s).
 
@@ -144,9 +146,27 @@ def discover_mapping(sock):
         return None
     if len({port for _ip, port in seen}) > 1:
         raise OverlayError("this host's NAT gives every destination a different port (symmetric NAT); "
-                           "forward one UDP port to this machine, set DIST_WG_PORT to it and set "
-                           "DIST_STUN_SERVERS empty so the forwarded port is advertised")
+                           "forward one UDP port to this machine and set DIST_WG_PORT to it")
     return seen[0][1]
+
+
+def forwarded_port() -> int:
+    """DIST_WG_PORT: a pinned (and, behind a NAT, port-forwarded) WireGuard port, or 0."""
+    return int(os.getenv("DIST_WG_PORT", "0") or 0)
+
+
+def nat_reachable():
+    """Can other ranks reach this host's WireGuard port? The answer create() would give, without
+    creating anything: True (a forwarded DIST_WG_PORT, or one consistent STUN mapping), False
+    (symmetric NAT: every rank here would be refused), None (no STUN answer: unknown)."""
+    if forwarded_port():
+        return True
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind(("0.0.0.0", 0))
+        try:
+            return True if discover_mapping(sock) else None
+        except OverlayError:
+            return False
 
 
 def overlay_ip(rank) -> str:
@@ -312,6 +332,7 @@ class RankOverlay:
         self._tid = tid
         self._hold = None          # the WireGuard port, held open for STUN until attach()
         self._last_stun = 0.0
+        self._forwarded = False    # symmetric NAT, but the operator forwarded this port
 
     def create(self, port=0):
         """Create the device in the HOST namespace (its UDP socket stays there).
@@ -326,7 +347,13 @@ class RankOverlay:
             hold.close()
             raise OverlayError("cluster overlay: the WireGuard port is already in use") from None
         self._hold, self.port = hold, hold.getsockname()[1]
-        self.public_port = discover_mapping(hold) or self.port
+        try:
+            self.public_port = discover_mapping(hold) or self.port
+        except OverlayError:
+            if not port:
+                raise
+            # DIST_WG_PORT is forwarded: peers reach it as-is, whatever the NAT does outbound.
+            self.public_port, self._forwarded = self.port, True
         self._last_stun = time.monotonic()
         _run(["ip", "link", "add", self.dev, "type", "wireguard"])
         priv = _run(["wg", "genkey"]).strip()
@@ -336,7 +363,7 @@ class RankOverlay:
 
     def keepalive(self):
         """While waiting for the other ranks: keep the NAT mapping open, and refuse if it moved."""
-        if self._hold is None or time.monotonic() - self._last_stun < STUN_REFRESH_S:
+        if self._hold is None or self._forwarded or time.monotonic() - self._last_stun < STUN_REFRESH_S:
             return
         self._last_stun = time.monotonic()
         server = (stun_servers() or [None])[0]
@@ -394,8 +421,8 @@ class RankOverlay:
             if time.monotonic() >= deadline:
                 raise OverlayError(
                     f"could not reach rank(s) {missing} over the overlay within {int(timeout)}s: a NAT or "
-                    "firewall blocks UDP between the machines (behind a symmetric NAT, forward a UDP port, "
-                    "set DIST_WG_PORT to it and DIST_STUN_SERVERS empty)")
+                    "firewall blocks UDP between the machines (behind a symmetric NAT, forward a UDP port "
+                    "and set DIST_WG_PORT to it)")
             time.sleep(1)
 
     def verify(self, rank, peers):

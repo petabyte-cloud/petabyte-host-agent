@@ -25,17 +25,31 @@ GPU_RE = re.compile(r"GPU-[a-fA-F0-9-]+\Z")
 CODER_MODEL = "qwen2.5-coder-7b-instruct"
 
 
+def wsl():
+    """True on WSL, False on native Linux, None when the kernel cannot be read."""
+    try:
+        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower()
+    except OSError:
+        return None
+
+
 def supported():
-    """Default-on for native Linux NVIDIA. Explicit false, WSL and other GPUs keep legacy serving."""
+    """Default-on for native Linux NVIDIA. WSL only when its owner opts in (PETABYTE_SHARED_POOL_WSL=true,
+    owner's call 2026-10-21): WSL's paravirtualized GPU was never validated for several CUDA servers at
+    once, so it is a per-node canary. Explicit false and other GPUs keep legacy serving."""
     if os.getenv("PETABYTE_SHARED_POOL", "true").lower() != "true" or sys.platform != "linux":
         return False
-    try:
-        if "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower():
-            return False
-    except OSError:
+    on_wsl = wsl()
+    if on_wsl is None or (on_wsl and os.getenv("PETABYTE_SHARED_POOL_WSL", "false").lower() != "true"):
         return False
     import gpu_runtime
     return gpu_runtime.vendor() == "nvidia"
+
+
+def gpu_args(gpu):
+    """The one validated GPU by UUID. WSL exposes every GPU through /dev/dxg and its toolkit takes only
+    `all`, which is that same single card: the plan requires exactly one GPU."""
+    return ["--gpus", "all"] if wsl() else ["--gpus", f"device={gpu['uuid']}"]
 
 
 def snapshot():
@@ -223,7 +237,7 @@ class PoolController:
                     if (starting or gpu["free"] < p["reserved_vram_mib"] + max(2048, int(gpu["total"] * 0.1))
                             or gpu.get("host_free", 0) < p["reserved_ram_mib"] + 6144):
                         continue
-                    c = iw.Controller(name=f"{iw.NAME}-{key}", gpu_args=["--gpus", f"device={gpu['uuid']}"], shared=True)
+                    c = iw.Controller(name=f"{iw.NAME}-{key}", gpu_args=gpu_args(gpu), shared=True)
                     tunnel = key + "-" + secrets.token_hex(4)
                     c.attach(lambda port, k=tunnel: self.open_tunnel(port, k),
                              lambda k=tunnel: self.close_tunnel(k), lambda k=tunnel: self.tunnel_alive(k))
@@ -264,17 +278,28 @@ class Model3DProxy:
                 self.wfile.write(body)
 
             def do_POST(self):
+                # Read the bounded body before ANY reply: a reply sent with the body unread can reach the
+                # client as a reset instead of its status (the deploy gate's flaky 403/503, 2026-10-21).
+                try:
+                    n = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    n = -1
+                # JSON may escape each content byte as six ASCII bytes (e.g. control chars).
+                try:
+                    raw = self.rfile.read(n) if 0 < n <= max(128 * 1024, 6 * max_chars + 16 * 1024) else None
+                except OSError:
+                    return
                 if closed.is_set() or not active():
                     return self.reply(503, b'{"error":"build coder lease ended"}')
                 auth = self.headers.get("Authorization", "")
                 if self.path != "/v1/chat/completions" or not hmac.compare_digest(auth.encode(), f"Bearer {key}".encode()):
                     return self.reply(403, b'{"error":"forbidden"}')
                 try:
-                    n = int(self.headers.get("Content-Length", "0"))
-                    # JSON may escape each content byte as six ASCII bytes (e.g. control chars).
-                    if not 0 < n <= max(128 * 1024, 6 * max_chars + 16 * 1024):
+                    if n < 0:
+                        raise ValueError("Content-Length")
+                    if raw is None:
                         return self.reply(413, b'{"error":"request too large"}')
-                    body = json.loads(self.rfile.read(n))
+                    body = json.loads(raw)
                     messages = body["messages"]
                     if (not isinstance(messages, list) or not 1 <= len(messages) <= 32
                             or any(not isinstance(m, dict) or m.get("role") not in ("system", "user", "assistant")

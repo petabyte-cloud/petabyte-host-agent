@@ -341,6 +341,8 @@ def heartbeat_loop():
                 pass
             if _JOB_NET["ok"] is not None:           # can this host isolate a networked app?
                 _hb["job_network"] = dict(_JOB_NET)
+            if _OVERLAY_NAT:                         # can other ranks reach this host (open|symmetric)?
+                _hb["overlay_nat"] = _OVERLAY_NAT
             _hb["gateways"] = _gateway_report()       # per-rental gateway support + RTT to each
             _hb["live_tasks"] = _live_task_ids()     # lets the server end tasks this node lost
             _bundle = _agent_bundle()
@@ -1058,6 +1060,12 @@ def _select_runtime(available_runtimes: str, is_gpu: bool):
 
     kata = present("kata-runtime", "kata-qemu", "kata-clh", "kata", "io.containerd.kata.v2")
     gvisor = present("runsc")
+    import isolation
+    if kata and isolation._is_wsl():
+        # Kata in WSL2 is a VM nested in Hyper-V's VM, and install.sh added it wherever /dev/kvm
+        # existed: every non-GPU container then died at `docker run` (seller 308's Fedora KDE
+        # rentals, 2026-10-13..20) while GPU jobs, which never use Kata, worked.
+        kata = None
     pref = (os.getenv("AGENT_RUNTIME") or "auto").strip().lower()
     if pref == "runc":
         return None
@@ -1571,12 +1579,32 @@ def _self_update_holds_claims():
     return True
 
 
+# Can the other ranks of a distributed job reach this host's WireGuard port? A symmetric NAT refuses
+# every rank (cluster_overlay.discover_mapping), so the server places ranks only on hosts reporting
+# "open". None until a STUN server answers (or DIST_WG_PORT is set); the last answer is kept.
+_OVERLAY_NAT = None
+
+
+def _probe_overlay_nat():
+    global _OVERLAY_NAT
+    try:
+        import cluster_overlay
+        reachable = cluster_overlay.nat_reachable()
+    except Exception as e:                               # noqa: BLE001 — never break the agent
+        logging.info(f"overlay NAT probe skipped: {e}")
+        return
+    if reachable is not None:
+        _OVERLAY_NAT = "open" if reachable else "symmetric"
+
+
 def _job_network_loop():
+    _probe_overlay_nat()                                 # STUN can take seconds: off the startup path
     last = time.time()
     while True:
         time.sleep(300)                                  # a launch failure is re-checked within 5 min
-        if not _JOB_NET["ok"] or time.time() - last >= 3600:
+        if not _JOB_NET["ok"] or _OVERLAY_NAT is None or time.time() - last >= 3600:
             _probe_job_network()
+            _probe_overlay_nat()
             last = time.time()
 
 
@@ -1834,10 +1862,12 @@ def _launch_failure_reason(e):
     if isinstance(e, subprocess.CalledProcessError):
         # a failed image pull (template_storage._pull) carries Docker's message in output, not stderr
         lines = [ln.strip() for ln in str(e.stderr or e.output or "").splitlines() if ln.strip()]
-        text = " | ".join(lines[-3:]) or f"docker exited {e.returncode}"
+        # `docker run` puts the reason on its FIRST line and boilerplate last ("Run 'docker run
+        # --help'"); a pull puts it last. Keeping only the tail lost the reason (2026-10-20).
+        text = " | ".join(lines[:1] + lines[-2:] if len(lines) > 3 else lines) or f"docker exited {e.returncode}"
     else:
         text = f"{type(e).__name__}: {e}"
-    return _mask_secrets(text)[-300:]
+    return _mask_secrets(text)[:400]
 
 
 # Server-driven orphan reap. The container watchdog only knows containers THIS process launched
@@ -4426,6 +4456,12 @@ def _run_model3d(task):
                                check=True, timeout=30)
             gateway = json.loads(r.stdout)[0]["IPAM"]["Config"][0]["Gateway"]
             def relay(payload):
+                if paired_builder:
+                    from model3d_peer import forward_chat
+                    return forward_chat(API_URL, HEADERS, _lease_payload({"task_id": tid}),
+                        {"messages": payload["messages"], "max_tokens": min(4096, payload["max_tokens"])},
+                        active=lambda: tid not in _KILLED and not stop.is_set(),
+                        timeout=min(600, int(task.get("max_runtime_s") or 600)))
                 return httpx.post(API_URL + "/jobs/model3d/chat", headers=HEADERS, trust_env=False,
                                   timeout=min(610, int(task.get("max_runtime_s") or 610)),
                                   json=_lease_payload({"task_id": tid, "messages": payload["messages"],
@@ -4990,7 +5026,7 @@ def _run_distributed(task):
                             f"container: {_docker_error(pout) or f'exit {prc}'}", "node_error")
     ov = _ov.RankOverlay(tid)
     try:
-        pub, port = ov.create(int(os.getenv("DIST_WG_PORT", "0")))
+        pub, port = ov.create(_ov.forwarded_port())
         r = httpx.post(f"{API_URL}{dist.get('register_url') or '/jobs/rendezvous'}", headers=HEADERS,
                        timeout=15, trust_env=False,
                        json=_lease_payload({"task_id": tid, "public_key": pub, "wg_port": port,

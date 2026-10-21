@@ -17,6 +17,68 @@ SHA = "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad"
 SIZE = 18556689568
 
 
+def _pending_call(response, expected=None):
+    try:
+        if len(response.content) > 1024:
+            raise ValueError("oversized ticket")
+        body = response.json()
+        call_id = body["call_id"]
+        if (body.get("pending") is not True or not isinstance(call_id, str) or len(call_id) != 32
+                or any(c not in "0123456789abcdef" for c in call_id)
+                or expected is not None and call_id != expected):
+            raise ValueError("invalid ticket")
+        return call_id
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise RuntimeError("the paired local model relay returned an invalid call ticket") from None
+
+
+def forward_chat(api_url, headers, lease, payload, active, timeout=600):
+    """Submit once, then poll the same owner/lease-bound call over short authenticated HTTP.
+
+    The private Blender connection can wait for inference, but no public edge request does.
+    An uncertain submission is never retried and polling cannot consume another call quota.
+    """
+    deadline = time.monotonic() + min(600, max(0, timeout))
+    if not active() or time.monotonic() >= deadline:
+        raise RuntimeError("the paired local model call lease ended")
+    with httpx.Client(trust_env=False, follow_redirects=False, timeout=15) as client:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise RuntimeError("the paired local model call lease ended")
+        response = client.post(api_url + "/jobs/model3d/chat", headers=headers,
+            json={**lease, "messages": payload["messages"], "max_tokens": payload["max_tokens"],
+                  "defer_response": True}, timeout=min(15, left))
+        if not active() or time.monotonic() >= deadline:
+            raise RuntimeError("the paired local model call lease ended")
+        if len(response.content) > 512 * 1024:
+            raise RuntimeError("the paired local model response is too large")
+        if response.status_code != 202:
+            return response
+        call_id = _pending_call(response)
+        while active() and time.monotonic() < deadline:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                response = client.post(api_url + "/jobs/model3d/peer/response", headers=headers,
+                    json={**lease, "call_id": call_id}, timeout=min(15, left))
+            except httpx.TransportError:
+                # This only reads an already admitted call. Never retry the submission above.
+                if not active() or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(1, max(0, deadline - time.monotonic())))
+                continue
+            if len(response.content) > 512 * 1024:
+                raise RuntimeError("the paired local model response is too large")
+            if not active() or time.monotonic() >= deadline:
+                break
+            if response.status_code != 202:
+                return response
+            _pending_call(response, call_id)
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise RuntimeError("the paired local model call ended or timed out")
+
+
 def api(host, task, route, **values):
     reply = httpx.post(host.API_URL + "/jobs/model3d/peer/" + route, headers=host.HEADERS,
         json={"task_id": task["task_id"], "lease_generation": task["lease_generation"], **values},

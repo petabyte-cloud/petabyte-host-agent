@@ -452,8 +452,48 @@ def warm(idle):
         threading.Thread(target=_warm_one, args=(image,), daemon=True, name="pb-keep-warm").start()
 
 
+def capabilities():
+    """What this agent can do: no Docker, no lock, so every heartbeat carries it. It used to ride on the
+    cache probe below, and a node whose probe never finished (the 2060, spec 246, 2026-10-21) reported
+    no capability at all, so it was offered no pool work and no feature that needs a flag."""
+    import shared_inference
+    result = {"version": 1, "probe_version": 1, "port_bridge_version": 1, "native_udp_version": 1,
+              "minecraft_status_version": 1, "ssh_start_version": 1,
+              "inference_offload_version": 1,     # inference_worker splits big models GPU/RAM
+              "image_pool_version": 1,            # inference_worker serves image leases (sd-server)
+              "image_checkpoint_version": 1,      # ...and complete SDXL checkpoints with embedded CLIP/VAE
+              "video_pool_version": 1,            # ...and video leases (Wan 2.2: t5xxl, vid_gen)
+              "video_llm_version": 1,             # ...with an llm encoder too (HunyuanVideo 1.5)
+              "audio_pool_version": 1,            # ...and audio leases (whisper-server, Chatterbox TTS)
+              "stt_jobs_version": 1,              # ...and long speech-to-text jobs from a bucket URL
+              "stt_burn_version": 1,              # ...that can burn the subtitles into the video
+              "vision_version": 1,                # ...and vision leases (llama-server --mmproj)
+              "imgtools_version": 1,              # ...and the CPU image tools (pool-imgtools)
+              "pool_images_version": 1,           # ...and Petabyte's slim pool images (deploy/pool-images)
+              "llm_args_version": 1,              # ...and passes a chat lease's allowlisted flags
+              # the cache below, or "unknown" while its probe has nothing fresh
+              "images": [], "cache_budget_bytes": 0, "cache_bytes": 0, "disk_free_bytes": 0,
+              "disk_reserve_bytes": 0}
+    if shared_inference.supported():
+        result["shared_pool_version"] = 1
+    return result
+
+
+_WARNED = {}   # probe error -> monotonic time last logged: the reason reaches the log hourly, not per beat
+
+
+def _warn(error):
+    import logging
+    reason = f"{type(error).__name__}: {error}"[:300]
+    if time.monotonic() - _WARNED.get(reason, -3600) >= 3600:
+        _WARNED[reason] = time.monotonic()
+        logging.warning("template storage: cache probe failed (%s); heartbeats carry capabilities only", reason)
+
+
 def report(gateway=""):
-    """Bounded, public cache metadata; private rental activity stays on this seller."""
+    """Capabilities plus the bounded, public cache metadata; private rental activity stays on this
+    seller. Docker can be slow: heartbeat_report runs this in the background."""
+    result = capabilities()
     try:
         with locked():
             state = read()
@@ -463,26 +503,9 @@ def report(gateway=""):
                 current = inspect(ref)
                 if current:
                     images.append(hashlib.sha256(ref.encode()).hexdigest())
-            result = {"version": 1, "probe_version": 1, "port_bridge_version": 1, "native_udp_version": 1,
-                      "minecraft_status_version": 1, "ssh_start_version": 1,
-                      "inference_offload_version": 1,     # inference_worker splits big models GPU/RAM
-                      "image_pool_version": 1,            # inference_worker serves image leases (sd-server)
-                      "image_checkpoint_version": 1,      # ...and complete SDXL checkpoints with embedded CLIP/VAE
-                      "video_pool_version": 1,            # ...and video leases (Wan 2.2: t5xxl, vid_gen)
-                      "video_llm_version": 1,             # ...with an llm encoder too (HunyuanVideo 1.5)
-                      "audio_pool_version": 1,            # ...and audio leases (whisper-server, Chatterbox TTS)
-                      "stt_jobs_version": 1,              # ...and long speech-to-text jobs from a bucket URL
-                      "stt_burn_version": 1,              # ...that can burn the subtitles into the video
-                      "vision_version": 1,                # ...and vision leases (llama-server --mmproj)
-                      "imgtools_version": 1,              # ...and the CPU image tools (pool-imgtools)
-                      "pool_images_version": 1,           # ...and Petabyte's slim pool images (deploy/pool-images)
-                      "llm_args_version": 1,              # ...and passes a chat lease's allowlisted flags
-                      "images": images, "cache_budget_bytes": int(budget),
-                      "cache_bytes": sum(x["bytes"] for x in state["images"].values()),
-                      "disk_free_bytes": free_bytes(), "disk_reserve_bytes": int(reserve)}
-        import shared_inference
-        if shared_inference.supported():
-            result["shared_pool_version"] = 1
+            result.update(images=images, cache_budget_bytes=int(budget),
+                          cache_bytes=sum(x["bytes"] for x in state["images"].values()),
+                          disk_free_bytes=free_bytes(), disk_reserve_bytes=int(reserve))
         mig = mig_mode()
         if mig:
             result["mig_mode"] = mig        # capability report only; the agent never changes MIG mode
@@ -501,7 +524,8 @@ def report(gateway=""):
             except OSError:
                 pass  # Cache metadata remains useful when the gateway probe fails.
         return result
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except Exception as e:  # noqa: BLE001 — a ledger/Docker fault must never hide what the agent can do
+        _warn(e)
         return None
 
 
@@ -533,7 +557,9 @@ def heartbeat_report(gateway=""):
         _PROBE = threading.Thread(target=refresh, daemon=True)
         _PROBE.start()
     at, value = _SNAPSHOT
-    return value if time.monotonic() - at < 45 else None
+    if value is not None and time.monotonic() - at < 45:
+        return value
+    return capabilities()                    # no fresh cache probe (slow, failed or hung Docker)
 
 
 def uninstall():

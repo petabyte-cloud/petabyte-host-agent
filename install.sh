@@ -120,6 +120,8 @@ KATA_OK=0
 if [ "${PETABYTE_KATA:-true}" != "false" ]; then
   if [ ! -e /dev/kvm ]; then
     echo "==> no /dev/kvm on this node — Kata skipped (normal on cloud droplets); using the hardened default runtime (runc)"
+  elif grep -qi microsoft /proc/version 2>/dev/null; then
+    echo "==> WSL2 — Kata skipped (a VM nested in Hyper-V's VM fails to start containers); using the hardened default runtime (runc)"
   elif [ "$(df -Pk /var/tmp | awk 'NR==2{print $4}')" -lt 6000000 ] 2>/dev/null; then
     echo "!! under 6 GB free on /var/tmp — Kata skipped (~930 MB download, ~3 GB unpacked); using the hardened default runtime (runc)"
   else
