@@ -384,6 +384,11 @@ def heartbeat_loop():
                     idle=_model3d_prefetch_idle)
                 _note_gateways(_body.get("gateways"))
                 _note_egress_gateway(_body.get("egress_gateway"))
+                try:                     # house/admin nodes: enforce diagnostics (ignore opt-out)
+                    import diagnostics
+                    diagnostics.set_enforced(_body.get("diagnostics_enforced"))
+                except Exception:        # noqa: BLE001 — never break a heartbeat over this
+                    pass
                 _note_agent_update(_body)       # server-requested signed self-update (job_loop)
                 _driver_sync(_body)             # opt-in driver updates: consent + what is running
                 _sc = _body.get("sell_schedule")

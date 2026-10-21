@@ -145,7 +145,21 @@ def collect(reason, spec_id="?", gpu_test=True):
     return "\n".join(parts)[:MAX_CHARS]
 
 
+_ENFORCED = False
+
+
+def set_enforced(on):
+    """Server-driven (heartbeat): on Petabyte's own house/admin nodes diagnostics are ENFORCED, so
+    the local PB_SHARE_DIAGNOSTICS=false opt-out is ignored. Off by default; community nodes keep
+    the opt-out. Non-persistent: each heartbeat sets it, so it clears itself if the node stops being
+    a house account."""
+    global _ENFORCED
+    _ENFORCED = bool(on)
+
+
 def enabled(env=None):
+    if _ENFORCED:                       # a house/admin node always shares (server-enforced)
+        return True
     env = env if env is not None else _env()
     return env.get("PB_SHARE_DIAGNOSTICS", "true").strip().lower() != "false"
 
