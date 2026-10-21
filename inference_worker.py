@@ -64,8 +64,10 @@ _SD_FLAGS = {"--cfg-scale", "--sampling-method", "--scheduler", "--flow-shift", 
 _SD_SWITCHES = {"--diffusion-fa", "--offload-to-cpu", "--vae-tiling"}
 _SD_VALUE_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 # The only server paths our API calls; the proxy refuses the rest (upscale, web UIs, model loading).
-_IMAGE_PATHS = re.compile(r"^/(v1/images/generations|v1/audio/speech|inference|sdcpp/v1/(capabilities|img_gen|"
-                          r"vid_gen|jobs/[A-Za-z0-9_-]{1,64}(/cancel)?))$")
+_IMAGE_PATHS = re.compile(r"^/(v1/images/generations|v1/audio/speech|inference|pb/img/(rembg|upscale)|"
+                          r"sdcpp/v1/(capabilities|img_gen|vid_gen|jobs/[A-Za-z0-9_-]{1,64}(/cancel)?))$")
+# Image tools (Petabyte Create, Phase 1): Petabyte's CPU server, its models baked into the pinned image.
+_IMGTOOLS_IMAGE_RE = re.compile(r"^docker\.io/petabytecloud/pool-imgtools@sha256:[0-9a-f]{64}$")
 # Audio leases: whisper.cpp's official CUDA image (speech to text) and Petabyte's Chatterbox image
 # (deploy/tts-server, text to speech). Each file is mounted at /models/<role>: role = the file name the
 # server loads, so it may not name a path.
@@ -77,6 +79,9 @@ _AUDIO_ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # up to STT_MAX_BYTES and polls the job. whisper-server has no job API, so AuthProxy runs the job.
 _STT_JOB_PATH = re.compile(r"^/pb/stt/jobs(?:/([0-9a-f]{16}))?$")
 _STT_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+\.(digitaloceanspaces\.com|aliyuncs\.com)/\S+$")
+# Burned-in subtitles: the finished video goes to the bucket with the API's signed, size-capped POST.
+_BURN_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+\.(digitaloceanspaces\.com|aliyuncs\.com)(/\S*)?$")
+BURN_STYLE = "FontName=DejaVu Sans,FontSize=20,Outline=2"    # DejaVu covers Arabic (pool-whisper's fonts)
 STT_MAX_BYTES = 512 * 1024 * 1024
 STT_TIMEOUT_S = 6 * 3600
 STT_KEEP_S = 3600                 # a finished job's result waits this long for the API to collect it
@@ -169,6 +174,27 @@ def _valid_audio(p):
             and p.get("args", []) == [] and type(p.get("seconds")) is int and 1 <= p["seconds"] <= 30)
 
 
+def _valid_vision(p):
+    """llama.cpp's server (the chat pool's pinned image) with a model and its vision projector."""
+    files = p.get("files")
+    return (isinstance(p.get("model"), str) and _MODEL_RE.match(p["model"])
+            and isinstance(p.get("image"), str) and _IMAGE_RE.match(p["image"])
+            and isinstance(files, list) and len(files) == 2 and all(isinstance(f, dict) for f in files)
+            and sorted(f.get("role") or "" for f in files) == ["mmproj", "model"]
+            and all(isinstance(f.get("url"), str) and _URL_RE.match(f["url"])
+                    and isinstance(f.get("sha256"), str) and _SHA_RE.match(f["sha256"])
+                    and type(f.get("size")) is int and 1 <= f["size"] <= 100 * 1024 ** 3 for f in files)
+            and type(p.get("ctx")) is int and 2048 <= p["ctx"] <= 131072
+            and type(p.get("parallel")) is int and 1 <= p["parallel"] <= 8
+            and p.get("args", []) == [] and type(p.get("seconds")) is int and 1 <= p["seconds"] <= 30)
+
+
+def _valid_imgtools(p):
+    return (isinstance(p.get("model"), str) and _MODEL_RE.match(p["model"])
+            and isinstance(p.get("image"), str) and _IMGTOOLS_IMAGE_RE.match(p["image"])
+            and p.get("files") == [] and type(p.get("seconds")) is int and 1 <= p["seconds"] <= 30)
+
+
 def valid(p):
     """The lease's shape, and that it names only the allowed image and weights."""
     def num(v, lo, hi):
@@ -177,6 +203,12 @@ def valid(p):
         return bool(_valid_image(p))
     if isinstance(p, dict) and p.get("kind") == "audio":
         return bool(_valid_audio(p))
+    if isinstance(p, dict) and p.get("kind") == "vision":
+        return bool(_valid_vision(p))
+    if isinstance(p, dict) and p.get("kind") == "imgtools":
+        return bool(_valid_imgtools(p))
+    if isinstance(p, dict) and p.get("kind") is not None:
+        return False
     return (isinstance(p, dict) and isinstance(p.get("model"), str) and _MODEL_RE.match(p["model"])
             and isinstance(p.get("url"), str) and _URL_RE.match(p["url"])
             and isinstance(p.get("sha256"), str) and _SHA_RE.match(p["sha256"])
@@ -357,6 +389,37 @@ def bench_tts(url):
     return round(max(len(r.content) - 44, 0) / (24000 * 2) / max(time.monotonic() - t, 1e-3), 2)
 
 
+def _tiny_png(side=64):
+    """A plain grey PNG: the image tools' benchmark input (the server resizes it to its working size)."""
+    import struct
+    import zlib
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+    rows = b"".join(b"\x00" + b"\x80" * (side * 3) for _ in range(side))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def bench_imgtools(url):
+    """Images per second for one background removal (the heavier tool, at its full working size)."""
+    t = time.monotonic()
+    r = httpx.post(f"{url}/pb/img/rembg", content=_tiny_png(), timeout=300, trust_env=False)
+    r.raise_for_status()
+    if r.content[:4] != b"\x89PNG":
+        raise RuntimeError("the image tools server returned no image")
+    return round(1 / max(time.monotonic() - t, 1e-3), 3)
+
+
+def srt(result):
+    """whisper's verbose_json segments as SRT (lumaris_api/audio_pool.render, for burning in)."""
+    def stamp(x):
+        ms = int(round(max(float(x), 0) * 1000))
+        return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+    segs = [s for s in result.get("segments") or [] if isinstance(s, dict) and str(s.get("text", "")).strip()]
+    return "\n".join(f"{i}\n{stamp(s['start'])} --> {stamp(s['end'])}\n{str(s['text']).strip()}\n"
+                     for i, s in enumerate(segs, 1))
+
+
 def _retire(image):
     try:
         import template_storage
@@ -370,17 +433,32 @@ def _retire(image):
 class SttJobs:
     """Speech-to-text jobs: download the buyer's upload from a short-lived bucket URL into scratch (RAM
     when the node has it), transcribe it on whisper-server, and keep the result until the API polls it.
-    One transcription runs at a time; the rest queue."""
+    One transcription runs at a time; the rest queue. A job with `burn` (and an `image`: pool-whisper,
+    whose ffmpeg has libass and Arabic-capable fonts) then burns the subtitles into the video in a
+    one-shot, network-less container and uploads it with the API's signed POST."""
 
-    def __init__(self, inner_port):
-        self.inner, self.jobs = inner_port, {}
+    def __init__(self, inner_port, image=None):
+        self.inner, self.jobs, self.image = inner_port, {}, image
         self.lock, self.gpu = threading.Lock(), threading.Lock()
+        self.burning = set()
+
+    def close(self):
+        """The server is stopping (a rental, a lapsed lease): no burn may outlive it on the CPU."""
+        for name in list(self.burning):
+            docker("rm", "-f", name)
 
     def start(self, body):
-        """(HTTP status, reply) for POST /pb/stt/jobs {url, filename, language}."""
+        """(HTTP status, reply) for POST /pb/stt/jobs {url, filename, language, burn: {url, fields}}."""
         url, language = str(body.get("url") or ""), str(body.get("language") or "auto")
         name = re.sub(r"[^A-Za-z0-9._ -]", "_", str(body.get("filename") or "audio"))[:120] or "audio"
         if not _STT_URL_RE.match(url) or language not in ("auto", "ar", "en"):
+            return 400, {"error": "bad job"}
+        burn = body.get("burn")
+        if burn is not None and not (
+                self.image and isinstance(burn, dict) and isinstance(burn.get("url"), str)
+                and _BURN_URL_RE.match(burn["url"]) and isinstance(burn.get("fields"), dict)
+                and len(burn["fields"]) <= 16
+                and all(isinstance(k, str) and isinstance(v, str) for k, v in burn["fields"].items())):
             return 400, {"error": "bad job"}
         with self.lock:
             now = time.time()
@@ -390,7 +468,7 @@ class SttJobs:
                 return 429, {"error": "too many jobs"}
             jid = secrets.token_hex(8)
             self.jobs[jid] = {"status": "queued"}
-        threading.Thread(target=self._work, args=(jid, url, name, language), daemon=True,
+        threading.Thread(target=self._work, args=(jid, url, name, language, burn), daemon=True,
                          name=f"pb-stt-{jid}").start()
         return 202, {"id": jid, "status": "queued"}
 
@@ -399,13 +477,47 @@ class SttJobs:
             job = self.jobs.get(jid)
             return (200, dict(job)) if job else (404, {"error": "job not found"})
 
-    def _work(self, jid, url, name, language):
+    def _burn(self, jid, work, result, burn):
+        """ffmpeg (libx264, at most 1920 wide) with the transcript as SRT, then the signed upload."""
+        with open(os.path.join(work, "subs.srt"), "w", encoding="utf-8") as f:
+            f.write(srt(result))
+        root = os.getuid() == 0
+        if root:                                  # the container runs as nobody: let it read and write /w
+            for p in (work, os.path.join(work, "upload"), os.path.join(work, "subs.srt")):
+                os.chown(p, 65534, 65534)
+        name, user = f"petabyte-burn-{jid}", "65534:65534" if root else f"{os.getuid()}:{os.getgid()}"
+        self.burning.add(name)
+        try:
+            r = docker("run", "--rm", "--name", name, "--network=none", "--read-only", "--cap-drop=ALL",
+                       "--security-opt=no-new-privileges", "--pids-limit=256", f"--user={user}",
+                       "--memory=2g", "--cpus=2", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+                       "--log-opt=max-size=1m", "-v", f"{work}:/w", "--entrypoint", "ffmpeg", self.image,
+                       "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "/w/upload",
+                       "-vf", f"scale='trunc(min(1920,iw)/2)*2':-2,subtitles=/w/subs.srt:force_style='{BURN_STYLE}'",
+                       "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k",
+                       "-movflags", "+faststart", "-y", "/w/out.mp4", timeout=STT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("burning the subtitles took too long")
+        finally:
+            docker("rm", "-f", name)
+            self.burning.discard(name)
+        out = os.path.join(work, "out.mp4")
+        if r.returncode or not os.path.exists(out):
+            raise RuntimeError("ffmpeg could not burn the subtitles: " + r.stderr.strip()[-160:])
+        with open(out, "rb") as f:
+            u = httpx.post(burn["url"], data=burn["fields"], files={"file": ("subtitled.mp4", f, "video/mp4")},
+                           timeout=httpx.Timeout(60, write=900), trust_env=False)
+        if u.status_code not in (200, 201, 204):
+            raise RuntimeError(f"the subtitled video could not be uploaded ({u.status_code})")
+
+    def _work(self, jid, url, name, language, burn=None):
         job, work = self.jobs[jid], None
         with self.gpu:
             job.update(status="running", started=int(time.time()))
             try:
                 import agent_scratch
-                work = agent_scratch.make_scratch("pb-stt-", need_bytes=STT_MAX_BYTES)
+                # a burn keeps the upload and writes the subtitled video beside it
+                work = agent_scratch.make_scratch("pb-stt-", need_bytes=STT_MAX_BYTES * (2 if burn else 1))
                 path, n = os.path.join(work, "upload"), 0
                 with httpx.stream("GET", url, timeout=httpx.Timeout(60, read=300), trust_env=False) as r:
                     if r.status_code != 200:
@@ -422,7 +534,15 @@ class SttJobs:
                                          "temperature": "0.0"}, timeout=STT_TIMEOUT_S, trust_env=False)
                 if r.status_code != 200:
                     raise RuntimeError(f"the speech server refused the file ({r.status_code})")
-                job.update(status="completed", result=r.json(), completed=int(time.time()))
+                result = r.json()
+                if burn:                          # the transcript is good either way; the API bills what worked
+                    job.update(stage="burning")
+                    try:
+                        self._burn(jid, work, result, burn)
+                        job["burned"] = True
+                    except Exception as e:        # noqa: BLE001 — reported, the transcript still completes
+                        job["burn_error"] = str(e)[:200]
+                job.update(status="completed", result=result, completed=int(time.time()))
             except Exception as e:                        # noqa: BLE001 — reported to the API, never raised
                 job.update(status="failed", error=str(e)[:200], completed=int(time.time()))
             finally:
@@ -435,8 +555,8 @@ class AuthProxy:
     the worker's address, reaches it only through this: the session key, and only _IMAGE_PATHS.
     A speech-to-text proxy (stt_jobs) also runs the long-file jobs itself (SttJobs, /pb/stt/jobs)."""
 
-    def __init__(self, inner_port, key, stt_jobs=False):
-        jobs = SttJobs(inner_port) if stt_jobs else None
+    def __init__(self, inner_port, key, stt_jobs=False, image=None):
+        jobs = self.jobs = SttJobs(inner_port, image) if stt_jobs else None
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
@@ -497,6 +617,8 @@ class AuthProxy:
         threading.Thread(target=self.server.serve_forever, daemon=True, name="pb-image-proxy").start()
 
     def close(self):
+        if self.jobs:
+            self.jobs.close()
         self.server.shutdown()
         self.server.server_close()
 
@@ -618,6 +740,10 @@ class Controller:
                 return self._serve_image(p, stop)
             if p.get("kind") == "audio":
                 return self._serve_audio(p, stop)
+            if p.get("kind") == "vision":
+                return self._serve_vision(p, stop)
+            if p.get("kind") == "imgtools":
+                return self._serve_imgtools(p, stop)
             self._resources = (["--memory", f"{p['reserved_ram_mib']}m", "--cpus", "2"]
                                if self.shared else [])
             path = self._fetch(p, lambda: self._lapsed(stop))
@@ -791,8 +917,90 @@ class Controller:
         speed = bench_stt(url) if stt else bench_tts(url)
         if self._lapsed(stop):
             return
-        self._proxy = AuthProxy(inner, key, stt_jobs=stt)
+        self._proxy = AuthProxy(inner, key, stt_jobs=stt, image=image if stt else None)
         self._warm_until_done(p, stop, self._proxy.port, key, dict(kind="audio", bench_mps=speed))
+
+    def _ready(self, url, path, stop, what):
+        """Wait for `url + path` to answer 200; False when the lease ended first."""
+        deadline = time.monotonic() + READY_TIMEOUT_S
+        while True:
+            if stop.wait(2) or self._lapsed(stop):
+                return False
+            try:
+                if httpx.get(url + path, timeout=3, trust_env=False).status_code == 200:
+                    return True
+            except httpx.HTTPError:
+                pass
+            if not self._running():
+                raise RuntimeError(f"{what} server exited while loading")
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"{what} server did not become ready")
+
+    def _serve_vision(self, p, stop):
+        """llama-server with the model and its vision projector (--mmproj), its own API key like chat.
+        --image-max-tokens keeps one page image (plus its transcript) inside the context."""
+        targets = [_target(f) for f in p["files"]]
+        self._resources = (["--memory", f"{p['reserved_ram_mib']}m", "--cpus", "2"]
+                           if self.shared else [])
+        paths = {f["role"]: self._fetch(f, lambda: self._lapsed(stop), keep=targets)
+                 for f in sorted(p["files"], key=lambda f: f["size"])}
+        import template_storage
+        template_storage.prepare(p["image"], 0, timeout=1800)
+        image = template_storage.local(p["image"])
+        if self._lapsed(stop):
+            return
+        self._set(state="starting", model=p["model"])
+        self._stop_container()
+        port, key = _free_port(), secrets.token_urlsafe(32)
+        r = docker("run", "-d", "--rm", "--pull=never", "--name", self.name, "--label", LABEL,
+                   "--restart=no", *self.gpu_args, *self._resources, "-p", f"127.0.0.1:{port}:8080",
+                   "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                   "--pids-limit=256", "--user=65534:65534", "-e", "HOME=/tmp",
+                   "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+                   "--log-opt=max-size=1m", "--log-opt=max-file=1",
+                   "--mount", f"type=bind,src={paths['model']},dst=/models/model.gguf,readonly",
+                   "--mount", f"type=bind,src={paths['mmproj']},dst=/models/mmproj.gguf,readonly",
+                   "-e", f"LLAMA_ARG_API_KEY={key}",
+                   image, "-m", "/models/model.gguf", "--mmproj", "/models/mmproj.gguf",
+                   "--image-max-tokens", str(p["ctx"] * 5 // 16), "--host", "0.0.0.0", "--port", "8080",
+                   "-c", str(p["ctx"] * p["parallel"]), "-np", str(p["parallel"]), "-ngl", "999", timeout=60)
+        if r.returncode:
+            raise RuntimeError(f"vision server did not start: {r.stderr.strip()[:160]}")
+        url = f"http://127.0.0.1:{port}"
+        if not self._ready(url, "/health", stop, "vision"):
+            return
+        tps = bench(url, key)
+        self._warm_until_done(p, stop, port, key, dict(kind="vision", bench_mps=tps))
+
+    def _serve_imgtools(self, p, stop):
+        """Petabyte's image tools server (deploy/pool-images/imgtools) behind AuthProxy. CPU only: no
+        GPU is passed in, so it can never touch the chat model's VRAM."""
+        import template_storage
+        template_storage.prepare(p["image"], 0, timeout=1800)
+        image = template_storage.local(p["image"])
+        if self._lapsed(stop):
+            return
+        self._set(state="starting", model=p["model"])
+        self._stop_container()
+        inner, key = _free_port(), secrets.token_urlsafe(32)
+        threads = max(1, min(4, (os.cpu_count() or 2) // 2))       # at most half the seller's CPU
+        r = docker("run", "-d", "--rm", "--pull=never", "--name", self.name, "--label", LABEL,
+                   "--restart=no", "--memory", f"{p.get('reserved_ram_mib', 4096)}m", "--cpus", str(threads),
+                   "-e", f"PB_THREADS={threads}", "-p", f"127.0.0.1:{inner}:8080",
+                   "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                   "--pids-limit=256", "--user=65534:65534", "-e", "HOME=/tmp",
+                   "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
+                   "--log-opt=max-size=1m", "--log-opt=max-file=1", image, timeout=60)
+        if r.returncode:
+            raise RuntimeError(f"image tools server did not start: {r.stderr.strip()[:160]}")
+        url = f"http://127.0.0.1:{inner}"
+        if not self._ready(url, "/health", stop, "image tools"):
+            return
+        speed = bench_imgtools(url)
+        if self._lapsed(stop):
+            return
+        self._proxy = AuthProxy(inner, key)
+        self._warm_until_done(p, stop, self._proxy.port, key, dict(kind="imgtools", bench_mps=speed))
 
     def _warm_until_done(self, p, stop, port, key, extra):
         """Open the tunnel to `port`, report warm, and watch the server until the lease ends."""

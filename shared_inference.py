@@ -80,7 +80,9 @@ def valid_plan(p, gpu):
                 or w["model"] in models):
             return False
         vram, ram = w.get("reserved_vram_mib"), w.get("reserved_ram_mib")
-        if type(vram) is not int or type(ram) is not int or not 0 < vram <= budget or not 0 < ram <= 1024 ** 2:
+        cpu_only = w.get("kind") == "imgtools"        # Create's image tools never get the GPU
+        if (type(vram) is not int or type(ram) is not int or not (0 < vram or cpu_only and vram == 0)
+                or vram > budget or not 0 < ram <= 1024 ** 2):
             return False
         ids.add(w["worker_id"])
         models.add(w["model"])
