@@ -280,8 +280,12 @@ def parse_plan(text, prompt):
     if not isinstance(plan, dict):
         raise ValueError("The local model did not supply a scene plan object")
     rows = plan.get("requirements")
-    if not isinstance(rows, list) or not 1 <= len(rows) <= 7:
-        raise ValueError("The local model did not supply a complete scene plan")
+    if not isinstance(rows, list):
+        raise ValueError("Scene plan requirements must be a JSON array of 1-7 physical mesh assemblies")
+    if not 1 <= len(rows) <= 7:
+        raise ValueError(f"Scene plan has {len(rows)} requirements; expected 1-7 physical mesh assemblies. "
+                         "Group related details under their main subject or environment, preserving every "
+                         "requested feature. Put camera, lighting and material-only work in composition.")
     clean, seen = [], set()
     for row in rows:
         if not isinstance(row, dict):

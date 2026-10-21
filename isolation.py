@@ -29,6 +29,12 @@ import network_policy as npol
 STATE = "/var/lib/petabyte-agent/isolation.json"
 AGENT_ENV = "/etc/petabyte/agent.env"
 DROPIN = "/etc/systemd/system/petabyte-agent.service.d/10-local-docker.conf"
+WSL_CONF = "/etc/wsl.conf"
+# WSL's defaults mount the seller's Windows drives under /mnt and let Linux start Windows programs,
+# so a buyer who escaped their container could read the seller's files. The agent needs neither:
+# CUDA comes from /usr/lib/wsl, and Windows drives this distro, never the other way round.
+_WSL_HARDENING = {"automount": {"enabled": "false", "mountFsTab": "false"},
+                  "interop": {"enabled": "false", "appendWindowsPath": "false"}}
 SELFTEST_TID = 999999999            # far above real task ids; its network/chains are removed after
 _ENGINE_ON = ["systemctl", "enable", "--now", "docker"]
 _ACTIONS = {
@@ -152,12 +158,45 @@ def _apply(action):
     return all(subprocess.run(cmd, timeout=1800).returncode == 0 for cmd in _ACTIONS[action])
 
 
+def harden_wsl():
+    """Close the Windows host's drives and programs to this WSL distro (from its next start), keeping
+    every other wsl.conf setting. True when wsl.conf changed. A file it cannot parse is left alone."""
+    if not _is_wsl():
+        return False
+    import configparser
+    conf = configparser.ConfigParser(interpolation=None)
+    conf.optionxform = str                       # wsl.conf keys are camelCase
+    try:
+        conf.read(WSL_CONF)
+    except configparser.Error as e:
+        print(f"isolation: {WSL_CONF} is not valid; left unchanged ({e})")
+        return False
+    changed = False
+    for section, keys in _WSL_HARDENING.items():
+        if not conf.has_section(section):
+            conf.add_section(section)
+        for key, value in keys.items():
+            if conf.get(section, key, fallback="").lower() != value:
+                conf.set(section, key, value)
+                changed = True
+    if changed:
+        try:
+            with open(WSL_CONF, "w") as f:
+                conf.write(f)
+        except OSError as e:
+            print(f"isolation: could not harden {WSL_CONF} ({e})")
+            return False
+        print("isolation: WSL hardened: Windows drives and programs are closed to this distro from its next start")
+    return changed
+
+
 def repair(version=None):
     """Detect, apply only the safe repairs, self-test, record {ok, reason, repaired}. With a version
     (the auto-update), runs at most once per agent version."""
     if version and last_repair().get("version") == version:
         print("isolation: repair already attempted for this agent version; skipping")
         return bool(last_repair().get("ok"))
+    harden_wsl()
     actions, reason = plan(inspect())
     if version:
         _save({"version": version, "at": int(time.time()), "ok": False, "reason": "interrupted"})
