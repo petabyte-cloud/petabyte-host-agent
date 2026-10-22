@@ -1,4 +1,4 @@
-# Petabyte Windows node installer — runs the (tested) Linux agent inside WSL2.
+# Petabyte Windows node installer - runs the (tested) Linux agent inside WSL2.
 # Run in an ELEVATED PowerShell (the /install page generates this with your key filled in):
 #   $env:PETABYTE_API_URL="https://petabyte.market"
 #   $env:PETABYTE_API_KEY="pk_your_node_key"
@@ -12,7 +12,7 @@
 #      "Petabyte" (Ubuntu 24.04), so Docker Desktop's WSL integration never serves it.
 #   3) Enables systemd inside the distro.
 #   4) Runs the standard Linux install.sh inside WSL (Docker sandbox, provision,
-#      attestation, petabyte-agent systemd service) — same code as Linux nodes.
+#      attestation, petabyte-agent systemd service) - same code as Linux nodes.
 #   5) Registers a Scheduled Task so the node comes online at logon. Its window
 #      ("Petabyte node - keep open") is the node: closing it takes the GPU offline.
 #
@@ -81,7 +81,7 @@ foreach ($v in "PETABYTE_API_URL","PETABYTE_API_KEY") {
     if (-not (Get-Item "env:$v" -ErrorAction SilentlyContinue)) { Fail "set `$env:$v first." }
 }
 if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
-    Write-Host "WARNING: nvidia-smi not found — install the NVIDIA Windows driver for GPU jobs." -ForegroundColor Yellow
+    Write-Host "WARNING: nvidia-smi not found - install the NVIDIA Windows driver for GPU jobs." -ForegroundColor Yellow
 }
 
 # --- 1. WSL2 + Ubuntu -------------------------------------------------------
@@ -89,7 +89,7 @@ $wslOk = $false
 try { wsl.exe --status | Out-Null; $wslOk = $true } catch {}
 $wslPre = $wslOk    # was WSL already present BEFORE Petabyte touched anything?
 if (-not $wslOk) {
-    Write-Host "==> installing WSL2 (a reboot may be required — rerun this script after)"
+    Write-Host "==> installing WSL2 (a reboot may be required - rerun this script after)"
     wsl.exe --install --no-distribution
     Write-Host "If Windows asks to reboot: reboot, then rerun this script." -ForegroundColor Yellow
 }

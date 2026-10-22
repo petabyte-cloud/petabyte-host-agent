@@ -88,6 +88,9 @@ def completion_blocks(reply, label):
 
 def execution_hint(message, source):
     """Correct observed Blender API mistakes at the failing line, without changing/executing code."""
+    if message.startswith("AttributeError:") and "'World' object has no attribute 'nodes'" in message:
+        return (" World shader nodes belong to its node_tree, not World.nodes. Enable world.use_nodes, "
+                "then use world.node_tree.nodes and world.node_tree.links. Keep the existing scene geometry.")
     if ("scene.objects.link" in source and
             (message.startswith("NameError:") or message.startswith("AttributeError:"))):
         return (" Remove scene.objects.link(...): mesh helpers already link their objects and scene is not a "

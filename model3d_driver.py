@@ -645,26 +645,58 @@ try:
                 feedback = "Previous failure: " + last_err + RERUN_HINT
             else:
                 raise RuntimeError("Incomplete scene requirement " + requirement["id"] + ": " + last_err)
-        # Composition is an explicit final pass, after all subjects exist. It must not delete them.
-        composition_reply = chat_live(scene_messages("Full request: " + args.prompt,
-            "\nMeasured extents (read-only text, not Python state): " + json.dumps(assembly_summary(scene_objects()))
-            + "\nSet the final camera, PBR materials, lights and world for this composition: " + plan["composition"]
-            + "\nKeep all existing mesh objects. Use camera(location,target,lens=24) to frame the main subjects."
-            + " Return a Python code block; do not change render settings."))
-        composition_blocks, composition_error = completion_blocks(composition_reply, "scene composition")
-        if not composition_blocks:
-            raise RuntimeError(composition_error)
-        for code in composition_blocks:
-            ok, res = run_code(DONE_LINE.sub("", code))
-            if not ok:
-                raise RuntimeError("Scene composition failed: " + res)
-            diff.append(code)
-        bpy.context.view_layer.update()
-        checks = evidence(scene_objects(), plan["requirements"])
-        if not all(c["complete"] for c in checks):
-            raise RuntimeError("Composition removed required scene geometry")
-        if getattr(bpy.context.scene.camera, "name", None) != "pb_artist_camera":
-            raise RuntimeError("The scene has no deliberate composition camera")
+        # Keep the existing final-pass allowance. Corrections use only unused assembly steps,
+        # at most three composition attempts in this same job; geometry loss still fails closed.
+        previous_composition, composition_feedback, composition_error = None, None, ""
+        for composition_attempt in range(3):
+            if composition_attempt:
+                if step >= args.max_steps:
+                    raise RuntimeError("Scene build budget ended before composition could be repaired: "
+                                       + composition_error)
+                step += 1
+            failure = {"role": "user", "content": composition_feedback} if composition_feedback else None
+            composition_messages = scene_messages("Full request: " + args.prompt,
+                "\nMeasured extents (read-only text, not Python state): " + json.dumps(assembly_summary(scene_objects()))
+                + "\nSet the final camera, PBR materials, lights and world for this composition: " + plan["composition"]
+                + "\nKeep all existing mesh objects. Use camera(location,target,lens=24) to frame the main subjects."
+                + " Return a Python code block; do not change render settings.", failure)
+            if previous_composition is not None:
+                retry = [*composition_messages[:-1],
+                         {"role": "assistant", "content": previous_composition}, failure]
+                composition_messages = retry if fits_context(retry) else composition_messages
+            composition_reply = chat_live(composition_messages)
+            previous_composition = composition_reply.get("content") or ""
+            composition_blocks, composition_error = completion_blocks(composition_reply, "scene composition")
+            if not composition_blocks:
+                log.append({"step": step, "stage": "composition", "attempt": composition_attempt, "ok": False,
+                            "result": composition_error, "response": previous_composition,
+                            "finish_reason": composition_reply.get("finish_reason")})
+            for code in composition_blocks:
+                code = DONE_LINE.sub("", code)
+                ok, res = run_code(code)
+                log.append({"step": step, "stage": "composition", "attempt": composition_attempt, "ok": ok,
+                            "result": res[:2000], "code": code,
+                            "finish_reason": composition_reply.get("finish_reason")})
+                print("PBSTEP", step, "composition", "ok" if ok else "ERR", res[:300], flush=True)
+                if not ok:
+                    composition_error = res
+                    break  # A failed block must not execute later blocks from the same reply.
+                diff.append(code)
+                _snap["dirty"] = True
+            bpy.context.view_layer.update()
+            checks = evidence(scene_objects(), plan["requirements"])
+            if not all(c["complete"] for c in checks):
+                raise RuntimeError("Composition removed required scene geometry")
+            if not composition_error and getattr(bpy.context.scene.camera, "name", None) != "pb_artist_camera":
+                composition_error = "The scene has no deliberate composition camera"
+                log.append({"step": step, "stage": "composition", "attempt": composition_attempt, "ok": False,
+                            "result": composition_error, "finish_reason": composition_reply.get("finish_reason")})
+            if not composition_error:
+                break
+            composition_feedback = ("Previous composition failure: " + composition_error + RERUN_HINT
+                                    + "\nCorrect ONLY camera, materials, lighting and world; keep all existing mesh assemblies.")
+        else:
+            raise RuntimeError("Scene composition failed after 3 attempts: " + composition_error)
         summary = "All planned scene components built; artistic quality awaits buyer review"
     for step in range(0 if args.staged else args.max_steps):
         # The system prompt, the request and only the LATEST exchange: the whole history (every code

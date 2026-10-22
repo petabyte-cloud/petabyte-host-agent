@@ -1,11 +1,11 @@
-# Petabyte node manager — pause, resume, uninstall, status.
+# Petabyte node manager - pause, resume, uninstall, status.
 # Run elevated. Node offline? Resume it (no need to reinstall):
 #   irm https://petabyte.market/manage.ps1 | iex        -> choose 1 (Resume)
 # Or pass -Action, or set $env:PETABYTE_ACTION (for unattended `irm ... | iex`):
 #   $env:PETABYTE_ACTION="pause"; irm https://petabyte.market/manage.ps1 | iex
 #
 # uninstall reverts cleanly: it stops + removes the agent and the auto-start task,
-# and — reading the state file written at install — unregisters the Ubuntu distro
+# and - reading the state file written at install - unregisters the Ubuntu distro
 # ONLY if we created it, and disables WSL ONLY if it wasn't already on this PC
 # before Petabyte. It never nukes a distro/WSL the user already had.
 
@@ -67,7 +67,7 @@ switch ($Action) {
     }
     Start-Sleep -Seconds 3
     Agent "systemctl start petabyte-agent"
-    Write-Host "Resumed — node coming back online." -ForegroundColor Green
+    Write-Host "Resumed - node coming back online." -ForegroundColor Green
     Write-Host "Keep the 'Petabyte node' window open (minimised is fine): closing it takes your GPU offline." -ForegroundColor Yellow
   }
 
@@ -97,7 +97,7 @@ switch ($Action) {
 
     # 3. WSL itself: disable only if it wasn't already enabled before us
     if (-not $state.wslPreexisted) {
-        Write-Host "  WSL was not enabled before Petabyte — disabling it..."
+        Write-Host "  WSL was not enabled before Petabyte - disabling it..."
         try {
             Disable-WindowsOptionalFeature -Online -FeatureName "Microsoft-Windows-Subsystem-Linux" -NoRestart -ErrorAction SilentlyContinue | Out-Null
             Disable-WindowsOptionalFeature -Online -FeatureName "VirtualMachinePlatform" -NoRestart -ErrorAction SilentlyContinue | Out-Null
