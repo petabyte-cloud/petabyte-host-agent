@@ -47,7 +47,7 @@ def _remaining(deadline):
     return left
 
 
-def _resolve(host, port, deadline):
+def _resolve(host, port, deadline, cancel_event=None):
     # libc DNS has no timeout argument. Bound caller wait and outstanding resolver threads;
     # a wedged resolver cannot accumulate unbounded threads or prolong a workload indefinitely.
     if not _DNS_SLOTS.acquire(blocking=False):
@@ -64,16 +64,22 @@ def _resolve(host, port, deadline):
             _DNS_SLOTS.release()
 
     threading.Thread(target=resolve, daemon=True).start()
-    try:
-        records = result.get(timeout=_remaining(deadline))
-    except queue.Empty:
-        raise FetchDenied("notebook DNS deadline exceeded") from None
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise FetchDenied("download cancelled")
+        try:
+            left = _remaining(deadline)
+            records = result.get(timeout=min(left, 0.25) if cancel_event is not None else left)
+            break
+        except queue.Empty:
+            if cancel_event is None:
+                raise FetchDenied("notebook DNS deadline exceeded") from None
     if not records or any(not public_ip(r[4][0]) for r in records):
         raise FetchDenied("notebook destination is not exclusively public")
     return records
 
 
-def _destination(url, deadline):
+def _destination(url, deadline, cancel_event=None):
     if not isinstance(url, str) or len(url) > 8192 or any(ord(c) <= 32 or ord(c) == 127 for c in url):
         raise FetchDenied("invalid notebook URL")
     try:
@@ -85,7 +91,7 @@ def _destination(url, deadline):
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
     except (ValueError, UnicodeError):
         raise FetchDenied("invalid notebook URL") from None
-    return parsed, host, port, _resolve(host, port, deadline)
+    return parsed, host, port, _resolve(host, port, deadline, cancel_event)
 
 
 def is_public_url(url):
@@ -151,7 +157,7 @@ class Response:
 SINK_MAX_BYTES = 8 * 1024 ** 3      # streamed to a file (render inputs): disk, not memory
 
 
-def get(url, timeout=60, max_redirects=5, max_bytes=MAX_BYTES, sink=None):
+def get(url, timeout=60, max_redirects=5, max_bytes=MAX_BYTES, sink=None, cancel_event=None):
     """Fetch a public URL with the same destination pinning. `sink`: a file to stream the body into
     instead of memory (render scene archives), which allows SINK_MAX_BYTES and up to an hour."""
     cap_bytes, cap_time = (SINK_MAX_BYTES, 3600.0) if sink is not None else (128 * 1024 * 1024, 60.0)
@@ -159,11 +165,21 @@ def get(url, timeout=60, max_redirects=5, max_bytes=MAX_BYTES, sink=None):
     if timeout <= 0 or not 0 < max_bytes <= cap_bytes or not 0 <= max_redirects <= 5:
         raise FetchDenied("invalid notebook fetch limits")
     for hop in range(max_redirects + 1):
-        parsed, host, port, records = _destination(url, deadline)
+        if cancel_event is not None and cancel_event.is_set():
+            raise FetchDenied("download cancelled")
+        parsed, host, port, records = _destination(url, deadline, cancel_event)
         conn = _PinnedConnection(host, port, records[0], deadline, parsed.scheme == "https")
         timer = threading.Timer(_remaining(deadline), conn.abort)
         timer.daemon = True
         timer.start()
+        watcher_stop = threading.Event()
+        if cancel_event is not None:
+            def watch_cancel(connection=conn, finished=watcher_stop, event=cancel_event):
+                while not finished.wait(0.25):
+                    if event.is_set():
+                        connection.abort()
+                        return
+            threading.Thread(target=watch_cancel, daemon=True).start()
         try:
             path = parsed.path or "/"
             if parsed.query:
@@ -190,6 +206,8 @@ def get(url, timeout=60, max_redirects=5, max_bytes=MAX_BYTES, sink=None):
                     raise FetchDenied("notebook response exceeds size limit")
             body, got = bytearray(), 0
             while not response.isclosed():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise FetchDenied("download cancelled")
                 conn.transport_socket.settimeout(_remaining(deadline))
                 block = response.read1(min(65536, max_bytes + 1 - got))
                 if not block:
@@ -202,6 +220,8 @@ def get(url, timeout=60, max_redirects=5, max_bytes=MAX_BYTES, sink=None):
                 else:
                     sink.write(block)
             _remaining(deadline)
+            if cancel_event is not None and cancel_event.is_set():
+                raise FetchDenied("download cancelled")
             if length is not None and got != length:
                 raise FetchDenied("incomplete notebook response")
             return Response(response.status, bytes(body))
@@ -211,6 +231,7 @@ def get(url, timeout=60, max_redirects=5, max_bytes=MAX_BYTES, sink=None):
             # Do not return URL query strings, credentials or destination addresses in errors.
             raise FetchDenied("notebook download failed") from None
         finally:
+            watcher_stop.set()
             timer.cancel()
             conn.abort()
     raise FetchDenied("excessive notebook redirects")

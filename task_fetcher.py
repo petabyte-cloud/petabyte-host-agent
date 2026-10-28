@@ -28,6 +28,7 @@ import gpu_runtime
 import disk_quota
 import template_storage
 import mig
+import lucebox
 
 import crypto
 import agent_scratch
@@ -329,6 +330,9 @@ def heartbeat_loop():
                 pass  # optional support metadata never breaks liveness
             _storage = template_storage.heartbeat_report(globals().get("_TUN_GW", ""))
             if _storage is not None:
+                _luce_caps = lucebox.capabilities()
+                if _luce_caps:
+                    _storage["lucebox"] = _luce_caps
                 if _SEAL_PUB:                            # can unseal rental secrets into /run/secrets
                     _storage["secrets_version"] = 1
                 _mig = mig.report()
@@ -1668,6 +1672,7 @@ def _cleanup_job_resources(tid, name=None):
     no leaked disk/network on the host. Everything is scoped by the pb.task=<tid> label, so it can
     only ever remove THIS rental's resources."""
     import subprocess
+    lucebox.cancel(tid)
     live = [vm for vm, entry in _LIVE_TEMPLATES.items() if entry["task"]["task_id"] == tid]
     for vm in live:
         entry = _LIVE_TEMPLATES.pop(vm)
@@ -1760,16 +1765,22 @@ def _await_ready(tid, name, host_port, path, auth=None, process=None):
     """Poll http://127.0.0.1:<host_port><path> until it answers 200, then report 'ready'. Stops
     when the watchdog has reported the container (it died) or after PB_READY_TIMEOUT_S (a 30 GB
     model download can take a long time; never ready = never billed, so a long limit is safe)."""
-    deadline = time.monotonic() + int(os.getenv("PB_READY_TIMEOUT_S", "3600"))
+    deadline = time.monotonic() + (600 if process == "lucebox" else int(os.getenv("PB_READY_TIMEOUT_S", "3600")))
     url = f"http://127.0.0.1:{int(host_port)}{path}"
     while time.monotonic() < deadline:
+        if process == "lucebox" and lucebox.cancelled(tid):
+            _cleanup_job_resources(tid, name)
+            return False
         with _pb_vm_lock:
-            alive = tid in _pb_vm_watch
+            watched = _pb_vm_watch.get(tid)
+            alive = watched is not None and (process != "lucebox" or not (watched.get("fail") or watched.get("reported")))
         if not alive:
-            return
+            return False
         try:
             options = {"auth": tuple(auth)} if auth else {}
-            if process == "minecraft":
+            if process == "lucebox":
+                ready = lucebox.ready(host_port, auth[1]) if auth else False
+            elif process == "minecraft":
                 # The pinned image's monitor speaks the Java status protocol, not HTTP.
                 ready = subprocess.run(["docker", "exec", name, "mc-health"],
                                        capture_output=True, timeout=5).returncode == 0
@@ -1783,14 +1794,31 @@ def _await_ready(tid, name, host_port, path, auth=None, process=None):
                         time.sleep(5)
                         continue
             if ready:
+                if process == "lucebox":
+                    if lucebox.cancelled(tid):
+                        _cleanup_job_resources(tid, name)
+                        return False
+                    with _pb_vm_lock:
+                        watched = _pb_vm_watch.get(tid)
+                        if not watched or watched.get("fail") or watched.get("reported"):
+                            return False
                 _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
                                            "status": "ready"})
                 report_log(tid, "app is ready: health check passed")
-                return
+                return True
         except Exception:                                # noqa: BLE001, S110 — still loading
             pass
         time.sleep(5)
-    report_log(tid, f"app did not pass its health check ({path}) in time; it was not billed")
+    report_log(tid, (f"app did not pass its health check ({path}) in time; stopping under the rental's existing settlement rules"
+                     if process == "lucebox" else
+                     f"app did not pass its health check ({path}) in time; it was not billed"))
+    if process == "lucebox":
+        report_log(tid, "Lucebox: model loading/startup timeout; stopping the rental and releasing its resources")
+        try:
+            _post_result_ack_retry(_signed_result(tid, status="failed", result="Lucebox model startup timed out"))
+        finally:
+            _cleanup_job_resources(tid, name)
+    return False
 
 
 def _start_ollama_pull(tid, name, model):
@@ -1938,6 +1966,8 @@ def _reap_orphan_templates(active_task_ids):
     nothing rather than risk reaping a live rental on missing data)."""
     if active_task_ids is None:
         return
+    for preparing_task in lucebox.cancel_inactive(active_task_ids):
+        _cleanup_job_resources(preparing_task)
     active = {str(t) for t in active_task_ids}
     ids = _list_template_containers()
     now = time.time()
@@ -3071,6 +3101,17 @@ def _run_template(task):
         _set_ui(status="idle", task=None, fail=True)
         return
     tid = task["task_id"]
+    _luce = None
+    if task.get("template") == "lucebox":
+        try:
+            _luce = lucebox.configuration(task)
+            task = dict(task, health="/health", health_process="lucebox",
+                        health_auth=["petabyte", _luce["env"]["PETABYTE_LUCEBOX_KEY"]])
+        except (ValueError, OSError, KeyError) as error:
+            report_log(tid, str(error))
+            _post_result_ack_retry(_signed_result(tid, status="failed", result=str(error)))
+            _cleanup_job_resources(tid)
+            return
     _set_ui(status="running", task=f"Template {task.get('template')} #{tid}")
     if _restore_volume(task.get("volume"), task.get("restore_from"), tid, task) is False:
         report_log(tid, "Host recovery refused: checkpoint could not be restored; saved work was not replaced with an empty workspace")
@@ -3157,7 +3198,7 @@ def _run_template(task):
            "--label", f"pb.task={tid}", "--label", "pb.kind=template"]
     if task.get("health") and _health_port:
         cmd += ["--label", f"pb.health={task['health']}", "--label", f"pb.health_port={_health_port}"]
-        if task.get("health_process") in {"plasmashell", "minecraft"}:
+        if task.get("health_process") in {"plasmashell", "minecraft", "lucebox"}:
             cmd += ["--label", "pb.health_process=" + task["health_process"]]
     if _service_bridge:
         cmd += ["--label", "pb.service_bridge=1"]
@@ -3213,7 +3254,7 @@ def _run_template(task):
         cmd += ["--network", net]
         cmd += _dns_flags()                    # pin the resolver so the host can't DNS-lie (P-3)
     if task.get("gpu") and not task.get("mig"):    # a slice gets only its own device, added below
-        cmd += [*gpu_runtime.docker_gpu_args()]
+        cmd += _luce["gpu_args"] if _luce else [*gpu_runtime.docker_gpu_args()]
     _slice = None
     if task.get("cache"):
         # SECURITY (CRITICAL — cross-tenant data): the cache/work dir is a PER-TASK named volume,
@@ -3231,6 +3272,8 @@ def _run_template(task):
         cmd += ["-v", f"{vol}:{task['cache']}"]
     model = params.get("model")
     _template_env = dict(task.get("env") or {})
+    if _luce:
+        _template_env = dict(_luce["env"])
     if task.get("model_env") and model:
         _template_env[task["model_env"]] = model
     _secrets = None
@@ -3243,6 +3286,9 @@ def _run_template(task):
                 import image_snapshot
                 image = image_snapshot.load(task["snapshot"], tid)
                 outcome = "loaded from your snapshot (sha256 and image id verified)"
+            elif _luce:
+                lucebox.begin(tid)
+                outcome = lucebox.prepare_image(task)
             else:
                 outcome = template_storage.prepare(image, tid,
                     cached_only=bool(params.get("cached_image_only", False)),
@@ -3262,23 +3308,48 @@ def _run_template(task):
                      and bool(params.get("startup_script")))
             if _hold:
                 cmd += ["--entrypoint", "sh"]
+            if _luce:
+                cmd += ["--entrypoint", "/opt/lucebox-hub/.venv/bin/python"]
             cmd += [template_storage.local(image)]        # a mirror pull runs by its mirror ref
             if _hold:
                 cmd += ["-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done"]
             # a model delivered as a CLI arg (vllm --model, TGI --model-id, llama.cpp -hf)
-            if task.get("model_arg") and model:
+            if not _luce and task.get("model_arg") and model:
                 cmd += [task["model_arg"], model]
-            cmd += list(task.get("args") or [])        # extra image args / batch command
+            cmd += _luce["args"] if _luce else list(task.get("args") or [])
             # This launches the requested workload, so the argv intentionally includes values
             # returned by the trusted API. It is always an argv list (shell=False); the new host
             # bind address is parsed and normalized by ipaddress, its UDP port comes from bind(0),
             # and the container port is fixed by the curated Palworld template. No value becomes
             # shell syntax or a Docker option.
+            if _luce:
+                # Prepare the same isolated container without executing its entrypoint. Its
+                # model volume receives only complete, checksummed bytes before docker start.
+                cmd[1] = "create"
+                cmd.remove("-d")
+            # Lucebox additionally validates the pinned image, UUID device and fixed argv in its adapter.
             # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
-            run = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            run = subprocess.run(cmd, capture_output=True, text=True, check=False, **({"timeout": 60} if _luce else {}))
             if run.returncode:                         # keep Docker's stderr: it says WHY
                 raise subprocess.CalledProcessError(run.returncode, cmd, run.stdout, run.stderr)
             cid = run.stdout.strip()
+            if _luce:
+                _register_vm(tid, name)
+                _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "", "status": "loading"})
+                from pathlib import Path
+                subprocess.run(["docker", "cp", str(Path(lucebox.__file__).with_name("lucebox_gate.py")),
+                                name + ":" + _luce["gate"]],
+                               capture_output=True, text=True, timeout=30, check=True)
+                for _notice in ("lucebox_model.LICENSE", "lucebox_model.NOTICE"):
+                    subprocess.run(["docker", "cp", str(Path(lucebox.__file__).with_name(_notice)),
+                                    name + ":" + task["cache"] + "/" + _notice],
+                                   capture_output=True, text=True, timeout=30, check=True)
+                lucebox.prepare_model(task, name, _luce, report_progress)
+                # Downloads may take minutes. Recheck the same actual GPU/driver and
+                # available VRAM/RAM immediately before loading; disk has already paid
+                # for these artifacts and must not be counted a second time.
+                lucebox.configuration(task, check_disk=False)
+                subprocess.run(["docker", "start", name], capture_output=True, text=True, timeout=60, check=True)
         finally:
             _remove_env_file(task)
         if _slice:
@@ -3303,7 +3374,16 @@ def _run_template(task):
             # the buyer's "Open" link wait for that.
             _post("/jobs/vm_details", {"task_id": tid, "vm_type": "template", "vm_id": "",
                                        "status": "loading"})
-            if task.get("health_auth"):
+            if _luce:
+                # Lucebox never publishes its tunnel until the authenticated loaded-model
+                # check and one-token inference succeed. Readiness and metering use the
+                # platform's existing loading/ready transition.
+                if not _await_ready(tid, name, _health_port, task["health"], task["health_auth"], "lucebox"):
+                    lucebox.finish(tid)
+                    _set_ui(status="idle", task=None, fail=True)
+                    return
+                lucebox.finish(tid)
+            elif task.get("health_auth"):
                 _start_ready_poll(tid, name, _health_port, task["health"], task["health_auth"], task.get("health_process"))
             else:
                 _start_ready_poll(tid, name, _health_port, task["health"],
@@ -3318,7 +3398,7 @@ def _run_template(task):
                 _prefetch_notebook(name, task.get("cache") or "/home/jovyan/work", nb_url)
             except Exception as _e:  # noqa: BLE001 — prefetch is best-effort
                 report_log(tid, "notebook prefetch skipped: download or container write rejected")
-        if params.get("startup_script"):
+        if not _luce and params.get("startup_script"):
             _start_startup_script(tid, name, task.get("cache") or "/tmp", params["startup_script"])
         if task.get("template") == "finetune" and not _wait_for_template_port(_health_port, name):
             report_log(tid, "Axolotl JupyterLab did not open its service port; failing the rental")
@@ -3374,6 +3454,8 @@ def _run_template(task):
             if _rev:                                   # watch the ssh -R; re-open it if it drops
                 _supervise_tunnel(tid, name, host_port, vm_id, rp=_hp, registered=_registered, gw=_gw)
         _set_ui(status="idle", task=None, ok=True)
+        if _luce:
+            lucebox.finish(tid)
     except Exception as e:                              # noqa: BLE001
         _why = _launch_failure_reason(e)
         report_log(tid, f"container launch failed: {_why}")
@@ -3390,6 +3472,8 @@ def _run_template(task):
         # A failed launch never reaches _register_vm, so the watchdog will never GC the labelled
         # volume/network created above. Reap them here or a re-delivered task id remounts them.
         _cleanup_job_resources(tid, name)
+        if _luce:
+            lucebox.finish(tid)
         _set_ui(status="idle", task=None, fail=True)
 
 
@@ -5406,7 +5490,28 @@ def _restore_vm_watch():
                         continue
                     tun_hp = str(restored)
                 if path.startswith("/") and hp.isdigit():
-                    if health_process == "plasmashell":
+                    if health_process == "lucebox":
+                        info = subprocess.run(["docker", "inspect", container], capture_output=True,
+                                              text=True, timeout=10, check=True)
+                        record = json.loads(info.stdout)[0]
+                        env = dict(item.split("=", 1) for item in record["Config"]["Env"] if "=" in item)
+                        key = env.get("PETABYTE_LUCEBOX_KEY")
+                        if record.get("State", {}).get("Status") == "created" or not key or len(key) < 32:
+                            with _pb_vm_lock:
+                                _pb_vm_watch[int(task_id)]["fail"] = "lucebox_preparation_interrupted"
+                            continue
+                        # A host restart may be loading the retained model again. Keep the
+                        # tunnel unpublished until authenticated inference succeeds, just as
+                        # on the initial launch; the private model volume is reused in place.
+                        lucebox.begin(int(task_id))
+                        _post("/jobs/vm_details", {"task_id": int(task_id), "vm_type": "template",
+                                                  "vm_id": "", "status": "loading"})
+                        restored_ready = _await_ready(int(task_id), container, int(hp), path,
+                                                      ["petabyte", key], "lucebox")
+                        lucebox.finish(int(task_id))
+                        if not restored_ready:
+                            continue
+                    elif health_process == "plasmashell":
                         info = subprocess.run(["docker", "inspect", container], capture_output=True,
                                               text=True, timeout=10, check=True)
                         env = dict(item.split("=", 1) for item in json.loads(info.stdout)[0]["Config"]["Env"] if "=" in item)
