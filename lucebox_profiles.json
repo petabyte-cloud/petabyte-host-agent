@@ -27,12 +27,18 @@
       "min_ram_mib": 8192,
       "min_disk_bytes": 21474836480,
       "min_context": 512,
-      "max_context": 2048,
+      "max_context": 1024,
       "default_context": 1024,
       "max_concurrency": 1,
-      "memory_basis": "Conservative admission estimate, not a measured Petabyte GPU configuration: 1.116 GiB file weights plus ~297 MiB duplicated output tensor + <=224 MiB BF16 KV at 2048 tokens + runtime/allocator headroom within 4 GiB; 8 GiB available host RAM; 20 GiB free disk for image, model and partial download.",
+      "memory_basis": "Conservative admission floor: 1.116 GiB file weights plus ~297 MiB duplicated output tensor, <=112 MiB BF16 KV at 1024 tokens, and runtime/allocator headroom within 4 GiB; 8 GiB available host RAM; 20 GiB free disk for image/model/partial download. Qualified on H100 SXM 80GB, driver 580.173.02, context 1024; sampled process VRAM 2200..2234 MiB is not a peak-memory measurement.",
       "license": "Apache-2.0",
-      "qualified": false
+      "qualified": true,
+      "qualified_gpu_ids": [
+        "h100-sxm"
+      ],
+      "qualified_compute_capabilities": [
+        "9.0"
+      ]
     }
   }
 }

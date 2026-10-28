@@ -40,8 +40,8 @@ class Config:
         value = env.get("PETABYTE_LUCEBOX_CONTEXT", "1024")
         if not 32 <= len(key) <= 256 or any(ord(c) < 33 or ord(c) > 126 for c in key):
             raise ValueError("Lucebox endpoint credential is missing or invalid")
-        if not value.isascii() or not value.isdigit() or not 512 <= int(value) <= 2048:
-            raise ValueError("Lucebox context must be between 512 and 2048")
+        if not value.isascii() or not value.isdigit() or not 512 <= int(value) <= 1024:
+            raise ValueError("Lucebox context must be between 512 and 1024")
         if env.get("PETABYTE_LUCEBOX_MODEL") != MODEL or env.get("LUCE_TARGET") != MODEL_PATH:
             raise ValueError("Lucebox requires the pinned Qwen3-0.6B BF16 profile")
         return cls(key=key, context=int(value))
@@ -199,7 +199,6 @@ class GateHandler(BaseHTTPRequestHandler):
         conn = http.client.HTTPConnection("127.0.0.1", self.server.upstream_port, timeout=5)
         try:
             conn.request("GET", "/v1/models", headers={"Connection": "close"})
-            upstream_socket = conn.sock
             response = conn.getresponse()
             raw = response.read(RESPONSE_LIMIT + 1)
             body = json.loads(raw)
