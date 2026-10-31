@@ -182,8 +182,25 @@ def image_for(role, override=None):
     return m.get(vendor()) or m.get("nvidia")
 
 
+#   The agent pulls the wipe image by digest: registry.petabyte.market serves digests only, so a node
+# that can't reach Docker Hub (mainland China, spec 321, 2026-10-30) gets it through the mirror.
+WIPE_DIGESTS = {
+    "pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime":
+        "sha256:7db0e1bf4b1ac274ea09cf6358ab516f8a5c7d3d0e02311bed445f7e236a5d80",
+    "pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime":
+        "sha256:0a3b9fedefe1f61ac4d5a9de9015c0863db27ca0fde2d4e37e6268147980b726",
+}
+
+
+def pinned(image):
+    """'repo@sha256:..' for a wipe image tag (what the agent pulls), else the image unchanged."""
+    d = WIPE_DIGESTS.get(image)
+    return f"{image.rsplit(':', 1)[0]}@{d}" if d else image
+
+
 def wipe_image_candidates():
-    """Locally-cached image candidates for the VRAM memset, vendor-first, plus VRAM_WIPE_IMAGE."""
+    """Locally-cached image candidates for the VRAM memset, vendor-first, plus VRAM_WIPE_IMAGE.
+    Each tag also under the names a digest pull leaves behind (direct or through the mirror)."""
     if vendor() == "amd":
         base = ["rocm/pytorch:latest"]
     else:
@@ -192,7 +209,13 @@ def wipe_image_candidates():
         base = ["pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime",
                 "pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime",
                 "pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime"]
-    return [i for i in base + [os.getenv("VRAM_WIPE_IMAGE", "")] if i]
+    import template_storage
+    named = []
+    for tag in base:
+        named.append(tag)
+        if pinned(tag) != tag:
+            named += [pinned(tag), template_storage.mirror_ref(pinned(tag))]
+    return [i for i in named + [os.getenv("VRAM_WIPE_IMAGE", "")] if i]
 
 
 def gpu_reset_cmd():

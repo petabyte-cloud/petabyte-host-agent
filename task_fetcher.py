@@ -5733,7 +5733,7 @@ def _ensure_wipe_image_async():
             img = ("pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime" if cc.isdigit() and int(cc) >= 10
                    else "pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime")   # Blackwell needs CUDA 12.8
             logging.warning(f"VRAM-wipe image missing — pulling {img} (GPU jobs are refused until it lands)")
-            template_storage.prepare(img, 0, timeout=3600)
+            template_storage.prepare(gpu_runtime.pinned(img), 0, timeout=3600)   # by digest: mirror-able
             logging.warning(f"VRAM-wipe image {img}: cached")
         except Exception as e:                           # noqa: BLE001 — never crash the agent
             logging.warning(f"VRAM-wipe image pull failed: {e}")
