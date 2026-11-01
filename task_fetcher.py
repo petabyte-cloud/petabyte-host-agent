@@ -3937,6 +3937,26 @@ def _run_container(task, attach=None):
         _remove_env_file(task)
 
 
+def _run_agent_container(task):
+    """One event-driven execution: restore, run, checkpoint, release all compute."""
+    import agent_state
+    tid = task["task_id"]
+    _set_ui(status="running", task=f"Agent execution #{tid}")
+    try:
+        output = agent_state.execute(task, API_URL, HEADERS, build_container_cmd, _run_streamed)
+    except Exception:
+        # Exceptions may contain URLs, event data or environment values. Keep
+        # seller-visible logs and signed failure output free of these inputs.
+        report_log(tid, "agent execution failed; state was not advanced")
+        _post_result_ack_retry(_signed_result(tid, status="failed",
+                                             failure_cause="agent_execution_failed"))
+        _set_ui(status="idle", task=None, fail=True)
+        return
+    _post_result_ack_retry(_signed_result(tid, status="completed", result=output,
+                                         content_hash=crypto.sha256_hex(output)))
+    _set_ui(status="idle", task=None, ok=True)
+
+
 _IMG_FORMATS = {"PNG": "PNG", "JPEG": "JPEG", "JPG": "JPEG", "EXR": "OPEN_EXR", "OPEN_EXR": "OPEN_EXR"}
 
 
@@ -5558,7 +5578,8 @@ def job_loop():
                 continue
             # spec_id pins the claim to THIS machine: one account's machines (or every JIT standby
             # droplet, which share the operator account) must never run each other's jobs.
-            r = httpx.get(f"{API_URL}/jobs/next", headers=HEADERS, params={"spec_id": SPEC_ID},
+            r = httpx.get(f"{API_URL}/jobs/next", headers=HEADERS,
+                          params={"spec_id": int(SPEC_ID), "agent_runtime": "true"},
                           timeout=20, trust_env=False)
             if r.status_code == 204:
                 pass                 # no job available right now
@@ -5647,6 +5668,8 @@ def job_loop():
                             _run_stitch(task)
                         elif tt == "distributed":
                             _run_distributed(task)
+                        elif tt == "agent":
+                            _run_agent_container(task)
                         elif tt == "container":
                             _run_container(task)
                         else:

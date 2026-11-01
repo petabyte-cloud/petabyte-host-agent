@@ -219,7 +219,7 @@ def valid(p):
             and _valid_args(p.get("args", []), _LLM_FLAGS, set()))
 
 
-# A big (MoE) model split between GPU and RAM: --fit keeps what fits in VRAM (256 MiB margin) and the
+# A deployment that needs host offload: --fit keeps what fits in VRAM (256 MiB margin) and the
 # rest of the experts in RAM; --no-mmap loads them into memory instead of paging them from disk.
 # Tuned on an RTX 4080 + 31 GiB with Qwen3-Next-80B: 21 tok/s vs 7 tok/s mmap'd (2026-10-09).
 OFFLOAD_ARGS = ("--fit", "on", "--fit-target", "256", "--no-mmap")
@@ -765,6 +765,8 @@ class Controller:
                        "-e", f"LLAMA_ARG_API_KEY={key}",
                        image, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
                        "-c", str(p["ctx"] * p["parallel"]), "-np", str(p["parallel"]),
+                       # `offload` describes this deployment, not the model's capability: a large
+                       # enough card uses all-GPU layers and the permit's bounded parallel slots.
                        *(OFFLOAD_ARGS if p.get("offload") else ("-ngl", "999")), *p.get("args", []),
                        timeout=60)
             if r.returncode:
