@@ -1171,11 +1171,13 @@ def _isolation_flags(task):
         flags += ["--cpus", str(cpus)]
     # SECURITY (peer abuse — DoS the seller + co-tenants): bound the resources a buyer job can
     # exhaust beyond RAM/CPU/pids. --shm-size caps /dev/shm (default 64 MB; unbounded shm is a
-    # host-memory DoS and an IPC surface), and --ulimit caps file descriptors and processes so a
-    # job can't exhaust host-wide kernel resources shared with co-tenants and the agent.
+    # host-memory DoS and an IPC surface), and --ulimit caps file descriptors. Processes are capped
+    # by --pids-limit above (the container's own cgroup). NEVER --ulimit nproc: without a user
+    # namespace RLIMIT_NPROC counts every process of that UID on the HOST, so the jupyter images
+    # (uid 1000) failed every exec with EAGAIN on a desktop seller whose login user is uid 1000
+    # (spec 323, diagnostics #27-#48, 2026-11-15).
     flags += ["--shm-size", str(task.get("shm_size") or "64m"),
-              "--ulimit", f"nofile={int(task.get('nofile') or 4096)}",
-              "--ulimit", f"nproc={int(task.get('nproc') or 2048)}"]
+              "--ulimit", f"nofile={int(task.get('nofile') or 4096)}"]
     if task.get("read_only"):
         # Immutable rootfs + a writable scratch. The tmpfs counts against the RAM cap, so keep it
         # modest; HOME=/tmp routes user/CUDA/pip caches onto it instead of the read-only rootfs.
