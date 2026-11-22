@@ -5270,7 +5270,10 @@ _MINER_RE = re.compile(
     r"|nanominer|phoenixminer|cryptodredge|bminer|tt-?miner|tbminer|ccminer|sgminer|ethminer|minerd"
     r"|cpuminer\S*|urx-isotope-cpuminer\S*|cgminer|bfgminer|excavator|xmr-stak\S*|miniz|verthashminer"
     r"|gminer|onezerominer|kawpowminer|z-enemy|nheqminer|peakminer\S*"
-    r"|[\w.]*[-_]miner)(?:\.exe)?(?:\s|$)|stratum\d?\+(?:tcp|ssl|tls)://")   # <x>-miner: pearl-miner, 2026-10-14
+    r"|[\w.]*[-_]miner)(?:\.exe)?(?:\s|$)|stratum\d?\+(?:tcp|ssl|tls)://"   # <x>-miner: pearl-miner, 2026-10-14
+    # Pearl by what it is told, not what it is called: a farm renamed the miner `runtimes` and gave
+    # it a bare host:port pool (2026-11-21). The algo/pool name or a prl1 payout address gives it away.
+    r"|pearlhash|\bprl1[02-9ac-hj-np-z]{20,}")
 _MINER_CHECK_S = 60
 
 
